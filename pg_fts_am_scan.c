@@ -40,6 +40,8 @@ static bool bm25_trgm_candidates(Relation index, BlockNumber trgmstart,
 static void bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck);
 static void bm25_recheck_exact(Relation index, FtsQuery query, TidSet *set);
 static double bm25_query_maxhits(Relation index, FtsQuery q, double N);
+static TidSet bm25_universe_bounded(Relation index, BlockNumber dictstart,
+									double ndocs, bool has_doclen_col);
 /* forward decl: blob reader (pg_fts_trgm_index.c, included after this file) */
 static uint8 *bm25_read_blob(Relation index, BlockNumber blk, Size len);
 
@@ -842,9 +844,9 @@ bm25_lookup_pattern(Relation index, const BM25SegMeta *seg,
  * Evaluate the query into a TidSet via a stack machine over the RPN items.
  * NOT is handled specially: a bare NOT is only meaningful as "a AND NOT b", so
  * we track whether each stack entry is "positive" (a TID set) or "negative"
- * (the complement of a TID set).  AND/OR combine them with De Morgan; a top-
- * level negative result is complemented against all indexed TIDs (via the
- * universe set).
+ * (the complement of a TID set).  AND/OR combine them with De Morgan; only a
+ * top-level negative result is complemented against all indexed TIDs (via the
+ * segment's universe set, built on demand).
  */
 typedef struct EvalVal
 {
@@ -853,8 +855,7 @@ typedef struct EvalVal
 } EvalVal;
 
 static TidSet
-bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
-				TidSet universe)
+bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 {
 	EvalVal    *stack;
 	int			top = 0;
@@ -968,7 +969,19 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 
 	Assert(top == 1);
 	if (stack[0].negated)
+	{
+		/*
+		 * Only a negated final result is complemented against the universe, so
+		 * build it here, not up front: it decodes every posting list in the
+		 * segment, and a NOT under an AND ("a & !b") never needs it --
+		 * tidset_andnot above already answered it.
+		 */
+		TidSet		universe;
+
+		universe = bm25_universe_bounded(index, seg->dictstart, seg->ndocs,
+										 seg->doclenstart == InvalidBlockNumber);
 		result = tidset_andnot(universe, stack[0].set);
+	}
 	else
 		result = stack[0].set;
 
@@ -2154,8 +2167,7 @@ bm25_span_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 	MemoryContext docctx;
 	MemoryContext oldctx = MemoryContextSwitchTo(segctx);
 	PosTermList *terms = palloc0((Size) q->nitems * sizeof(PosTermList));
-	TidSet		universe = {NULL, 0};
-	TidSet		candidates = bm25_eval_query(index, seg, q, universe);
+	TidSet		candidates = bm25_eval_query(index, seg, q);
 	uint32		i;
 	int			ci;
 	bool		ok = true;
@@ -2246,7 +2258,6 @@ typedef struct BM25CollectCtx
 	BM25Tombstones *seg_tombs;
 	/* query classification (set once, read per segment) */
 	bool		has_fuzzy_regex;
-	bool		has_not;
 	bool		has_phrase;
 	/* positional-phrase fast path */
 	bool		use_pos_phrase;
@@ -2292,14 +2303,8 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 
 	if (ctx->has_fuzzy_regex && query->nitems > 1)
 	{
-		TidSet candidates;
+		TidSet		candidates = bm25_eval_query(index, sg, query);
 
-		universe.tids = NULL;
-		universe.n = 0;
-		if (ctx->has_not)
-			universe = bm25_universe_bounded(index, sg->dictstart, sg->ndocs,
-												sg->doclenstart == InvalidBlockNumber);
-		candidates = bm25_eval_query(index, sg, query, universe);
 		ctx->need_recheck = true;
 		bm25_filter_tombstoned_seg(ctx->seg_tombs, s, &candidates);
 		if (candidates.n > 0)
@@ -2391,15 +2396,6 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 		return SEG_OK;
 	}
 
-	if (ctx->has_not)
-		universe = bm25_universe_bounded(index, sg->dictstart, sg->ndocs,
-										 sg->doclenstart == InvalidBlockNumber);
-	else
-	{
-		universe.tids = NULL;
-		universe.n = 0;
-	}
-
 	if (ctx->use_pos_phrase)
 	{
 		/* evaluate the phrase from this segment's positional postings; the
@@ -2439,7 +2435,7 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 	}
 
 	{
-		TidSet		result = bm25_eval_query(index, sg, query, universe);
+		TidSet		result = bm25_eval_query(index, sg, query);
 
 		if (result.n > 0)
 		{
@@ -2668,7 +2664,6 @@ collect_retry:
 		ctx.query = query;
 		ctx.seg_tombs = &seg_tombs;
 		ctx.has_fuzzy_regex = has_fuzzy_regex;
-		ctx.has_not = has_not;
 		ctx.has_phrase = has_phrase;
 		ctx.use_pos_phrase = use_pos_phrase;
 		ctx.use_pos_span = use_pos_span;

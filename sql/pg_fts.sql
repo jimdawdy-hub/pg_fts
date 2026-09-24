@@ -3189,3 +3189,60 @@ SELECT (SELECT array_agg(id ORDER BY id) FROM small) =
        (SELECT array_agg(id ORDER BY id) FROM truth WHERE ord <= 64)
        AS wand_cutoff_ties_exact;
 DROP TABLE wand_tie_regress;
+
+-- ---------------------------------------------------------------------------
+-- NOT through the index, across segments, tombstones and the pending list.
+--
+-- The index evaluates NOT by set difference.  Only a query whose WHOLE result
+-- is negated (!a, !a & !b, a | !b, !(a & !b), ...) must be complemented against
+-- the segment universe (every TID in the segment); a NOT nested under an AND
+-- (a & !b, !a & b) is plain set difference, and a double negation cancels.
+-- Each shape below must count the same through the index -- a bitmap scan and
+-- fts_count -- as the heap matcher under a forced seqscan.  The index has two
+-- segments (the second flushed by VACUUM), tombstones in both (deleted +
+-- vacuumed rows), and a pending list whose rows may reuse the freed heap
+-- slots.  count(id), not count(*): a bare count(*) is answered by the FtsCount
+-- pushdown, which uses the index even when seqscans are forced.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION notseg_doc(g int) RETURNS ftsdoc LANGUAGE sql AS $$
+  SELECT to_ftsdoc('w' || g || CASE WHEN g % 2 = 0 THEN ' apple' ELSE '' END
+                            || CASE WHEN g % 3 = 0 THEN ' cherry' ELSE '' END
+                            || CASE WHEN g % 5 = 0 THEN ' zeta' ELSE '' END) $$;
+CREATE TABLE notseg (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+INSERT INTO notseg(d) SELECT notseg_doc(g) FROM generate_series(1, 300) g;
+CREATE INDEX notseg_fts ON notseg USING fts (d);                -- segment 1
+INSERT INTO notseg(d) SELECT notseg_doc(g) FROM generate_series(301, 600) g;
+VACUUM notseg;                                                  -- segment 2
+DELETE FROM notseg WHERE id % 7 = 0;
+VACUUM notseg;                                                  -- tombstones
+INSERT INTO notseg(d) SELECT notseg_doc(g) FROM generate_series(601, 700) g;  -- pending
+SELECT fts_index_nsegments('notseg_fts') AS notseg_segments;    -- 2
+-- the two plans compared below: bitmap scan of the index vs heap seqscan
+SET enable_seqscan = off; SET enable_indexscan = off; SET enable_bitmapscan = on;
+EXPLAIN (COSTS OFF) SELECT count(id) FROM notseg WHERE d @@@ 'apple & !cherry'::ftsquery;
+SET enable_seqscan = on; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT count(id) FROM notseg WHERE d @@@ 'apple & !cherry'::ftsquery;
+RESET enable_seqscan; RESET enable_indexscan; RESET enable_bitmapscan;
+CREATE FUNCTION notseg_counts(qry text, OUT via_bitmap bigint, OUT via_heap bigint,
+                              OUT via_fts_count bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = on;
+  EXECUTE format('SELECT count(id) FROM notseg WHERE d @@@ %L::ftsquery', qry) INTO via_bitmap;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;
+  EXECUTE format('SELECT count(id) FROM notseg WHERE d @@@ %L::ftsquery', qry) INTO via_heap;
+  via_fts_count := fts_count('notseg_fts', qry::ftsquery);
+END $$;
+-- rows 1-4 need no universe; rows 5-10 do (the whole result is negated).
+-- 615 live rows; every count is non-zero.
+SELECT v.q, c.via_bitmap, c.via_heap, c.via_fts_count,
+       c.via_bitmap = c.via_heap AND c.via_fts_count = c.via_heap AS agree
+FROM (VALUES (1, 'apple & !cherry'), (2, '!apple & cherry'),
+             (3, 'apple & !(cherry | zeta)'), (4, '!!apple'),
+             (5, '!apple & !cherry'), (6, '!(apple | cherry)'),
+             (7, 'apple | !cherry'), (8, '!(apple & !cherry)'),
+             (9, '!apple'), (10, '!kiwi')) v(ord, q),
+     LATERAL notseg_counts(v.q) c
+ORDER BY v.ord;
+DROP TABLE notseg;
+DROP FUNCTION notseg_counts(text);
+DROP FUNCTION notseg_doc(int);

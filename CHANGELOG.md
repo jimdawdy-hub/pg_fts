@@ -51,6 +51,22 @@ All notable changes to pg_fts are documented here.
   with the unconfigured analyzer. This change does not recover already-lost input
   positions or redesign the dictionary pipeline.
 
+### Performance
+
+- **`a & !b` no longer decodes every posting list in the segment.** Whenever a query
+  contained NOT, the evaluator behind bitmap scans and counts first built each segment's
+  "universe" -- every TID in the segment, found by decoding every posting list. It needs
+  that set only when the query's final result is negated (`!a`, `!a & !b`, `a | !b`):
+  negation is tracked with De Morgan, so `a & !b` is a plain set difference and paid for a
+  full-segment decode it never used. The universe is now built per segment only for a
+  negated final result. Answers are unchanged.
+
+### Tests
+
+- A regression block compares ten NOT shapes through the index (bitmap scan and
+  `fts_count`) with the heap matcher, across two segments with tombstones plus the
+  pending list.
+
 ## 1.8.3 - 2026-09-18
 
 **Correctness release: two deadlocks that shipped in every prior version, found while
