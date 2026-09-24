@@ -6,7 +6,7 @@
  * Stage 11 of pg_fts.  tsquery_to_ftsquery() mechanically converts a tsquery
  * into an ftsquery so existing queries port with minimal churn: & -> AND,
  * | -> OR, ! -> NOT, and the phrase operator <N> (OP_PHRASE) -> ftsquery
- * FTS_OP_PHRASE preserving the token gap, so adjacency is carried over
+ * FTS_OP_EXACT preserving the token gap, so adjacency is carried over
  * faithfully.
  *
  * tsquery is stored in prefix (Polish) order; ftsquery is postfix (RPN).  We
@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "pg_fts.h"
+#include "miscadmin.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
@@ -31,7 +32,8 @@ typedef struct MigItem
 {
 	uint8		type;
 	uint8		op;
-	uint32		distance;		/* max token gap for FTS_OP_PHRASE (else unused) */
+	uint16		flags;
+	uint32		distance;		/* exact token gap or term weight mask */
 	char	   *term;			/* folded term (lowercased) for VAL items */
 	int			termlen;
 }			MigItem;
@@ -46,7 +48,8 @@ typedef struct MigState
 }			MigState;
 
 static void
-mig_emit(MigState *st, uint8 type, uint8 op, uint32 distance, char *term, int termlen)
+mig_emit(MigState *st, uint8 type, uint8 op, uint16 flags,
+		 uint32 distance, char *term, int termlen)
 {
 	if (st->nitems >= st->maxitems)
 	{
@@ -59,6 +62,7 @@ mig_emit(MigState *st, uint8 type, uint8 op, uint32 distance, char *term, int te
 	}
 	st->items[st->nitems].type = type;
 	st->items[st->nitems].op = op;
+	st->items[st->nitems].flags = flags;
 	st->items[st->nitems].distance = distance;
 	st->items[st->nitems].term = term;
 	st->items[st->nitems].termlen = termlen;
@@ -69,18 +73,22 @@ mig_emit(MigState *st, uint8 type, uint8 op, uint32 distance, char *term, int te
 static void
 mig_walk(MigState *st, QueryItem *item)
 {
+	check_stack_depth();
 	if (item->type == QI_VAL)
 	{
 		QueryOperand *op = &item->qoperand;
 		char	   *src = st->operands + op->distance;
 		char	   *folded = (char *) palloc(op->length);
+		uint16		flags = op->prefix ? FTS_QF_PREFIX : 0;
 		int			i;
 
 		/* tsquery lexemes are already normalized; copy verbatim (they are the
 		 * dictionary output, so no further folding is applied). */
 		for (i = 0; i < (int) op->length; i++)
 			folded[i] = src[i];
-		mig_emit(st, FTS_QI_VAL, 0, 0, folded, op->length);
+		if (op->weight != 0)
+			flags |= FTS_QF_WEIGHTED;
+		mig_emit(st, FTS_QI_VAL, 0, flags, op->weight, folded, op->length);
 	}
 	else						/* QI_OPR */
 	{
@@ -90,14 +98,14 @@ mig_walk(MigState *st, QueryItem *item)
 		{
 			/* NOT has a single (right) operand at item+1 */
 			mig_walk(st, item + 1);
-			mig_emit(st, FTS_QI_OPR, FTS_OP_NOT, 0, NULL, 0);
+			mig_emit(st, FTS_QI_OPR, FTS_OP_NOT, 0, 0, NULL, 0);
 		}
 		else
 		{
 			QueryItem  *left = item + op->left;
 			QueryItem  *right = item + 1;
 			uint8		ftop;
-			uint32		dist = 1;
+			uint32		dist = 0;
 
 			mig_walk(st, left);
 			mig_walk(st, right);
@@ -112,14 +120,14 @@ mig_walk(MigState *st, QueryItem *item)
 					break;
 				case OP_PHRASE:
 					/* faithful: tsquery <N> -> ftsquery phrase with the same gap */
-					ftop = FTS_OP_PHRASE;
+					ftop = FTS_OP_EXACT;
 					dist = op->distance;
 					break;
 				default:
 					ftop = FTS_OP_AND;
 					break;
 			}
-			mig_emit(st, FTS_QI_OPR, ftop, dist, NULL, 0);
+			mig_emit(st, FTS_QI_OPR, ftop, 0, dist, NULL, 0);
 		}
 	}
 }
@@ -166,7 +174,7 @@ tsquery_to_ftsquery(PG_FUNCTION_ARGS)
 	{
 		items[i].type = st.items[i].type;
 		items[i].op = st.items[i].op;
-		items[i].flags = 0;
+		items[i].flags = st.items[i].flags;
 		items[i].distance = st.items[i].distance;
 		if (st.items[i].type == FTS_QI_VAL)
 		{

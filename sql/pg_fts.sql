@@ -112,7 +112,7 @@ SELECT to_ftsquery('english','the & a & of & postgres')::text AS q_many_stop; --
 SELECT to_ftsquery('english','(the | a) & postgres')::text AS q_grouped;-- 'postgr'
 SELECT to_ftsquery('english','postgres & (the | vacuum)')::text AS q_grp2; -- ('postgr' & 'vacuum')
 SELECT to_ftsquery('english','postgres & !the')::text AS q_pg_not_the;  -- 'postgr'
-SELECT to_ftsquery('english','"postgres the database"')::text AS q_phrase_mid; -- ('postgr' <-> 'databas')
+SELECT to_ftsquery('english','"postgres the database"')::text AS q_phrase_mid; -- ('postgr' <2> 'databas')
 -- ftsquery elision matches the standard to_tsquery reduction (both drop 'the')
 SELECT to_ftsquery('english','the & postgres')::text
      = to_ftsquery('english','postgres')::text AS matches_tsquery_reduction; -- t
@@ -1599,6 +1599,8 @@ SELECT CASE WHEN g % 3 = 0 THEN 'alpha united states beta d'||g          -- adja
             WHEN g % 3 = 1 THEN 'alpha united middle states beta d'||g   -- AND, not phrase
             ELSE 'gamma delta noise d'||g END                           -- neither
 FROM generate_series(1, 600) g;
+INSERT INTO pos_on(body) VALUES ('states middle nation initial');
+INSERT INTO pos_on(body) VALUES ('united far far far states miss');
 INSERT INTO pos_off(body) SELECT body FROM pos_on;
 CREATE INDEX pos_on_idx  ON pos_on  USING fts (to_ftsdoc('simple'::regconfig, body)) WITH (positions = on);
 CREATE INDEX pos_off_idx ON pos_off USING fts (to_ftsdoc('simple'::regconfig, body));  -- default off
@@ -1636,6 +1638,28 @@ SELECT
 SELECT
   (SELECT count(*) FROM pos_on  WHERE to_ftsdoc('simple'::regconfig, body) @@@ to_ftsquery('simple'::regconfig, 'united & states')) =
   (SELECT count(*) FROM pos_off WHERE to_ftsdoc('simple'::regconfig, body) @@@ to_ftsquery('simple'::regconfig, 'united & states')) AS and_on_eq_off;
+-- w/N accepts both orders; indexed positions and heap recheck agree.
+INSERT INTO pos_on(body) VALUES ('states middle united reverse');
+INSERT INTO pos_off(body) VALUES ('states middle united reverse');
+INSERT INTO pos_on(body) VALUES ('states middle nation reverse2');
+INSERT INTO pos_off(body) VALUES ('states middle nation reverse2');
+SELECT fts_count('pos_on_idx', 'united w/2 states'::ftsquery) =
+       fts_count('pos_off_idx', 'united w/2 states'::ftsquery) AS within_on_eq_off;
+SELECT fts_count('pos_on_idx', 'united w/2 states'::ftsquery) >
+       fts_count('pos_on_idx', 'united p/2 states'::ftsquery) AS within_reverse_added;
+SELECT fts_count('pos_on_idx', '(united OR nation) w/2 states'::ftsquery) =
+       fts_count('pos_off_idx', '(united OR nation) w/2 states'::ftsquery) AS within_or_on_eq_off;
+SELECT fts_count('pos_on_idx', '(united OR nation) w/2 states'::ftsquery) >
+       fts_count('pos_on_idx', 'united w/2 states'::ftsquery) AS within_or_adds_hits;
+SELECT fts_count('pos_on_idx', 'states w/2 (united OR nation)'::ftsquery) =
+       fts_count('pos_off_idx', 'states w/2 (united OR nation)'::ftsquery) AS within_right_or_eq_off;
+SELECT fts_count('pos_on_idx', 'united w/2 states'::ftsquery) =
+       (SELECT count(*) FROM pos_on WHERE to_ftsdoc('simple'::regconfig, body) @@@ 'united w/2 states'::ftsquery)
+       AS within_count_eq_scan;
+SELECT count(*) > 0 AND bool_and(to_ftsdoc('simple'::regconfig, p.body) @@@
+                                   'united w/2 states'::ftsquery) AS within_ranked_matches
+  FROM fts_search('pos_on_idx', 'united w/2 states'::ftsquery, 10) r
+  JOIN pos_on p ON p.ctid = r.ctid;
 RESET enable_seqscan;
 -- multi-segment / pending: phrase must be correct across several segments (the
 -- positional hits accumulate per-segment and are merged); insert more rows
@@ -1766,9 +1790,8 @@ DROP TABLE rf;
 -- Guards the WAND/MaxScore recall + the 0.2.1 boolean-structure gate.
 -- ranked <=> ordering scan must equal the fair brute-force BM25 top-k SET.
 -- Distinct scores (unique tf per doc) => deterministic, no tie ambiguity.
--- Index MUST be flushed (VACUUM) so the ranked path covers all docs; pending
--- docs are intentionally not ranked (CAPABILITIES.md), so a flush is part of
--- the contract this test checks.
+-- Flush so this test exercises WAND. legal_proximity separately covers
+-- ranked pending documents through the exact fallback.
 CREATE TABLE rankparity (id int, d ftsdoc);
 -- unique alpha tf per doc (1..600) -> strictly distinct single-term scores;
 -- every 4th doc also carries beta/delta/epsilon for OR/AND/4-term coverage.
@@ -1973,7 +1996,8 @@ INSERT INTO qrt VALUES
   (2, 'alpha | (beta & !gamma)'::ftsquery),
   (3, '"quick brown fox"'::ftsquery),
   (4, 'NEAR(alpha beta, 3)'::ftsquery),
-  (5, 'quick* & alpha'::ftsquery);
+  (5, 'quick* & alpha'::ftsquery),
+  (6, '(dog OR canine) w/10 bite'::ftsquery);
 COPY qrt TO '/tmp/pg_fts_qrt.bin' WITH (FORMAT binary);
 CREATE TEMP TABLE qrt2 (id int, q ftsquery);
 COPY qrt2 FROM '/tmp/pg_fts_qrt.bin' WITH (FORMAT binary);
@@ -2397,14 +2421,33 @@ SELECT 'a & b'::ftsquery::text, 'a | b'::ftsquery::text, '!a'::ftsquery::text,
        'NEAR(a b, 3)'::ftsquery::text, 'a b'::ftsquery::text;   -- implicit AND
 -- keyword operators, case-insensitive
 SELECT to_ftsquery('a AND b')::text, to_ftsquery('a OR b')::text, to_ftsquery('NOT a')::text;
+-- legal proximity: grouped alternatives, both word orders, and exact text I/O
+SELECT to_ftsdoc('canine little bite') @@@ '(dog OR canine) w/3 bite'::ftsquery AS grouped_within;
+SELECT to_ftsdoc('bite little canine') @@@ '(dog OR canine) w/3 bite'::ftsquery AS reverse_within;
+SELECT to_ftsdoc('bite little canine') @@@ '(dog OR canine) p/3 bite'::ftsquery AS reverse_ordered;
+SELECT to_ftsdoc('dog bite') @@@ 'dog w/4294967295 bite'::ftsquery AS max_distance;
+SELECT 'NEAR(dog bite, 5)'::ftsquery::text::ftsquery::text = 'NEAR(dog bite, 5)'::ftsquery::text AS ordered_roundtrip;
+SELECT 'NEAR(a b c, 2)'::ftsquery::text::ftsquery::text = 'NEAR(a b c, 2)'::ftsquery::text AS near_three_roundtrip;
+SELECT '(dog OR canine) w/10 bite'::ftsquery::text::ftsquery::text = '(dog OR canine) w/10 bite'::ftsquery::text AS within_roundtrip;
+SELECT $$'and' p/5 'or'$$::ftsquery::text AS literal_keywords;
+SELECT to_ftsquery('"w/5 dog"')::text::ftsquery::text = to_ftsquery('"w/5 dog"')::text AS proximity_word_in_phrase;
+SELECT to_ftsquery('NEAR(w/5 dog, 10)')::text::ftsquery::text = to_ftsquery('NEAR(w/5 dog, 10)')::text AS proximity_word_in_near;
+SELECT to_ftsquery('w/5a')::text = to_ftsquery($$'w/5a'$$)::text AS proximity_prefix_word;
+SELECT to_ftsquery('O''Brien')::text = to_ftsquery('O Brien')::text AS apostrophe_word;
+SELECT to_ftsquery('"attorney''s fees"')::text = to_ftsquery('"attorney s fees"')::text AS apostrophe_phrase;
 -- empty input -> empty query
 SELECT to_ftsquery('')::text AS empty_q, ''::ftsquery::text AS empty_cast;
+-- A phrase can be an unordered proximity operand.
+SELECT to_ftsdoc('bite big dog') @@@ '"big dog" w/5 bite'::ftsquery AS phrase_within;
 -- malformed queries must ERROR (each is its own statement so the .out records it)
 SELECT '"unterminated'::ftsquery;         -- unterminated quote
 SELECT '/unterminated'::ftsquery;         -- unterminated regex
 SELECT '""'::ftsquery;                    -- empty phrase
 SELECT 'NEAR(only)'::ftsquery;            -- NEAR needs >= 2 terms
 SELECT 'NEAR(a b, 0)'::ftsquery;          -- NEAR k must be >= 1
+SELECT 'a w/0 b'::ftsquery;               -- distance must be positive
+SELECT 'a w/99999999999999999999 b'::ftsquery; -- distance cannot overflow
+SELECT '(dog AND canine) w/5 bite'::ftsquery; -- AND has no positions: explicit error
 SELECT 'a &'::ftsquery;                   -- trailing operator
 SELECT '& a'::ftsquery;                   -- leading operator
 SELECT 'a & & b'::ftsquery;               -- double operator
@@ -2957,8 +3000,8 @@ SELECT fts_match(to_ftsdoc('english','x','A') || to_ftsdoc('english','vacuum','B
 -- unlabelled (v3-style) doc: label D matches, others do not
 SELECT fts_match(to_ftsdoc('english','vacuum'), to_ftsquery('english','vacuum:A')) AS plain_a;  -- f
 SELECT fts_match(to_ftsdoc('english','vacuum'), to_ftsquery('english','vacuum:D')) AS plain_d;  -- t
--- weighted prefix / fuzzy / regex are rejected
-SELECT to_ftsquery('english','vac:A*');       -- error
+-- Weighted prefixes retain their mask; fuzzy + weight remains unsupported.
+SELECT to_ftsquery('english','vac:A*');       -- prefix and weight
 SELECT to_ftsquery('english','vac:A~1');      -- error
 -- index-path parity: field restriction through the fts index == seqscan truth,
 -- for count(*), fts_count, and a scan.
@@ -3028,7 +3071,7 @@ SELECT to_ftsdoc('simple','quick brown') @@@ '"quick brown"'::ftsquery AS positi
 SELECT to_ftsdoc('simple','fox brown zzz quick') @@@ (to_tsquery('simple','quick <-> (brown & fox)'))::ftsquery AS bool_under_phrase_f;  -- f
 -- prefix-inside-phrase is DELIBERATELY lossy (positions are not tracked for a
 -- prefix operand), and that shipped behaviour is preserved: still permissive.
-SELECT to_ftsdoc('simple','brown quick') @@@ '"quick bro*"'::ftsquery AS prefix_in_phrase_stays_lossy;   -- t
+SELECT to_ftsdoc('simple','brown quick') @@@ '"quick bro*"'::ftsquery AS prefix_in_phrase_checks_positions;   -- f
 -- field-zone labels live in position high bits, so a positionless doc carries no
 -- label information: a zone restriction we cannot evaluate must not match.
 SELECT $$'quick':1$$::ftsdoc @@@ 'quick:A'::ftsquery AS nopos_zone_A_never_matches;   -- f
@@ -3069,3 +3112,80 @@ SELECT to_ftsdoc('simple', 'only a here')
        @@@ to_ftsquery('simple', 'a ' || chr(45) || 'b') AS neg_matches_when_absent;
 SELECT to_ftsdoc('simple', 'a and b here')
        @@@ to_ftsquery('simple', 'a ' || chr(45) || 'b') AS neg_excludes_when_present;
+
+-- Runtime NULL scan keys must not be dereferenced or replaced by ORDER BY keys.
+CREATE TABLE null_scan_keys (id integer, d ftsdoc);
+INSERT INTO null_scan_keys VALUES (1, to_ftsdoc('alpha')), (2, to_ftsdoc('beta'));
+CREATE INDEX null_scan_keys_idx ON null_scan_keys USING fts(d);
+ANALYZE null_scan_keys;
+CREATE TABLE null_scan_rhs (q ftsquery);
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*) AS null_bitmap_rhs FROM null_scan_keys
+WHERE d @@@ (SELECT q FROM null_scan_rhs);
+RESET enable_indexscan;
+SET enable_bitmapscan = off;
+SELECT count(*) AS null_plain_rhs FROM null_scan_keys
+WHERE d @@@ (SELECT q FROM null_scan_rhs);
+SELECT count(*) AS null_filter_with_order FROM
+  (SELECT id FROM null_scan_keys
+   WHERE d @@@ (SELECT q FROM null_scan_rhs)
+   ORDER BY d <=> 'alpha'::ftsquery) s;
+SELECT array_agg(id ORDER BY id) AS null_order_ids,
+       bool_and(distance IS NULL) AS null_order_distances
+FROM (SELECT id, d <=> (SELECT q FROM null_scan_rhs) AS distance
+      FROM null_scan_keys WHERE d @@@ 'alpha'::ftsquery
+      ORDER BY d <=> (SELECT q FROM null_scan_rhs)) s;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+DROP TABLE null_scan_rhs, null_scan_keys;
+
+-- Ranked WAND seeks must not mistake the next term's block for the next block
+-- of the current term.  The last alpha block shares a page with beta's header.
+CREATE TABLE wand_seek_regress (id integer, d ftsdoc);
+INSERT INTO wand_seek_regress
+SELECT g, to_ftsdoc(CASE WHEN g <= 64 THEN 'alpha beta' ELSE 'alpha' END)
+FROM generate_series(1, 129) AS g;
+INSERT INTO wand_seek_regress VALUES (130, to_ftsdoc(repeat('alpha beta ', 20)));
+CREATE INDEX wand_seek_regress_fts ON wand_seek_regress USING fts (d);
+WITH small AS (SELECT * FROM fts_search('wand_seek_regress_fts', 'alpha | beta'::ftsquery, 1)),
+     truth AS (SELECT * FROM fts_search('wand_seek_regress_fts', 'alpha | beta'::ftsquery, 130)
+               ORDER BY score DESC, ctid LIMIT 1)
+SELECT EXISTS (SELECT 1 FROM small s JOIN truth t
+               ON s.ctid = t.ctid AND s.score = t.score) AS wand_seek_exact;
+DROP TABLE wand_seek_regress;
+
+-- MaxScore discards only a low-impact prefix whose combined bound is below
+-- the current threshold.  A suffix bound wrongly loses the superior last row.
+CREATE TABLE maxscore_regress (id integer, d ftsdoc);
+INSERT INTO maxscore_regress
+SELECT g, to_ftsdoc(repeat('alpha beta gamma delta ', 10))
+FROM generate_series(1, 64) AS g;
+INSERT INTO maxscore_regress VALUES
+  (65, to_ftsdoc(repeat('alpha beta gamma delta ', 100)));
+CREATE INDEX maxscore_regress_fts ON maxscore_regress USING fts (d);
+WITH small AS (SELECT * FROM fts_search('maxscore_regress_fts',
+                                        'alpha | beta | gamma | delta'::ftsquery, 1)),
+     truth AS (SELECT * FROM fts_search('maxscore_regress_fts',
+                                        'alpha | beta | gamma | delta'::ftsquery, 65)
+               ORDER BY score DESC, ctid LIMIT 1)
+SELECT EXISTS (SELECT 1 FROM small s JOIN truth t
+               ON s.ctid = t.ctid AND s.score = t.score) AS maxscore_prefix_exact;
+DROP TABLE maxscore_regress;
+
+-- Replacing a tied cutoff score must evict the largest TID, retaining stable
+-- score DESC, TID ASC order for every k.
+CREATE TABLE wand_tie_regress (id integer, d ftsdoc);
+INSERT INTO wand_tie_regress
+SELECT g, to_ftsdoc('alpha') FROM generate_series(1, 256) AS g;
+INSERT INTO wand_tie_regress VALUES (257, to_ftsdoc(repeat('alpha ', 20)));
+CREATE INDEX wand_tie_regress_fts ON wand_tie_regress USING fts (d);
+WITH small AS (SELECT id FROM fts_search('wand_tie_regress_fts', 'alpha'::ftsquery, 64) r
+               JOIN wand_tie_regress d ON d.ctid = r.ctid),
+     truth AS (SELECT id, row_number() OVER (ORDER BY r.score DESC, r.ctid) AS ord
+               FROM fts_search('wand_tie_regress_fts', 'alpha'::ftsquery, 257) r
+               JOIN wand_tie_regress d ON d.ctid = r.ctid)
+SELECT (SELECT array_agg(id ORDER BY id) FROM small) =
+       (SELECT array_agg(id ORDER BY id) FROM truth WHERE ord <= 64)
+       AS wand_cutoff_ties_exact;
+DROP TABLE wand_tie_regress;

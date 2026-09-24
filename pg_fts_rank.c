@@ -182,6 +182,14 @@ fts_bm25_score(FtsDoc doc, FtsQuery q, double N, double avgdl,
 	return score;
 }
 
+double
+fts_bm25_score_index(FtsDoc doc, FtsQuery q, double N, double avgdl,
+					 const double *dfs)
+{
+	return fts_bm25_score(doc, q, N, avgdl, dfs,
+					  BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE);
+}
+
 /*
  * SQL: fts_bm25(doc, query, n_docs float8, avgdl float8 [, dfs float8[]])
  * Returns the BM25 score.  k1/b use the standard defaults.

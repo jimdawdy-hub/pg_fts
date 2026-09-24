@@ -61,12 +61,26 @@
      <para>
       A parsed query.  Supports boolean <literal>&amp;</literal>
       (AND), <literal>|</literal> (OR), <literal>!</literal> (NOT); quoted
-      phrases <literal>"a b c"</literal>; <literal>NEAR(a b, k)</literal>
-      proximity; prefix <literal>term*</literal>; fuzzy
+      phrases <literal>"a b c"</literal>; ordered proximity
+      <literal>NEAR(a b, k)</literal> or <literal>a p/k b</literal>;
+      proximity in either word order <literal>a w/k b</literal>, including
+      <literal>(a | b) w/k c</literal>; prefix <literal>term*</literal>; fuzzy
       <literal>term~k</literal> (edit distance <replaceable>k</replaceable>,
       default&#160;2); and regular expressions <literal>/re/</literal>.
       Produced with <function>to_ftsquery</function> or the input syntax
       (<literal>'a &amp; b'::ftsquery</literal>).
+     </para>
+     <para>
+      <literal>w/k</literal> accepts terms, phrases, OR alternatives and nested
+      proximity groups. It joins nonoverlapping matches whose nearest edges
+      are 1..k token positions apart, in either order. Chaining is left
+      associative; use parentheses to change grouping. AND/NOT operands have
+      no positional span and are rejected inside text proximity.
+      Exact <literal>&lt;-&gt;</literal> and <literal>&lt;N&gt;</literal>
+      measure the gap from the left match's end to the right match's start.
+      <literal>&lt;0&gt;</literal> permits the same position. Quoted phrases
+      preserve removed stopword gaps: <literal>"breach of contract"</literal>
+      under English becomes <literal>'breach' &lt;2&gt; 'contract'</literal>.
      </para>
      <para>
       A leading <literal>-</literal> is also accepted as NOT
@@ -196,11 +210,8 @@ SELECT id FROM docs
       behaves, so a stopword can never silently zero out a boolean query.
       Prefix (<literal>term*</literal>), fuzzy (<literal>term~k</literal>), and
       regex (<literal>/re/</literal>) terms are matched literally and are never
-      stopword-normalized.  Note that <literal>and</literal>,
-      <literal>or</literal>, <literal>not</literal>, and <literal>near</literal>
-      are reserved query operators and cannot currently be searched for as
-      literal words (even quoted); this is a rare limitation for natural-language
-      corpora, where they are stopwords anyway.
+      stopword-normalized. Reserved words such as <literal>and</literal> and
+      <literal>or</literal> can be searched as literal terms when quoted.
      </para>
     </listitem>
    </varlistentry>
@@ -401,9 +412,9 @@ SELECT fts_count('docs_bm25', to_ftsquery('english', 'brown'));
   </para>
   <para>
    Building the index <literal>WITH (positions = on)</literal> stores per-token
-   positions in the posting lists, so phrase and NEAR are answered directly from
-   the index -- with no heap access and no recheck -- bringing phrase count and
-   match to posting-scan speed:
+   positions in the posting lists. Positive combinations of plain terms,
+   phrases, OR groups and nested proximity can be answered directly from
+   those positions, without heap rechecks:
 <programlisting>
 CREATE INDEX docs_bm25 ON docs USING fts (to_ftsdoc('english', body))
   WITH (positions = on);
@@ -411,11 +422,11 @@ CREATE INDEX docs_bm25 ON docs USING fts (to_ftsdoc('english', body))
    The trade-off is index size: positions roughly double the posting bytes on
    high-term-frequency corpora (little effect when terms occur once per
    document).  Positions are decoded lazily, so plain ranked / boolean / count
-   queries are unaffected whether positions are on or off.  Phrase and NEAR are
-   always <emphasis>correct</emphasis> either way; <literal>positions = on</literal>
-   only makes them <emphasis>fast</emphasis> (index-only).  This is an on-disk
-   format change (BM25 v2 &rarr; v3); an index built by an older release must be
-   <command>REINDEX</command>ed.
+   queries are unaffected whether positions are on or off. Modifier terms,
+   weighted terms, AND/NOT combinations and oversized position sets use exact
+   heap rechecks. Results agree with either position setting. The earlier introduction of stored positions changed the
+   on-disk format (BM25 v2 &rarr; v3) and required <command>REINDEX</command>.
+   The proximity syntax described here does not change that format.
   </para>
   <para>
    The size of that difference is easy to underestimate.  Measured on 2,188,038
@@ -516,9 +527,9 @@ SELECT * FROM messages
   <para>
    Field restriction needs the document to carry token positions (the labels
    ride on positions), so build the index <literal>WITH (positions = on)</literal>
-   for field-restricted ranked or count queries.  Weight labels apply to plain
-   terms; combining a label with a prefix, fuzzy, or regex term
-   (<literal>vacuum:A*</literal>) is a syntax error.
+   for positional index queries. Weight labels apply to plain terms and
+   prefixes (<literal>vacuum*:A</literal> or <literal>vacuum:*A</literal>).
+   Fuzzy+weight combinations and regex modifiers raise a syntax error.
   </para>
   <para>
    This is <emphasis>not</emphasis> an on-disk index format change: labels live
@@ -854,6 +865,12 @@ SELECT * FROM messages
   <title>Limitations</title>
 
   <itemizedlist>
+   <listitem><para>
+    The configured analyzer inherits PostgreSQL's 16,383-position cap. A phrase
+    after 17,000 filler words can fail on <literal>to_ftsdoc('simple', text)</literal>
+    but match on unconfigured <literal>to_ftsdoc(text)</literal>, which stores
+    wider positions. Existing values cannot recover positions already lost.
+   </para></listitem>
    <listitem>
     <para>
      No index-only scan (the index is not covering); use
@@ -868,11 +885,10 @@ SELECT * FROM messages
    </listitem>
    <listitem>
     <para>
-     Ranked results cover flushed segments; documents still in the pending
-     write buffer are found by <literal>@@@</literal> and counted by
-     <function>fts_count</function>, but are ranked by <literal>&lt;=&gt;</literal>
-     only after the next flush (<command>VACUUM</command> or
-     <function>fts_merge</function>).
+     Pending documents and modifier queries use an exact heap ranking fallback.
+     Plain merged queries retain WAND. Ranking uses literal query-term BM25
+     scores, so expansion-only matches can score zero. Equal scores are ordered
+     by tuple identifier to keep pagination stable.
     </para>
    </listitem>
    <listitem>

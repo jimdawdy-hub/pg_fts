@@ -64,6 +64,10 @@ jobs:
           pg_virtualenv -v ${{ matrix.pg }} \
             make installcheck PROVE_TESTS=ci/noop.pl PG_CONFIG=$PGBIN/pg_config
 
+      - name: Binary query input validation
+        continue-on-error: ${{ matrix.pg == 19 }}
+        run: pg_virtualenv -v ${{ matrix.pg }} python3 test/query_binary.py --local
+
       - name: TAP tests (corruption recovery, server encodings, concurrency)
         # Gating on 17/18 (the supported majors); best-effort on 19-devel.
         # t/003 (torn-page/corruption), t/004 (server encodings), t/005 (scan-vs-
@@ -71,10 +75,8 @@ jobs:
         # t/008 (fts_vacuum reclaim) run here: t/001 (crash recovery) and t/002
         # (replication) need a full PostgreSQL::Test cluster-management setup that
         # pg_virtualenv does not provide, so they run locally / are exercised
-        # elsewhere.  t/006 runs in a separate non-gating step below (a rare
-        # intermittent crash under very heavy concurrent churn flakes on this
-        # runner's timing; see DEFERRED.md).  (The Nix flake tap-pg17/tap-pg18
-        # checks gate t/006 too, where it is stable.)
+        # elsewhere.  t/006 and t/010 also gate both supported majors here and
+        # in the Nix flake.
         continue-on-error: ${{ matrix.pg == 19 }}
         run: |
           PGBIN=/usr/lib/postgresql/${{ matrix.pg }}/bin
@@ -154,7 +156,7 @@ jobs:
             LD_PRELOAD="$ASAN_LIB" \
             LD_LIBRARY_PATH="$ASAN_DIR:${LD_LIBRARY_PATH:-}" \
             ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1:verify_asan_link_order=0" \
-            make installcheck REGRESS="pg_fts unicode_fold" PROVE_TESTS=ci/noop.pl PG_CONFIG=$PGBIN/pg_config
+            make installcheck REGRESS="pg_fts unicode_fold legal_proximity" PROVE_TESTS=ci/noop.pl PG_CONFIG=$PGBIN/pg_config
       - name: Show diffs on failure
         if: failure()
         run: |

@@ -114,6 +114,7 @@ typedef struct BM25ScanOpaqueData
 {
 	FtsQuery	query;			/* copied into the scan's context */
 	bool		queryValid;
+	bool		orderByNull;	/* strict NULL <=> key: filter rows, return NULL distance */
 	/* ordering-scan (amgettuple) state, materialized on first call */
 	bool		orderInit;		/* have we computed the ordered results? */
 	ScoredTid  *ordered;		/* top-k by ascending distance */
@@ -763,6 +764,81 @@ bm25_lookup_prefix(Relation index, const BM25SegMeta *seg,
 }
 
 /*
+ * Pattern leaves in compound queries must contribute their own candidate set;
+ * unioning only pattern leaves loses ordinary OR alternatives. Native matching
+ * also keeps Unicode edit distances identical to the positional heap matcher.
+ * ponytail: linear dictionary scan; add safe pattern pruning if it dominates.
+ */
+static TidSet
+bm25_lookup_pattern(Relation index, const BM25SegMeta *seg,
+                    FtsQuery q, FtsQueryItem *it)
+{
+	TidSet result = {NULL, 0};
+	BlockNumber blk = seg->dictstart;
+	const char *term = FTS_QUERY_ITEMTEXT(q, it);
+	text *pattern = it->flags & FTS_QF_REGEX ?
+		cstring_to_text_with_len(term, it->termlen) : NULL;
+
+	while (blk != InvalidBlockNumber)
+	{
+		Buffer buffer;
+		Page page;
+		char *ptr, *end;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();
+		buffer = bm25_scan_readbuf(index, blk);
+		if (!BufferIsValid(buffer))
+			break;
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		ptr = (char *) PageGetContents(page);
+		end = bm25_page_data_end(page);
+		next = BM25PageGetOpaque(page)->nextblk;
+		while (ptr < end)
+		{
+			BM25DictEntry *de = (BM25DictEntry *) ptr;
+			bool matches;
+
+			if (!bm25_dict_entry_fits(de, end))
+				break;
+			matches = pattern ? RE_compile_and_execute(pattern, de->term,
+				de->termlen, REG_ADVANCED, C_COLLATION_OID, 0, NULL) :
+				varstr_levenshtein_less_equal(term, it->termlen, de->term,
+					de->termlen, 1, 1, 1, it->distance, true) <= it->distance;
+			if (matches)
+			{
+				BM25Posting *post;
+				int np = bm25_decode_term(index, de->firstposting,
+					de->firstoffset, de->df, &post, NULL, false, NULL, true,
+					seg->doclenstart == InvalidBlockNumber);
+				TidSet run;
+				TidSet merged;
+				int j;
+
+				run.n = np;
+				run.tids = FTS_ALLOC_MAYBE_HUGE((Size) Max(np, 1) * sizeof(ItemPointerData));
+				for (j = 0; j < np; j++)
+					run.tids[j] = post[j].tid;
+				tidset_sort_uniq(&run);
+				merged = tidset_or(result, run);
+				if (result.tids)
+					pfree(result.tids);
+				pfree(run.tids);
+				pfree(post);
+				result = merged;
+			}
+			ptr += MAXALIGN(offsetof(BM25DictEntry, term) + de->termlen);
+		}
+		UnlockReleaseBuffer(buffer);
+		blk = next;
+	}
+	if (pattern)
+		pfree(pattern);
+	return result;
+}
+
+/*
  * Evaluate the query into a TidSet via a stack machine over the RPN items.
  * NOT is handled specially: a bare NOT is only meaningful as "a AND NOT b", so
  * we track whether each stack entry is "positive" (a TID set) or "negative"
@@ -802,7 +878,9 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		{
 			TidSet		s;
 
-			if (it->flags & FTS_QF_PREFIX)
+			if (it->flags & (FTS_QF_FUZZY | FTS_QF_REGEX))
+				s = bm25_lookup_pattern(index, seg, q, it);
+			else if (it->flags & FTS_QF_PREFIX)
 				bm25_lookup_prefix(index, seg,
 								   FTS_QUERY_ITEMTEXT(q, it), it->termlen, &s);
 			else if (!bm25_lookup_term(index, seg,
@@ -836,10 +914,11 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 			EvalVal		a = stack[--top];
 			EvalVal		res;
 
-			if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE)
+			if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE ||
+				it->op == FTS_OP_WITHIN || it->op == FTS_OP_EXACT)
 			{
-				/* PHRASE is treated as AND for candidate generation; the
-				 * bitmap heap recheck (@@@) enforces adjacency exactly. */
+				/* Proximity is treated as AND for candidate generation; the
+				 * bitmap heap recheck (@@@) enforces distance exactly. */
 				if (!a.negated && !b.negated)
 				{
 					res.set = tidset_and(a.set, b.set);
@@ -898,18 +977,19 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 
 /*
  * bm25_fuzzy_terms -- collect the postings of every dictionary term within edit
- * distance k of `term`, using the Levenshtein automaton (pg_fts_lev.c) directly
- * over the sorted dictionary.  This is EXACT: only true within-k terms are
- * collected, so no heap recheck is needed (unlike the trigram funnel, which
- * over-generates candidates that must be re-verified per doc).  Returns true
- * (always applicable); *out is a sorted TidSet.  For query terms longer than
- * the automaton bound, returns false so the caller falls back to the funnel.
+ * distance k of `term`. ASCII terms use the Levenshtein automaton
+ * (pg_fts_lev.c); other terms use PostgreSQL's character-aware matcher.
+ * This is exact, so no heap recheck is needed. *out is a sorted TidSet.
+ * Query terms longer than the automaton bound return false so the caller
+ * uses the native dictionary matcher for the whole query term.
  */
 static bool
 bm25_fuzzy_terms(Relation index, const BM25SegMeta *seg,
 				 const char *term, int termlen, int k, TidSet *out)
 {
 	FtsLevAut	aut;
+	bool		query_ascii = true;
+	int			qi;
 	BlockNumber blk;
 	ItemPointerData *tids;
 	unsigned char nextkey[FTS_LEV_MAXQ + 2];
@@ -922,7 +1002,11 @@ bm25_fuzzy_terms(Relation index, const BM25SegMeta *seg,
 	int64		total = 0;
 
 	if (termlen > FTS_LEV_MAXQ)
-		return false;			/* fall back to trigram funnel + recheck */
+		return false;			/* native dictionary fallback */
+
+	for (qi = 0; qi < termlen; qi++)
+		if ((unsigned char) term[qi] >= 0x80)
+			query_ascii = false;
 
 	aut.q = (const unsigned char *) term;
 	aut.m = termlen;
@@ -967,17 +1051,26 @@ bm25_fuzzy_terms(Relation index, const BM25SegMeta *seg,
 				break;		/* recycled/corrupt page: stop (see bm25_dict_entry_fits) */
 			esize = MAXALIGN(offsetof(BM25DictEntry, term) + de->termlen);
 
-			if (abs((int) de->termlen - termlen) <= k)
-				match = fts_lev_match_prefix(&aut,
-											 (const unsigned char *) de->term,
-											 (int) de->termlen, &deadlen);
-			else
 			{
-				/* run the automaton anyway to learn the dead prefix for skipping */
-				match = fts_lev_match_prefix(&aut,
-											 (const unsigned char *) de->term,
-											 (int) de->termlen, &deadlen);
-				match = false;		/* length filter still rules it out */
+				bool ascii = query_ascii;
+				int j;
+
+				for (j = 0; ascii && j < de->termlen; j++)
+					if ((unsigned char) de->term[j] >= 0x80)
+						ascii = false;
+				if (ascii && k < FTS_LEV_MAXQ)
+					match = fts_lev_match_prefix(&aut,
+						(const unsigned char *) de->term, de->termlen, &deadlen);
+				else
+				{
+					/* An ASCII dead prefix cannot match any continuation, even
+					 * Unicode. Non-ASCII prefixes need character-based matching;
+					 * do not apply byte-prefix skipping to them. Large k also
+					 * bypasses the automaton's int16 rows and fixed seek buffer. */
+					match = varstr_levenshtein_less_equal(term, termlen, de->term,
+						de->termlen, 1, 1, 1, k, true) <= k;
+					deadlen = de->termlen;
+				}
 			}
 
 			if (match)
@@ -1027,7 +1120,8 @@ bm25_fuzzy_terms(Relation index, const BM25SegMeta *seg,
 			 * consumed without dying (it failed only on length or final accept),
 			 * so LONGER terms with this prefix may still match -- must NOT skip.
 			 */
-			if (deadlen > 0 && deadlen < (int) de->termlen)
+			if (deadlen > 0 && deadlen < (int) de->termlen &&
+				deadlen <= FTS_LEV_MAXQ)
 			{
 				int			kl = deadlen;
 
@@ -1318,13 +1412,19 @@ bm25_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			ScanKey orderbys, int norderbys)
 {
 	BM25ScanOpaque so = (BM25ScanOpaque) scan->opaque;
+	bool		nullFilter = false;
+	int			i;
 
 	if (scankey && scan->numberOfKeys > 0)
 		memmove(scan->keyData, scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
 
+	for (i = 0; i < scan->numberOfKeys; i++)
+		if (scan->keyData[i].sk_flags & SK_ISNULL)
+			nullFilter = true;
+	so->query = NULL;
 	so->queryValid = false;
-	if (scan->numberOfKeys >= 1)
+	if (scan->numberOfKeys >= 1 && !nullFilter)
 	{
 		FtsQuery	q = DatumGetFtsQuery(scan->keyData[0].sk_argument);
 
@@ -1345,10 +1445,22 @@ bm25_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
+	so->orderByNull = false;
 	if (scan->numberOfOrderBys >= 1)
 	{
-		so->query = DatumGetFtsQuery(scan->orderByData[0].sk_argument);
-		so->queryValid = true;
+		if (scan->orderByData[0].sk_flags & SK_ISNULL)
+		{
+			so->orderByNull = true;
+			if (scan->numberOfKeys == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("pg_fts: ORDER BY distance to NULL requires a search filter")));
+		}
+		else if (!nullFilter)
+		{
+			so->query = DatumGetFtsQuery(scan->orderByData[0].sk_argument);
+			so->queryValid = true;
+		}
 	}
 }
 
@@ -1429,7 +1541,7 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * from the same evaluator, so results are identical; the executor applies
 	 * MVCC visibility on the heap fetch.
 	 */
-	if (scan->numberOfOrderBys == 0)
+	if (scan->numberOfOrderBys == 0 || so->orderByNull)
 	{
 		if (!so->plainInit)
 		{
@@ -1447,6 +1559,15 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 		scan->xs_heaptid = so->plainTids[so->plainpos++];
 		scan->xs_recheck = so->plainRecheck;
 		bm25_set_itup(scan, so);
+		if (so->orderByNull)
+		{
+			IndexOrderByDistance dist;
+			Oid			typ = FLOAT8OID;
+
+			dist.value = 0;
+			dist.isnull = true;
+			index_store_float8_orderby_distances(scan, &typ, &dist, false);
+		}
 		return true;
 	}
 
@@ -1560,6 +1681,7 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
  * to_ftsquery produces for "a b c" and NEAR(a b c, k).  Anything mixing phrase
  * with boolean AND/OR/NOT, or a phrase term that is a prefix/fuzzy/regex, is
  * left to the existing AND + recheck path (still correct, just slower).
+ * A single two-term WITHIN also uses this path, checking both word orders.
  */
 
 /* one term's postings decoded with positions, docid-sorted */
@@ -1579,23 +1701,84 @@ typedef struct PosTermList
 }			PosTermList;
 
 /*
- * Is the query a pure phrase chain we can evaluate positionally?  Returns the
- * ordered list of term-operand indices (into query->items) via *termidx and
- * their count via *nterms, plus the max phrase distance (all PHRASE ops share
- * the chain).  Requires: items are VAL/PHRASE only, every VAL is a plain term
- * (no PREFIX/FUZZY/REGEX), and the RPN is the canonical left-deep phrase chain
- * (v1 v2 PHRASE v3 PHRASE ...).  For NEAR the per-op distance may differ per
- * step; we carry each step's distance in *dist[].
+ * Recognize a pure, left-deep PHRASE chain, a two-term WITHIN, or one of the
+ * two three-term shapes (A OR B) WITHIN C / C WITHIN (A OR B).  All VALs must
+ * be plain terms.  The OR shapes use C as the posting-list driver; *or_anchor
+ * is its position in termidx (otherwise -1).  Other shapes use heap recheck.
  */
 static bool
-bm25_phrase_chain(FtsQuery q, int *termidx, uint32 *stepdist, int *nterms)
+bm25_phrase_chain(FtsQuery q, int *termidx, uint32 *stepdist, bool *stepexact,
+                  int *nterms,
+				  int *or_anchor)
 {
 	int			nt = 0;
 	uint32		i;
 	int			stack = 0;
 
+	*or_anchor = -1;
+
 	if (q->nitems < 3)
 		return false;			/* need at least v v PHRASE */
+	if (q->nitems == 5 && q->items[4].type == FTS_QI_OPR &&
+		q->items[4].op == FTS_OP_WITHIN)
+	{
+		int			or_idx = (q->items[2].type == FTS_QI_OPR &&
+						  q->items[2].op == FTS_OP_OR) ? 2 : 3;
+		int			val_idx[3] = {0, 1, or_idx == 2 ? 3 : 2};
+
+		if (q->items[or_idx].type == FTS_QI_OPR &&
+			q->items[or_idx].op == FTS_OP_OR)
+		{
+			for (i = 0; i < 3; i++)
+			{
+				FtsQueryItem *it = &q->items[val_idx[i]];
+
+				if (it->type != FTS_QI_VAL ||
+					(it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX)))
+					return false;
+				termidx[i] = val_idx[i];
+			}
+			stepdist[0] = q->items[4].distance;
+			*nterms = 3;
+			*or_anchor = or_idx == 2 ? 2 : 0;
+			return true;
+		}
+	}
+
+	{
+		bool all_exact = true;
+		int ends[FTS_QUERY_MAX_PHRASE_TERMS];
+
+		for (i = 0; i < q->nitems; i++)
+			if (q->items[i].type == FTS_QI_OPR && q->items[i].op != FTS_OP_EXACT)
+				all_exact = false;
+		if (all_exact)
+		{
+			for (i = 0; i < q->nitems; i++)
+			{
+				FtsQueryItem *it = &q->items[i];
+
+				if (it->type == FTS_QI_VAL)
+				{
+					if (it->flags != 0 || nt >= FTS_QUERY_MAX_PHRASE_TERMS)
+						return false;
+					termidx[nt] = i;
+					ends[stack++] = nt++;
+				}
+				else
+				{
+					int boundary = ends[stack - 2];
+
+					stepdist[boundary] = it->distance;
+					stepexact[boundary] = true;
+					ends[stack - 2] = ends[stack - 1];
+					stack--;
+				}
+			}
+			*nterms = nt;
+			return stack == 1 && nt >= 2;
+		}
+	}
 
 	for (i = 0; i < q->nitems; i++)
 	{
@@ -1623,12 +1806,15 @@ bm25_phrase_chain(FtsQuery q, int *termidx, uint32 *stepdist, int *nterms)
 			termidx[nt++] = (int) i;
 			stack++;
 		}
-		else if (it->type == FTS_QI_OPR && it->op == FTS_OP_PHRASE)
+		else if (it->type == FTS_QI_OPR &&
+				 (it->op == FTS_OP_PHRASE || it->op == FTS_OP_EXACT ||
+				  (it->op == FTS_OP_WITHIN && q->nitems == 3 && i == 2)))
 		{
 			if (stack < 2)
 				return false;
 			/* step k joins term (nt-1) to its predecessor: record its distance */
 			stepdist[nt - 2] = it->distance;
+			stepexact[nt - 2] = it->op == FTS_OP_EXACT;
 			stack--;			/* phrase collapses two operands to one */
 		}
 		else
@@ -1636,6 +1822,32 @@ bm25_phrase_chain(FtsQuery q, int *termidx, uint32 *stepdist, int *nterms)
 	}
 	*nterms = nt;
 	return (stack == 1 && nt >= 2);
+}
+
+/* Compound proximity/OR with plain positive terms can use the span matcher. */
+static bool
+bm25_span_query(FtsQuery q)
+{
+	uint32		i;
+	bool		has_proximity = false;
+
+	for (i = 0; i < q->nitems; i++)
+	{
+		FtsQueryItem *it = &q->items[i];
+
+		if (it->type == FTS_QI_VAL)
+		{
+			if (it->flags != 0)
+				return false;
+		}
+		else if (it->type == FTS_QI_OPR &&
+				 (it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
+				  it->op == FTS_OP_EXACT))
+			has_proximity = true;
+		else if (it->type != FTS_QI_OPR || it->op != FTS_OP_OR)
+			return false;
+	}
+	return has_proximity;
 }
 
 static int
@@ -1800,12 +2012,14 @@ bm25_pospost_find(PosTermList *pl, uint64 docid)
  */
 static bool
 bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
-					 const int *termidx, const uint32 *stepdist, int nterms,
+					 const int *termidx, const uint32 *stepdist,
+                     const bool *stepexact, int nterms,
+					 int or_anchor,
 					 ItemPointerData **tids, int *ntids, int *captids)
 {
 	PosTermList *tl = (PosTermList *) palloc0(nterms * sizeof(PosTermList));	/* alloc-ok: nterms = query term count */
 	int			t;
-	int			base = -1;		/* index of the smallest-df (driving) term */
+	int			base = or_anchor;	/* OR: common term; phrase: smallest-df term */
 	PosPosting *driver;
 	int			di;
 	bool		ok = true;
@@ -1824,13 +2038,14 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 			ok = false;			/* found but positions missing: fall back to recheck */
 			goto done;
 		}
-		if (rc == BM25_POSLOOKUP_ABSENT)
+		if (rc == BM25_POSLOOKUP_ABSENT &&
+			(or_anchor < 0 || t == or_anchor))
 			goto done;			/* term absent: phrase cannot match this segment */
-		if (base < 0 || tl[t].nposts < tl[base].nposts)
+		if (or_anchor < 0 && (base < 0 || tl[t].nposts < tl[base].nposts))
 			base = t;
 	}
 
-	/* drive the docid intersection from the smallest posting list */
+	/* For OR drive C; otherwise intersect from the smallest posting list. */
 	driver = tl[base].posts;
 	for (di = 0; di < tl[base].nposts; di++)
 	{
@@ -1845,7 +2060,7 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		for (t = 0; t < nterms; t++)
 		{
 			pp[t] = (t == base) ? &driver[di] : bm25_pospost_find(&tl[t], docid);
-			if (pp[t] == NULL)
+			if (pp[t] == NULL && (or_anchor < 0 || t == or_anchor))
 			{
 				allpresent = false;
 				break;
@@ -1853,28 +2068,60 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		}
 		if (!allpresent)
 			continue;
-
-		/* chain phrase_step across the terms: acc starts as term 0's positions */
-		if (pp[0]->npos > BM25_PHRASE_POSBUF)
+		if (or_anchor >= 0)
 		{
-			ok = false;			/* pathological tf: fall back (bounded buffer) */
-			goto done;
-		}
-		memcpy(acc, pp[0]->pos, pp[0]->npos * sizeof(uint32));
-		nacc = pp[0]->npos;
-		for (t = 1; t < nterms && nacc > 0; t++)
-		{
-			int			nout = 0;
-
-			if (pp[t]->npos > BM25_PHRASE_POSBUF)
+			nacc = 0;
+			for (t = 0; t < nterms; t++)
 			{
-				ok = false;
+				if (pp[t] && pp[t]->npos > BM25_PHRASE_POSBUF)
+				{
+					ok = false;
+					goto done;
+				}
+			}
+			for (t = 0; t < nterms; t++)
+			{
+				if (t == or_anchor || pp[t] == NULL)
+					continue;
+				fts_phrase_step_pos(pp[t]->pos, pp[t]->npos,
+								pp[or_anchor]->pos, pp[or_anchor]->npos,
+								stepdist[0], false, tmp, &nacc);
+				if (nacc == 0)
+					fts_phrase_step_pos(pp[or_anchor]->pos, pp[or_anchor]->npos,
+									pp[t]->pos, pp[t]->npos,
+									stepdist[0], false, tmp, &nacc);
+				if (nacc > 0)
+					break;
+			}
+		}
+		else
+		{
+			/* Chain phrase steps from the first term's positions. */
+			if (pp[0]->npos > BM25_PHRASE_POSBUF)
+			{
+				ok = false;		/* pathological tf: bounded buffer */
 				goto done;
 			}
-			fts_phrase_step_pos(acc, nacc, pp[t]->pos, pp[t]->npos,
-								stepdist[t - 1], tmp, &nout);
-			memcpy(acc, tmp, nout * sizeof(uint32));
-			nacc = nout;
+			memcpy(acc, pp[0]->pos, pp[0]->npos * sizeof(uint32));
+			nacc = pp[0]->npos;
+			for (t = 1; t < nterms && nacc > 0; t++)
+			{
+				int			nout = 0;
+
+				if (pp[t]->npos > BM25_PHRASE_POSBUF)
+				{
+					ok = false;
+					goto done;
+				}
+				fts_phrase_step_pos(acc, nacc, pp[t]->pos, pp[t]->npos,
+									stepdist[t - 1], stepexact[t - 1], tmp, &nout);
+				memcpy(acc, tmp, nout * sizeof(uint32));
+				nacc = nout;
+			}
+			if (nacc == 0 && nterms == 2 && q->items[2].op == FTS_OP_WITHIN)
+				fts_phrase_step_pos(pp[1]->pos, pp[1]->npos,
+									pp[0]->pos, pp[0]->npos,
+									stepdist[0], false, tmp, &nacc);
 		}
 		if (nacc > 0)
 		{
@@ -1897,6 +2144,97 @@ done:
 	return ok;
 }
 
+/* Verify compound proximity candidates without fetching heap tuples. */
+static bool
+bm25_span_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
+				   ItemPointerData **tids, int *ntids, int *captids)
+{
+	MemoryContext segctx = AllocSetContextCreate(CurrentMemoryContext,
+											  "pg_fts span segment", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext docctx;
+	MemoryContext oldctx = MemoryContextSwitchTo(segctx);
+	PosTermList *terms = palloc0((Size) q->nitems * sizeof(PosTermList));
+	TidSet		universe = {NULL, 0};
+	TidSet		candidates = bm25_eval_query(index, seg, q, universe);
+	uint32		i;
+	int			ci;
+	bool		ok = true;
+
+	if (candidates.n == 0)
+		goto done;
+	for (i = 0; i < q->nitems; i++)
+	{
+		FtsQueryItem *it = &q->items[i];
+
+		if (it->type == FTS_QI_VAL &&
+			bm25_lookup_term_pos(index, seg, FTS_QUERY_ITEMTEXT(q, it),
+								it->termlen, &terms[i]) == BM25_POSLOOKUP_NOPOS)
+		{
+			ok = false;
+			goto done;
+		}
+	}
+	docctx = AllocSetContextCreate(segctx, "pg_fts span document",
+									 ALLOCSET_SMALL_SIZES);
+	MemoryContextSwitchTo(oldctx);
+
+	for (ci = 0; ci < candidates.n; ci++)
+	{
+		uint64		docid = bm25_tid_to_docid(&candidates.tids[ci]);
+		FtsMatchValue *values;
+		bool		overflow = false;
+		bool		matched;
+
+		CHECK_FOR_INTERRUPTS();
+		MemoryContextSwitchTo(docctx);
+		values = palloc0((Size) q->nitems * sizeof(FtsMatchValue));
+		for (i = 0; i < q->nitems; i++)
+		{
+			PosPosting *pp;
+			int			j;
+
+			if (q->items[i].type != FTS_QI_VAL)
+				continue;
+			pp = bm25_pospost_find(&terms[i], docid);
+			if (pp == NULL)
+				continue;
+			if (pp->npos > BM25_PHRASE_POSBUF)
+			{
+				overflow = true;
+				break;
+			}
+			values[i].present = true;
+			values[i].nspans = pp->npos;
+			values[i].spans = palloc((Size) Max(pp->npos, 1) * sizeof(FtsMatchSpan)); /* alloc-ok: npos <= BM25_PHRASE_POSBUF above */
+			for (j = 0; j < pp->npos; j++)
+				values[i].spans[j].start = values[i].spans[j].end =
+					FTS_POS_ORD(pp->pos[j]);
+		}
+		matched = !overflow &&
+			fts_match_eval(q, values, BM25_PHRASE_POSBUF, &overflow);
+		MemoryContextSwitchTo(oldctx);
+		MemoryContextReset(docctx);
+		if (overflow)
+		{
+			ok = false;
+			break;
+		}
+		if (matched)
+		{
+			if (*ntids >= *captids)
+			{
+				*captids = Max(*captids * 2, 16);
+				*tids = repalloc(*tids, (Size) *captids * sizeof(ItemPointerData));
+			}
+			(*tids)[(*ntids)++] = candidates.tids[ci];
+		}
+	}
+done:
+	MemoryContextSwitchTo(oldctx);
+	MemoryContextDelete(segctx);
+	return ok;
+}
+
 /*
  * Per-scan evaluation state shared between bm25_collect_matches and the
  * per-segment evaluator it delegates to.  Bundled so the evaluator's signature
@@ -1912,9 +2250,12 @@ typedef struct BM25CollectCtx
 	bool		has_phrase;
 	/* positional-phrase fast path */
 	bool		use_pos_phrase;
+	bool		use_pos_span;
 	int		   *pterm;
 	uint32	   *pstep;
+	bool	   *pexact;
 	int			npterm;
+	int			or_anchor;
 	ItemPointerData *ptids;
 	int			nptids;
 	int			captids;
@@ -1949,6 +2290,23 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 	if (sg->dictstart == InvalidBlockNumber)
 		return SEG_OK;
 
+	if (ctx->has_fuzzy_regex && query->nitems > 1)
+	{
+		TidSet candidates;
+
+		universe.tids = NULL;
+		universe.n = 0;
+		if (ctx->has_not)
+			universe = bm25_universe_bounded(index, sg->dictstart, sg->ndocs,
+												sg->doclenstart == InvalidBlockNumber);
+		candidates = bm25_eval_query(index, sg, query, universe);
+		ctx->need_recheck = true;
+		bm25_filter_tombstoned_seg(ctx->seg_tombs, s, &candidates);
+		if (candidates.n > 0)
+			ctx->acc = tidset_or(ctx->acc, candidates);
+		return SEG_OK;
+	}
+
 	if (ctx->has_fuzzy_regex)
 	{
 		TidSet		cands;
@@ -1969,15 +2327,15 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 
 			if (it->flags & FTS_QF_FUZZY)
 			{
-				if (bm25_fuzzy_terms(index, sg,
-									 FTS_QUERY_ITEMTEXT(query, it),
-									 it->termlen, (int) it->distance, &ts))
-				{
-					cands = tidset_or(cands, ts);
-					any_trgm = true;
-					continue;
-				}
+				if (!bm25_fuzzy_terms(index, sg,
+									  FTS_QUERY_ITEMTEXT(query, it),
+									  it->termlen, (int) it->distance, &ts))
+					ts = bm25_lookup_pattern(index, sg, query, it);
+				cands = tidset_or(cands, ts);
+				any_trgm = true;
+				continue;
 			}
+
 			exact = false;
 			if (bm25_trgm_candidates(index, sg->trgmstart,
 									 sg->dictstart,
@@ -2056,8 +2414,12 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 			ctx->captids = 64;
 			ctx->ptids = (ItemPointerData *) palloc(ctx->captids * sizeof(ItemPointerData));
 		}
-		if (!bm25_phrase_eval_seg(index, sg, query, ctx->pterm, ctx->pstep, ctx->npterm,
-								  &ctx->ptids, &ctx->nptids, &ctx->captids))
+		if (!(ctx->use_pos_span ?
+			  bm25_span_eval_seg(index, sg, query,
+								 &ctx->ptids, &ctx->nptids, &ctx->captids) :
+			  bm25_phrase_eval_seg(index, sg, query, ctx->pterm, ctx->pstep,
+								   ctx->pexact, ctx->npterm, ctx->or_anchor,
+								   &ctx->ptids, &ctx->nptids, &ctx->captids)))
 			return SEG_RESTART;
 
 		/* filter ONLY this segment's new hits (ptids[seg_start..nptids])
@@ -2197,9 +2559,12 @@ bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck)
 	bool		has_weighted = false;
 	bool		need_recheck = false;
 	bool		use_pos_phrase = false;	/* positional phrase fast path applies */
+	bool		use_pos_span = false;
 	int			pterm[FTS_QUERY_MAX_PHRASE_TERMS];
 	uint32		pstep[FTS_QUERY_MAX_PHRASE_TERMS] = {0};
+	bool		pexact[FTS_QUERY_MAX_PHRASE_TERMS] = {false};
 	int			npterm = 0;
+	int			or_anchor = -1;
 	ItemPointerData *ptids = NULL;
 	int			nptids = 0;
 	int			captids = 0;
@@ -2251,7 +2616,9 @@ collect_retry:
 
 		if (it->type == FTS_QI_OPR && it->op == FTS_OP_NOT)
 			has_not = true;
-		if (it->type == FTS_QI_OPR && it->op == FTS_OP_PHRASE)
+		if (it->type == FTS_QI_OPR &&
+			(it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
+			 it->op == FTS_OP_EXACT))
 			has_phrase = true;
 		if (it->type == FTS_QI_VAL && (it->flags & (FTS_QF_FUZZY | FTS_QF_REGEX)))
 			has_fuzzy_regex = true;
@@ -2279,9 +2646,13 @@ collect_retry:
 	 * slower).
 	 */
 	if (has_phrase && !has_fuzzy_regex && !has_not && !has_weighted &&
-		bm25_index_wants_positions(index) &&
-		bm25_phrase_chain(query, pterm, pstep, &npterm))
-		use_pos_phrase = true;
+		bm25_index_wants_positions(index))
+	{
+		if (bm25_phrase_chain(query, pterm, pstep, pexact, &npterm, &or_anchor))
+			use_pos_phrase = true;
+		else if (bm25_span_query(query))
+			use_pos_phrase = use_pos_span = true;
+	}
 
 	/*
 	 * Load per-segment tombstones once.  Each segment's match contribution is
@@ -2300,9 +2671,12 @@ collect_retry:
 		ctx.has_not = has_not;
 		ctx.has_phrase = has_phrase;
 		ctx.use_pos_phrase = use_pos_phrase;
+		ctx.use_pos_span = use_pos_span;
 		ctx.pterm = pterm;
 		ctx.pstep = pstep;
+		ctx.pexact = pexact;
 		ctx.npterm = npterm;
+		ctx.or_anchor = or_anchor;
 		ctx.ptids = ptids;
 		ctx.nptids = nptids;
 		ctx.captids = captids;
@@ -2794,7 +3168,8 @@ cmp_scored_desc(const void *a, const void *b)
 		return 1;
 	if (sa > sb)
 		return -1;
-	return 0;
+	return ItemPointerCompare((ItemPointer) &((const ScoredTid *) a)->tid,
+							  (ItemPointer) &((const ScoredTid *) b)->tid);
 }
 
 /*
@@ -3191,7 +3566,11 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 			nextp = (char *) MAXALIGN((char *) (bh + 1) + bh->bytelen + bh->posbytelen);
 			/* can we prove this whole block is < target? need the next block's
 			 * first_docid (on this page) to be <= target. */
-			if (nextp + sizeof(BM25BlockHdr) <= pend)
+			/* The following header may belong to a different term when this is
+			 * the final block in this term's posting list.  Its first_docid cannot
+			 * prove this block is below target. */
+			if (c->nread + (int) bh->count < (int) c->df &&
+				nextp + sizeof(BM25BlockHdr) <= pend)
 			{
 				BM25BlockHdr *nb = (BM25BlockHdr *) nextp;
 				uint64		nbfirst = ((uint64) nb->first_docid_hi << 32) | nb->first_docid_lo;
@@ -3327,7 +3706,7 @@ fts_query_is_pure_or(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX))
+			if (it->flags != 0)
 				return false;
 		}
 		else					/* operator */
@@ -3366,7 +3745,7 @@ fts_query_is_pure_boolean(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX))
+			if (it->flags != 0)
 				return false;
 		}
 		else					/* operator */
@@ -3460,6 +3839,18 @@ bmw_gate_admits(BoolGate *g, WandCursor *cursors, int nterms, uint64 pivot_docid
 	return bool_gate_admits(g);
 }
 
+/* Fixed tie order keeps floating-point score addition stable across WAND
+ * seek paths and adaptive top-k passes. */
+static inline bool
+wand_cursor_before(const WandCursor *a, const WandCursor *b)
+{
+	if (a->docid != b->docid)
+		return a->docid < b->docid;
+	if (a->termidx != b->termidx)
+		return a->termidx < b->termidx;
+	return a->segidx < b->segidx;
+}
+
 /*
  * fts_search_wand: exact top-k identical to the accumulate path, but using
  * document-at-a-time WAND so that documents which cannot enter the current
@@ -3498,10 +3889,10 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 
 		CHECK_FOR_INTERRUPTS();	/* per document-at-a-time step; cursor blocks are palloc'd copies, no lock held */
 
-		/* selection-sort cursors by current docid (nterms is small) */
+		/* selection-sort by docid and fixed term identity (nterms is small) */
 		for (i = 0; i < nterms; i++)
 			for (j = i + 1; j < nterms; j++)
-				if (cursors[j].docid < cursors[i].docid)
+				if (wand_cursor_before(&cursors[j], &cursors[i]))
 				{
 					WandCursor	tmp = cursors[i];
 
@@ -3543,6 +3934,7 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 		if (nheap >= k)
 		{
 			double		blocksum = 0.0;
+			uint64		safe_until = pivot_docid;
 			int			nle = 0;		/* cursors with docid <= pivot */
 			int			lei = -1;		/* index of the (single) such cursor */
 
@@ -3553,6 +3945,9 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				if (cursors[i].docid <= pivot_docid)
 				{
 					blocksum += wand_block_max_contrib(&cursors[i]);
+					if (cursors[i].blkcount > 0)
+						safe_until = Min(safe_until,
+									 cursors[i].docids[cursors[i].blkcount - 1]);
 					nle++;
 					lei = i;
 				}
@@ -3577,10 +3972,10 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				 * pre-existing multi-term AND recall gap).
 				 *
 				 * SAFE PATH -- two or more cursors sit at/before the pivot, OR a
-				 * cursor overlaps the block's docid range: advance every
-				 * at-or-before cursor to just past the pivot instead; blocksum
-				 * proved nothing up to and including pivot_docid can win, so this
-				 * is exact regardless of conjunction.
+				 * cursor overlaps the block's docid range: advance every cursor
+				 * at-or-before safe_until just past that docid.  The current-block
+				 * bounds only cover postings through the earliest current block end;
+				 * a later block before the pivot may have a higher contribution.
 				 */
 				bool		block_isolated = false;
 
@@ -3602,8 +3997,8 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				else
 					for (i = 0; i < nterms; i++)
 						if (cursors[i].docid != UINT64_MAX &&
-							cursors[i].docid <= pivot_docid)
-							wand_seek(&cursors[i], pivot_docid + 1);
+							cursors[i].docid <= safe_until)
+							wand_seek(&cursors[i], safe_until + 1);
 				continue;
 			}
 		}
@@ -3652,7 +4047,7 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				int			minpos = 0;
 
 				for (i = 1; i < nheap; i++)
-					if (heap[i].score < heap[minpos].score)
+					if (cmp_scored_desc(&heap[i], &heap[minpos]) > 0)
 						minpos = i;
 				heap[minpos].tid = tid;
 				heap[minpos].score = score;
@@ -3699,7 +4094,7 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 /*
  * fts_search_maxscore: exact top-k via the MaxScore algorithm.  Cursors are
  * split into ESSENTIAL and NON-ESSENTIAL sets by ascending max_contrib: a
- * suffix of low-impact terms whose cumulative max_contrib cannot, by itself,
+ * prefix of low-impact terms whose cumulative max_contrib cannot, by itself,
  * reach the current threshold is non-essential -- a document containing only
  * non-essential terms can never enter the top-k.  We therefore iterate
  * candidate docids from the ESSENTIAL cursors only (document-at-a-time over the
@@ -3715,14 +4110,14 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 	ScoredTid  *heap;
 	int			nheap = 0;
 	double		threshold = 0.0;
-	double	   *suffix;			/* suffix[i] = sum of max_contrib[i..nterms) */
+	double	   *prefix;			/* canonical-order bound for max_contrib[0..i) */
 	int			t,
 				i,
 				j;
 	int			first_essential;	/* cursors[first_essential..) are essential */
 
 	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
-	suffix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
+	prefix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
 
 	for (t = 0; t < nterms; t++)
 		wand_prime(&cursors[t]);
@@ -3737,9 +4132,17 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 				cursors[i] = cursors[j];
 				cursors[j] = tmp;
 			}
-	suffix[nterms] = 0.0;
-	for (i = nterms - 1; i >= 0; i--)
-		suffix[i] = suffix[i + 1] + cursors[i].max_contrib;
+	prefix[0] = 0.0;
+	for (i = 0; i < nterms; i++)
+	{
+		/* Recompute each prefix in the exact scorer's descending order.
+		 * Reusing an ascending subtotal can round below a prefix-only score. */
+		double		bound = 0.0;
+
+		for (j = i; j >= 0; j--)
+			bound += cursors[j].max_contrib;
+		prefix[i + 1] = bound;
+	}
 
 	first_essential = 0;
 
@@ -3747,6 +4150,7 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 	{
 		uint64		cand = UINT64_MAX;
 		double		score;
+		double		bound;
 
 		CHECK_FOR_INTERRUPTS();	/* per document-at-a-time step; cursor blocks are palloc'd copies, no lock held */
 
@@ -3756,7 +4160,7 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 		if (nheap >= k)
 		{
 			while (first_essential < nterms &&
-				   suffix[first_essential + 1] <= threshold)
+				   prefix[first_essential + 1] <= threshold)
 				first_essential++;
 		}
 
@@ -3769,16 +4173,24 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 
 		/* score cand: essential contributions + upper bound of non-essentials */
 		score = 0.0;
-		for (i = first_essential; i < nterms; i++)
+		/* Always add contributions in descending cursor order.  The essential
+		 * boundary changes with k; a fixed order avoids one-ULP score changes
+		 * that reorder ties across adaptive ranked-scan batches. */
+		for (i = nterms - 1; i >= first_essential; i--)
 			if (cursors[i].docid == cand)
 				score += wand_contrib_cur(&cursors[i]);
 
-		/* early-exit check: essential score + all non-essential max <= threshold
-		 * => cand cannot make the top-k, skip the non-essential lookups */
-		if (!(nheap >= k && score + suffix[first_essential] <= threshold))
+		/* Add upper bounds in the same order as exact non-essential scores.
+		 * A grouped prefix add can round below the exact candidate score. */
+		bound = score;
+		for (i = first_essential - 1; i >= 0; i--)
+			bound += cursors[i].max_contrib;
+		/* early-exit check: essential score + non-essential upper bounds cannot
+		 * beat the threshold, so skip the non-essential lookups */
+		if (!(nheap >= k && bound <= threshold))
 		{
 			/* add exact non-essential contributions by seeking to cand */
-			for (i = 0; i < first_essential; i++)
+			for (i = first_essential - 1; i >= 0; i--)
 			{
 				wand_seek(&cursors[i], cand);
 				if (cursors[i].docid == cand)
@@ -3817,7 +4229,7 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 
 				bm25_docid_to_tid(cand, &tid);
 				for (i = 1; i < nheap; i++)
-					if (heap[i].score < heap[minpos].score)
+					if (cmp_scored_desc(&heap[i], &heap[minpos]) > 0)
 						minpos = i;
 				heap[minpos].tid = tid;
 				heap[minpos].score = score;
@@ -3883,6 +4295,8 @@ bm25_query_maxhits(Relation index, FtsQuery q, double N)
 	if (q->nitems == 0)
 		return 0;
 	bm25_read_meta(index, &meta);
+	if (meta.npending > 0)
+		return N;			/* segment df omits pending documents */
 	stack = (double *) palloc(q->nitems * sizeof(double));
 
 	for (i = 0; i < q->nitems; i++)
@@ -3891,7 +4305,7 @@ bm25_query_maxhits(Relation index, FtsQuery q, double N)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags & (FTS_QF_FUZZY | FTS_QF_REGEX | FTS_QF_PREFIX))
+			if (it->flags != 0)
 				stack[top++] = N;	/* over-generating: no cheap bound */
 			else
 			{
@@ -3935,6 +4349,154 @@ bm25_query_maxhits(Relation index, FtsQuery q, double N)
 	return Min(result, N);
 }
 
+static bool
+fts_query_has_modifier(FtsQuery q)
+{
+	uint32		i;
+
+	for (i = 0; i < q->nitems; i++)
+		if (q->items[i].type == FTS_QI_VAL && q->items[i].flags != 0)
+			return true;
+	return false;
+}
+
+/*
+ * Pending documents have no WAND cursors, and modifier matches can come from
+ * lexemes other than the literal query term.  Score the exact @@@ set from the
+ * heap in those cases, keeping only k results.  Expansion-only matches can
+ * have zero literal-term BM25 score; term-expansion scoring is a separate
+ * ranking change.
+ * ponytail: O(matches * k) selection with bounded storage; use a binary heap
+ * if large-k fallback profiling shows selection dominating heap matching.
+ */
+static int
+bm25_topk_exact(Relation index, FtsQuery q, const BM25MetaPageData *meta,
+				int k, uint64 docid_lo, uint64 docid_hi, ScoredTid **out)
+{
+	TidSet		matches;
+	bool		recheck;
+	const char **terms;
+	int		   *lens;
+	int			nterms = fts_query_terms(q, &terms, &lens);
+	double	   *dfs = palloc0((Size) Max(nterms, 1) * sizeof(double)); /* alloc-ok: query terms */
+	double		N = Max(meta->ndocs, 1.0);
+	double		avgdl = meta->ndocs > 0 ? meta->sumdoclen / meta->ndocs : 1.0;
+	ScoredTid  *best = palloc((Size) k * sizeof(ScoredTid));
+	Relation	heap;
+	IndexInfo  *indexInfo;
+	EState	   *estate;
+	ExprContext *econtext;
+	TupleTableSlot *slot;
+	IndexFetchTableData *fetch;
+	Snapshot	snap = GetActiveSnapshot();
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	int			nbest = 0;
+	int			i;
+
+	for (i = 0; i < nterms; i++)
+	{
+		uint32		s;
+
+		for (s = 0; s < meta->nsegments; s++)
+		{
+			uint32		df,
+						mtf;
+			BlockNumber fb;
+			uint32		fo;
+
+			if (bm25_lookup_dict(index, &meta->segs[s], terms[i], lens[i],
+								 &df, &mtf, &fb, &fo))
+				dfs[i] += df;
+		}
+	}
+	bm25_collect_matches(index, q, &matches, &recheck);
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	indexInfo = BuildIndexInfo(index);
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(heap, NULL);
+	econtext->ecxt_scantuple = slot;
+#if PG_VERSION_NUM >= 190000
+	fetch = table_index_fetch_begin(heap, SO_NONE);
+#else
+	fetch = table_index_fetch_begin(heap);
+#endif
+	for (i = 0; i < matches.n; i++)
+	{
+		ItemPointerData tid = matches.tids[i];
+		uint64		docid = bm25_tid_to_docid(&tid);
+		bool		call_again = false;
+		bool		all_dead = false;
+		double		score;
+
+		CHECK_FOR_INTERRUPTS();
+		if (docid < docid_lo || docid > docid_hi)
+			continue;
+		ExecClearTuple(slot);
+		if (!table_index_fetch_tuple(fetch, &tid, snap, slot,
+									 &call_again, &all_dead))
+			continue;
+		{
+			MemoryContext oldctx = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+			FtsDoc		doc;
+
+			FormIndexDatum(indexInfo, slot, estate, values, isnull);
+			if (isnull[0])
+			{
+				MemoryContextSwitchTo(oldctx);
+				ResetExprContext(econtext);
+				continue;
+			}
+			doc = (FtsDoc) PG_DETOAST_DATUM(values[0]);
+			if (!fts_doc_matches(doc, q))
+			{
+				MemoryContextSwitchTo(oldctx);
+				ResetExprContext(econtext);
+				continue;
+			}
+			score = fts_bm25_score_index(doc, q, N, avgdl, dfs);
+			MemoryContextSwitchTo(oldctx);
+			ResetExprContext(econtext);
+		}
+		if (nbest < k)
+		{
+			best[nbest].tid = tid;
+			best[nbest++].score = score;
+		}
+		else
+		{
+			int			worst = 0;
+			int			j;
+
+			for (j = 1; j < nbest; j++)
+				if (best[j].score < best[worst].score ||
+					(best[j].score == best[worst].score &&
+					 ItemPointerCompare(&best[j].tid, &best[worst].tid) > 0))
+					worst = j;
+			if (score > best[worst].score ||
+				(score == best[worst].score &&
+				 ItemPointerCompare(&tid, &best[worst].tid) < 0))
+			{
+				best[worst].tid = tid;
+				best[worst].score = score;
+			}
+		}
+	}
+	table_index_fetch_end(fetch);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	table_close(heap, AccessShareLock);
+	if (matches.tids)
+		pfree(matches.tids);
+	pfree(dfs);
+	pfree(terms);
+	pfree(lens);
+	qsort(best, nbest, sizeof(ScoredTid), cmp_scored_desc);
+	*out = best;
+	return nbest;
+}
+
 /*
  * bm25_topk_visible: shared top-k engine for both the fts_search SRF and the
  * amgettuple ordering scan.  Runs block-max WAND / MaxScore over the index's
@@ -3946,12 +4508,9 @@ bm25_query_maxhits(Relation index, FtsQuery q, double N)
  * base table is opened here for the visibility check.  Returns the number of
  * visible results.
  *
- * NOTE: ranked results cover the merged SEGMENTS only; documents still in the
- * pending write buffer (inserted since the last flush) are searchable by @@@
- * and counted by fts_count(), but are not ranked here until a flush folds them
- * into a segment (automatic on VACUUM, or immediate via fts_merge()).  Ranking
- * pending docs would require per-doc scoring outside the WAND cursors; deferred
- * intentionally, since pending is transient and bounded.
+ * Plain merged queries use WAND; documents still in the
+ * pending write buffer and modifier queries use bm25_topk_exact instead.
+ * Its literal-term scores preserve the existing BM25 formula.
  */
 static int
 bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
@@ -3986,6 +4545,9 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 		wantk = 1;
 
 	bm25_read_meta(index, &meta);
+	if (meta.npending > 0 || fts_query_has_modifier(q))
+		return bm25_topk_exact(index, q, &meta, wantk,
+							   docid_lo, docid_hi, out);
 	N = meta.ndocs < 1.0 ? 1.0 : meta.ndocs;
 	avgdl = meta.ndocs > 0 ? meta.sumdoclen / meta.ndocs : 1.0;
 	/* relcache page directory over the v4 doclen sidecars (built once per backend,
@@ -4010,7 +4572,7 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	 *    ranked AND/NOT slow (e.g. `year & hungary` no longer materializes all
 	 *    735k `year` postings before the WAND scan).
 	 *
-	 *  - NON-PURE-BOOLEAN (phrase/near/prefix/fuzzy/regex present): the exact
+	 *  - NON-PURE-BOOLEAN (phrase/proximity present): the exact
 	 *    @@@ set must be computed (positions / term-expansion the cursor test
 	 *    cannot see) -- keep bm25_collect_matches + recheck + DocidFilter.
 	 *
@@ -4031,21 +4593,16 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 		bm25_collect_matches(index, q, &matches, &recheck);
 		/*
 		 * matches is the SAME boolean set @@@ uses through this index (it is
-		 * built by the identical evaluator).  For fuzzy/regex/NOT-universe and
-		 * PHRASE/NEAR it OVER-generates (recheck=true): fuzzy/regex is a
-		 * trigram-funnel candidate set, and a PHRASE is the AND-set (the
-		 * positionless posting lists cannot enforce adjacency).  The bitmap-
+		 * built by the identical evaluator). A phrase/proximity query can
+		 * over-generate when positions are unavailable or its span set exceeds
+		 * the index evaluator's bound (recheck=true). The bitmap-
 		 * heap scan resolves this with an executor recheck of @@@; the ranked
 		 * scan has none, so we recheck here -- shrink matches to the EXACT set
 		 * against the heap ftsdoc.  After this the docid filter is precise, so
 		 * the ranked scan never admits a doc "WHERE d @@@ q" would reject.
 		 *
-		 * COMPLETENESS caveat: the WAND cursors are built from the LITERAL query
-		 * terms (fts_query_terms), so a doc that matches only via a fuzzy/prefix/
-		 * regex EXPANSION (no posting for the literal term) is never generated as
-		 * a ranked candidate.  The recheck only shrinks, so ranked fuzzy/prefix/
-		 * regex results are a correct SUBSET of the @@@ matches, not the full set.
-		 * PHRASE/NEAR/boolean are exact.  Use @@@ for exhaustive fuzzy/prefix.
+		 * Modifier queries use bm25_topk_exact above: the literal-only WAND
+		 * cursors cannot generate documents that match only an expanded term.
 		 *
 		 * TidSet is TID-sorted and bm25_tid_to_docid is monotonic in TID
 		 * order, so the docid array comes out sorted (binary-searchable).
@@ -5017,4 +5574,3 @@ fts_anomalous_docs(PG_FUNCTION_ARGS)
 	}
 	SRF_RETURN_DONE(funcctx);
 }
-

@@ -1,0 +1,519 @@
+-- Complete spans, rather than one endpoint, define unordered proximity.
+-- Enumerate every five-token document over four words, plus focused expansion
+-- cases outside that alphabet.  The reference below
+-- tries EVERY pair of occurrences recursively using SQL cross joins; it never
+-- calls pg_fts, consults an index, or uses the implementation's ordered merge.
+-- Both shorter and longer occurrences with the same endpoint must survive.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_fts;
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+CREATE FUNCTION lp_occurrences(words text[], labels text[], expr jsonb)
+RETURNS TABLE (first_pos integer, last_pos integer)
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF jsonb_typeof(expr) = 'string' THEN
+    RETURN QUERY SELECT p::integer, p::integer
+      FROM unnest(words) WITH ORDINALITY AS w(word, p)
+      WHERE word = expr #>> '{}';
+  ELSIF expr->>0 = 'weight' THEN
+    RETURN QUERY SELECT p::integer, p::integer
+      FROM unnest(words) WITH ORDINALITY AS w(word, p)
+      WHERE word = expr->>1 AND strpos(expr->>2, labels[p]) > 0;
+  ELSIF expr->>0 = 'terms' THEN
+    RETURN QUERY SELECT p::integer, p::integer
+      FROM unnest(words) WITH ORDINALITY AS w(word, p)
+      WHERE word IN (SELECT jsonb_array_elements_text(expr->1));
+  ELSIF expr->>0 = 'or' THEN
+    RETURN QUERY
+      SELECT * FROM lp_occurrences(words, labels, expr->1)
+      UNION
+      SELECT * FROM lp_occurrences(words, labels, expr->2);
+  ELSIF expr->>0 = 'and' THEN
+    RETURN QUERY SELECT 0, 0
+      WHERE EXISTS (SELECT FROM lp_occurrences(words, labels, expr->1))
+        AND EXISTS (SELECT FROM lp_occurrences(words, labels, expr->2));
+  ELSE
+    RETURN QUERY
+      SELECT DISTINCT least(l.first_pos, r.first_pos),
+                      greatest(l.last_pos, r.last_pos)
+      FROM lp_occurrences(words, labels, expr->2) AS l
+      CROSS JOIN lp_occurrences(words, labels, expr->3) AS r
+      WHERE CASE expr->>0
+        WHEN 'w' THEN
+          r.first_pos - l.last_pos BETWEEN 1 AND (expr->>1)::integer
+          OR l.first_pos - r.last_pos BETWEEN 1 AND (expr->>1)::integer
+        WHEN 'e' THEN r.first_pos - l.last_pos = (expr->>1)::integer
+        WHEN 'p' THEN r.last_pos - l.last_pos BETWEEN 1 AND (expr->>1)::integer
+        ELSE false END;
+  END IF;
+END
+$$;
+CREATE TABLE lp_docs AS
+SELECT n + 1 AS id,
+       ARRAY(SELECT (ARRAY['alpha','alphi','beta','gamma'])[1 + ((n >> (2*p)) & 3)]
+             FROM generate_series(0, 4) AS p ORDER BY p) AS words,
+       ARRAY['A','B','C','D','A'] AS labels
+FROM generate_series(0, 1023) AS n;
+-- ASCII spellings of Unicode code points keep the SQL source portable:
+-- U+6771 U+4EAC is Tokyo; deleting its first character is one edit, not three.
+INSERT INTO lp_docs VALUES
+ (1025, ARRAY['dog','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1026, ARRAY['dog','zulu','beta','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1027, ARRAY['cat','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1028, ARRAY['cot','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1029, ARRAY['cat','zulu','beta','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1030, ARRAY[U&'\6771\4EAC','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1031, ARRAY[U&'\4EAC','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1032, ARRAY[U&'\6771\4EAC\90FD','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1033, ARRAY[U&'\6771\4EAC','zulu','beta','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1034, ARRAY['chat','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1035, ARRAY[U&'ch\00E2t','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1036, ARRAY['chat','zulu','beta','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1037, ARRAY['coat','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1038, ARRAY['abcde','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1039, ARRAY['abxde','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1040, ARRAY['abxye','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1041, ARRAY[repeat('x',260),'beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1042, ARRAY[repeat('x',259)||'y','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1043, array_fill(repeat('x',260), ARRAY[5]), ARRAY['A','B','C','D','A']),
+ (1044, array_fill(repeat('y',260), ARRAY[5]), ARRAY['A','B','C','D','A']),
+ (1045, array_fill(repeat('y',255), ARRAY[5]), ARRAY['A','B','C','D','A']),
+ (1046, array_fill(repeat('y',256), ARRAY[5]), ARRAY['A','B','C','D','A']),
+ (1047, ARRAY[repeat(U&'\00E2',130),'beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1048, ARRAY[repeat(U&'\00E2',129)||'a','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1049, ARRAY[repeat('a',254),'beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']),
+ (1050, ARRAY[repeat('a',254)||U&'\00E2','beta','zulu','zulu','zulu'], ARRAY['A','B','C','D','A']);
+ALTER TABLE lp_docs ADD COLUMN v tsvector;
+UPDATE lp_docs SET v =
+  setweight(to_tsvector('simple', words[1]), 'A') ||
+  setweight(to_tsvector('simple', words[2]), 'B') ||
+  setweight(to_tsvector('simple', words[3]), 'C') ||
+  setweight(to_tsvector('simple', words[4]), 'D') ||
+  setweight(to_tsvector('simple', words[5]), 'A');
+-- JSON expressions describe expected meaning independently of query parsing:
+-- w = either order/nonoverlap, e = exact edge distance, p = ordered max gap.
+-- The last column is PostgreSQL's own query for independent exact-phrase truth.
+-- NEAR's historical right-nested endpoint behavior is tested separately from
+-- the left-associative infix p/N spelling.
+CREATE TABLE lp_queries (name text PRIMARY KEY, q ftsquery, expr jsonb, native tsquery);
+INSERT INTO lp_queries VALUES
+ ('within', 'alpha w/2 beta', '["w",2,"alpha","beta"]', NULL),
+ ('chain_left', 'alpha w/1 beta w/1 gamma', '["w",1,["w",1,"alpha","beta"],"gamma"]', NULL),
+ ('chain_right', 'alpha w/1 (beta w/1 gamma)', '["w",1,"alpha",["w",1,"beta","gamma"]]', NULL),
+ ('chain_four_ops', 'alpha w/1 beta w/1 gamma w/1 alphi w/1 alpha', '["w",1,["w",1,["w",1,["w",1,"alpha","beta"],"gamma"],"alphi"],"alpha"]', NULL),
+ ('chain_distances', 'alpha w/2 beta w/3 gamma', '["w",3,["w",2,"alpha","beta"],"gamma"]', NULL),
+ ('repeat_term', 'alpha w/1 alpha w/1 beta', '["w",1,["w",1,"alpha","alpha"],"beta"]', NULL),
+ ('phrase_left', '"alpha beta" w/1 gamma', '["w",1,["e",1,"alpha","beta"],"gamma"]', NULL),
+ ('phrase_right', 'gamma w/1 "alpha beta"', '["w",1,"gamma",["e",1,"alpha","beta"]]', NULL),
+ ('two_phrases', '"alpha beta" w/1 "gamma alphi"', '["w",1,["e",1,"alpha","beta"],["e",1,"gamma","alphi"]]', NULL),
+ ('phrase_chain', '("alpha beta" w/1 gamma) w/1 alphi', '["w",1,["w",1,["e",1,"alpha","beta"],"gamma"],"alphi"]', NULL),
+ ('two_groups', '(alpha w/2 beta) w/1 (gamma w/2 alphi)', '["w",1,["w",2,"alpha","beta"],["w",2,"gamma","alphi"]]', NULL),
+ ('phrase_or', '("alpha beta" OR gamma) w/1 alphi', '["w",1,["or",["e",1,"alpha","beta"],"gamma"],"alphi"]', NULL),
+ ('both_or', '("alpha beta" OR "alphi beta") w/2 (gamma OR alpha)', '["w",2,["or",["e",1,"alpha","beta"],["e",1,"alphi","beta"]],["or","gamma","alpha"]]', NULL),
+ ('same_end_short', '(alpha OR "beta alpha") w/1 beta', '["w",1,["or","alpha",["e",1,"beta","alpha"]],"beta"]', NULL),
+ ('same_end_long', '(alpha OR "beta alpha") w/1 gamma', '["w",1,["or","alpha",["e",1,"beta","alpha"]],"gamma"]', NULL),
+ ('independent', '(alpha w/1 beta) AND (gamma w/1 alphi)', '["and",["w",1,"alpha","beta"],["w",1,"gamma","alphi"]]', NULL),
+ ('prefix_chain', 'alph* w/1 beta w/1 gamma', '["w",1,["w",1,["or","alpha","alphi"],"beta"],"gamma"]', NULL),
+ ('fuzzy_chain', 'alpha~1 w/1 beta w/1 gamma', '["w",1,["w",1,["or","alpha","alphi"],"beta"],"gamma"]', NULL),
+ ('regex_chain', '/^alph/ w/1 beta w/1 gamma', '["w",1,["w",1,["or","alpha","alphi"],"beta"],"gamma"]', NULL),
+ ('prefix_phrase', 'alph* <-> beta', '["e",1,["or","alpha","alphi"],"beta"]', 'alph:* <-> beta'),
+ ('fuzzy_phrase', 'alpha~1 <-> beta', '["e",1,["or","alpha","alphi"],"beta"]', NULL),
+ ('regex_phrase', '/^alph/ <-> beta', '["e",1,["or","alpha","alphi"],"beta"]', NULL),
+ ('exact_gap', 'alpha <2> beta', '["e",2,"alpha","beta"]', 'alpha <2> beta'),
+ ('exact_zero', 'alpha <0> alpha', '["e",0,"alpha","alpha"]', 'alpha <0> alpha'),
+ ('exact_nested', 'alpha <-> (beta <-> gamma)', '["e",1,"alpha",["e",1,"beta","gamma"]]', 'alpha <-> (beta <-> gamma)'),
+ ('exact_four_gaps', 'alpha <-> (beta <-> (gamma <-> (alphi <-> alpha)))', '["e",1,"alpha",["e",1,"beta",["e",1,"gamma",["e",1,"alphi","alpha"]]]]', 'alpha <-> (beta <-> (gamma <-> (alphi <-> alpha)))'),
+ ('exact_nested_gaps', 'alpha <2> (beta <-> gamma)', '["e",2,"alpha",["e",1,"beta","gamma"]]', 'alpha <2> (beta <-> gamma)'),
+ ('exact_zero_nested', 'alpha <0> (alpha <-> (beta <2> gamma))', '["e",0,"alpha",["e",1,"alpha",["e",2,"beta","gamma"]]]', 'alpha <0> (alpha <-> (beta <2> gamma))'),
+ ('exact_zero_middle', '(alpha <2> beta) <0> (beta <-> gamma)', '["e",0,["e",2,"alpha","beta"],["e",1,"beta","gamma"]]', '(alpha <2> beta) <0> (beta <-> gamma)'),
+ ('exact_zero_chain', 'alpha <0> (alpha <0> (alpha <0> alpha))', '["e",0,"alpha",["e",0,"alpha",["e",0,"alpha","alpha"]]]', 'alpha <0> (alpha <0> (alpha <0> alpha))'),
+ ('exact_or', '(alpha OR alphi) <2> beta', '["e",2,["or","alpha","alphi"],"beta"]', '(alpha | alphi) <2> beta'),
+ ('ordered_gap', 'alpha p/2 beta', '["p",2,"alpha","beta"]', NULL),
+ ('ordered_chain', 'alpha p/2 beta p/2 gamma', '["p",2,["p",2,"alpha","beta"],"gamma"]', NULL),
+ ('near_chain', 'NEAR(alpha beta gamma, 2)', '["p",2,"alpha",["p",2,"beta","gamma"]]', NULL),
+ ('near_prefix', 'NEAR(alph* beta, 2)', '["p",2,["or","alpha","alphi"],"beta"]', NULL),
+ ('near_fuzzy', 'NEAR(alpha~1 beta, 2)', '["p",2,["or","alpha","alphi"],"beta"]', NULL),
+ ('near_regex', 'NEAR(/^alph/ beta, 2)', '["p",2,["or","alpha","alphi"],"beta"]', NULL),
+ ('legacy_endpoint', 'alpha p/2 "beta gamma"', '["p",2,"alpha",["e",1,"beta","gamma"]]', NULL),
+ ('mixed_chain', '(alpha w/2 beta) <-> gamma', '["e",1,["w",2,"alpha","beta"],"gamma"]', NULL),
+ ('no_overlap', '"alpha beta" w/1 beta', '["w",1,["e",1,"alpha","beta"],"beta"]', NULL),
+ ('weighted_chain', 'alpha:A w/1 beta:B w/1 gamma:C', '["w",1,["w",1,["weight","alpha","A"],["weight","beta","B"]],["weight","gamma","C"]]', NULL),
+ ('weighted_mask', 'alpha:AC w/2 beta:BD', '["w",2,["weight","alpha","AC"],["weight","beta","BD"]]', NULL),
+ ('weighted_phrase', 'alpha:B <-> beta:C', '["e",1,["weight","alpha","B"],["weight","beta","C"]]', 'alpha:B <-> beta:C'),
+ ('weighted_prefix', 'alph:*B', '["or",["weight","alpha","B"],["weight","alphi","B"]]', 'alph:*B'),
+ ('weighted_prefix_span', 'alph*:B w/1 beta:C', '["w",1,["or",["weight","alpha","B"],["weight","alphi","B"]],["weight","beta","C"]]', NULL),
+ ('fuzzy_or_literal', '(cat~1 OR dog) w/1 beta', '["w",1,["or",["terms",["cat","cot","chat","coat"]],"dog"],"beta"]', NULL),
+ ('regex_or_literal', '(dog OR /^cat$/) w/1 beta', '["w",1,["or","dog","cat"],"beta"]', NULL),
+ ('unicode_fuzzy', U&'\4EAC~1 w/1 beta', jsonb_build_array('w',1,
+   jsonb_build_array('or',U&'\4EAC',U&'\6771\4EAC'),'beta'), NULL),
+ ('unicode_fuzzy_phrase', U&'\4EAC~1 <-> beta', jsonb_build_array('e',1,
+   jsonb_build_array('or',U&'\4EAC',U&'\6771\4EAC'),'beta'), NULL);
+-- A deliberately unoptimized edit-distance reference: compare Unicode
+-- characters using every dynamic-programming cell, without trigram filtering,
+-- byte-length shortcuts, an automaton, or any pg_fts function.
+CREATE FUNCTION lp_edit_distance(a text, b text) RETURNS integer
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+  previous integer[] := ARRAY(SELECT generate_series(0, char_length(b)));
+  current_row integer[];
+  i integer;
+  j integer;
+BEGIN
+  FOR i IN 1..char_length(a) LOOP
+    current_row := ARRAY[i];
+    FOR j IN 1..char_length(b) LOOP
+      current_row[j+1] := least(previous[j+1] + 1, current_row[j] + 1,
+        previous[j] + (substr(a,i,1) <> substr(b,j,1))::integer);
+    END LOOP;
+    previous := current_row;
+  END LOOP;
+  RETURN previous[char_length(b)+1];
+END
+$$;
+SELECT lp_edit_distance('abxde','abcde') = 1 AS destroyed_trigrams,
+       lp_edit_distance('chat',U&'ch\00E2t') = 1 AS unicode_substitution,
+       lp_edit_distance(repeat('x',260),repeat('y',260)) = 260 AS long_mismatch;
+ destroyed_trigrams | unicode_substitution | long_mismatch 
+--------------------+----------------------+---------------
+ t                  | t                    | t
+(1 row)
+
+-- Standalone and compound fuzzy queries must agree on accepted words.  The
+-- >255-byte cases exceed the ASCII automaton's term capacity; k=255 and k=256
+-- exercise its bounded-row limit.  The long all-y documents supply real misses.
+WITH cases(name, word, distance) AS (VALUES
+       ('accent_query', U&'ch\00E2t', 1),
+       ('accent_candidate', 'chat', 1),
+       ('lost_trigrams', 'abcde', 1),
+       ('long_ascii', repeat('x',260), 1),
+       ('distance_255', 'alpha', 255),
+       ('distance_256', 'alpha', 256),
+       ('unicode_insert', U&'\4EAC', 1),
+       ('unicode_delete', U&'\6771\4EAC', 1),
+       ('long_unicode', repeat(U&'\00E2',130), 1),
+       ('unicode_boundary', repeat('a',254), 1)),
+     vocabulary AS (SELECT DISTINCT unnest(words) AS word FROM lp_docs),
+     accepted AS MATERIALIZED (
+       SELECT c.name, c.word || '~' || c.distance AS query_text,
+              jsonb_build_array('terms', jsonb_agg(v.word ORDER BY v.word)) AS expr
+       FROM cases c CROSS JOIN vocabulary v
+       WHERE lp_edit_distance(c.word, v.word) <= c.distance
+       GROUP BY c.name, c.word, c.distance),
+     forms(kind) AS (VALUES ('standalone'), ('or'), ('within'), ('exact'))
+INSERT INTO lp_queries
+SELECT a.name || '_' || f.kind,
+       to_ftsquery(CASE f.kind
+         WHEN 'standalone' THEN a.query_text
+         WHEN 'or' THEN '(' || a.query_text || ' OR dog)'
+         WHEN 'within' THEN a.query_text || ' w/1 beta'
+         WHEN 'exact' THEN a.query_text || ' <-> beta' END),
+       CASE f.kind
+         WHEN 'standalone' THEN a.expr
+         WHEN 'or' THEN jsonb_build_array('or', a.expr, 'dog')
+         WHEN 'within' THEN jsonb_build_array('w', 1, a.expr, 'beta')
+         WHEN 'exact' THEN jsonb_build_array('e', 1, a.expr, 'beta') END,
+       NULL
+FROM accepted a CROSS JOIN forms f;
+CREATE TABLE lp_truth AS
+SELECT q.name, d.id FROM lp_queries q CROSS JOIN lp_docs d
+WHERE EXISTS (SELECT FROM lp_occurrences(d.words, d.labels, q.expr));
+-- Every query has real matches AND rejects some documents; 0 = 0 cannot pass.
+SELECT count(*) AS queries,
+       bool_and(hits > 0 AND hits < (SELECT count(*) FROM lp_docs)) AS nontrivial
+FROM (SELECT q.name, count(t.id) AS hits FROM lp_queries q
+      LEFT JOIN lp_truth t USING (name) GROUP BY q.name) AS counts;
+ queries | nontrivial 
+---------+------------
+      89 | t
+(1 row)
+
+SELECT name, count(*) AS expected_matches FROM lp_truth GROUP BY name ORDER BY name;
+            name             | expected_matches 
+-----------------------------+------------------
+ accent_candidate_exact      |                4
+ accent_candidate_or         |                8
+ accent_candidate_standalone |                6
+ accent_candidate_within     |                4
+ accent_query_exact          |                2
+ accent_query_or             |                5
+ accent_query_standalone     |                3
+ accent_query_within         |                2
+ both_or                     |              396
+ chain_distances             |              312
+ chain_four_ops              |               16
+ chain_left                  |              170
+ chain_right                 |              170
+ distance_255_exact          |              720
+ distance_255_or             |             1047
+ distance_255_standalone     |             1047
+ distance_255_within         |              803
+ distance_256_exact          |              720
+ distance_256_or             |             1048
+ distance_256_standalone     |             1048
+ distance_256_within         |              803
+ exact_four_gaps             |                1
+ exact_gap                   |              184
+ exact_nested                |               48
+ exact_nested_gaps           |               32
+ exact_or                    |              352
+ exact_zero                  |              781
+ exact_zero_chain            |              781
+ exact_zero_middle           |               32
+ exact_zero_nested           |               32
+ fuzzy_chain                 |              330
+ fuzzy_or_literal            |                5
+ fuzzy_phrase                |              464
+ independent                 |               80
+ legacy_endpoint             |               48
+ long_ascii_exact            |                2
+ long_ascii_or               |                5
+ long_ascii_standalone       |                3
+ long_ascii_within           |                2
+ long_unicode_exact          |                2
+ long_unicode_or             |                4
+ long_unicode_standalone     |                2
+ long_unicode_within         |                2
+ lost_trigrams_exact         |                2
+ lost_trigrams_or            |                4
+ lost_trigrams_standalone    |                2
+ lost_trigrams_within        |                2
+ mixed_chain                 |              142
+ near_chain                  |               96
+ near_fuzzy                  |              552
+ near_prefix                 |              552
+ near_regex                  |              552
+ no_overlap                  |               86
+ ordered_chain               |               97
+ ordered_gap                 |              336
+ phrase_chain                |               30
+ phrase_left                 |               87
+ phrase_or                   |              457
+ phrase_right                |               87
+ prefix_chain                |              330
+ prefix_phrase               |              464
+ regex_chain                 |              330
+ regex_or_literal            |                2
+ regex_phrase                |              464
+ repeat_term                 |               86
+ same_end_long               |              421
+ same_end_short              |              390
+ two_groups                  |              112
+ two_phrases                 |               16
+ unicode_boundary_exact      |                2
+ unicode_boundary_or         |                4
+ unicode_boundary_standalone |                2
+ unicode_boundary_within     |                2
+ unicode_delete_exact        |                3
+ unicode_delete_or           |                6
+ unicode_delete_standalone   |                4
+ unicode_delete_within       |                3
+ unicode_fuzzy               |                2
+ unicode_fuzzy_phrase        |                2
+ unicode_insert_exact        |                2
+ unicode_insert_or           |                5
+ unicode_insert_standalone   |                3
+ unicode_insert_within       |                2
+ weighted_chain              |               16
+ weighted_mask               |              205
+ weighted_phrase             |               64
+ weighted_prefix             |              512
+ weighted_prefix_span        |              128
+ within                      |              506
+(89 rows)
+
+SELECT to_ftsdoc('gamma beta alpha') @@@ '(alpha OR "beta alpha") w/1 gamma'::ftsquery AS longer_span,
+       to_ftsdoc('beta alpha') @@@ '(alpha OR "beta alpha") w/1 beta'::ftsquery AS shorter_span,
+       NOT (to_ftsdoc('alpha beta gamma') @@@ '"alpha beta" w/1 beta'::ftsquery) AS rejects_overlap;
+ longer_span | shorter_span | rejects_overlap 
+-------------+--------------+-----------------
+ t           | t            | t
+(1 row)
+
+CREATE TABLE lp_on (id integer, d ftsdoc) WITH (autovacuum_enabled = false);
+CREATE TABLE lp_off (LIKE lp_on) WITH (autovacuum_enabled = false);
+INSERT INTO lp_on SELECT id, to_ftsdoc(v) FROM lp_docs WHERE id <= 512;
+INSERT INTO lp_off SELECT * FROM lp_on;
+CREATE INDEX lp_on_idx ON lp_on USING fts(d) WITH (positions = on);
+CREATE INDEX lp_off_idx ON lp_off USING fts(d) WITH (positions = off);
+-- These rows are searched from the pending list before the explicit merge.
+INSERT INTO lp_on SELECT id, to_ftsdoc(v) FROM lp_docs WHERE id > 512;
+INSERT INTO lp_off SELECT id, to_ftsdoc(v) FROM lp_docs WHERE id > 512;
+ANALYZE lp_on;
+ANALYZE lp_off;
+-- Each comparison is a complete ID set, not merely an equal count.  Test both
+-- public ranking entry points with k larger than the entire corpus, so ranking
+-- cannot hide false negatives by dropping them below a small requested limit.
+CREATE FUNCTION lp_check(stage text) RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE
+  query record;
+  arm text;
+  want integer[];
+  got integer[];
+  got_count bigint;
+  checks integer := 0;
+BEGIN
+  FOR query IN SELECT * FROM lp_queries ORDER BY name LOOP
+    SELECT array_agg(id ORDER BY id) INTO want FROM lp_truth WHERE name = query.name;
+    SELECT array_agg(id ORDER BY id) INTO got FROM lp_docs
+      WHERE to_ftsdoc(v) @@@ query.q;
+    IF got IS DISTINCT FROM want THEN
+      RAISE EXCEPTION '% direct mismatch: %', stage, query.name;
+    END IF;
+    checks := checks + 1;
+    FOREACH arm IN ARRAY ARRAY['on', 'off'] LOOP
+      EXECUTE format('SELECT array_agg(id ORDER BY id) FROM %I WHERE d @@@ $1', 'lp_' || arm)
+        INTO got USING query.q;
+      IF got IS DISTINCT FROM want THEN
+        RAISE EXCEPTION '% scan % mismatch: %', stage, arm, query.name;
+      END IF;
+      got_count := fts_count(('lp_' || arm || '_idx')::regclass, query.q);
+      IF got_count <> cardinality(want) THEN
+        RAISE EXCEPTION '% count % mismatch: %', stage, arm, query.name;
+      END IF;
+      EXECUTE format('SELECT array_agg(d.id ORDER BY d.id) FROM '
+        'fts_search($1, $2, 2048) r JOIN %I d ON d.ctid = r.ctid', 'lp_' || arm)
+        INTO got USING ('lp_' || arm || '_idx')::regclass, query.q;
+      IF got IS DISTINCT FROM want THEN
+        RAISE EXCEPTION '% fts_search % mismatch: %', stage, arm, query.name;
+      END IF;
+      EXECUTE format('SELECT array_agg(id ORDER BY id) FROM '
+        '(SELECT id FROM %I WHERE d @@@ $1 ORDER BY d <=> $1 LIMIT 2048) s', 'lp_' || arm)
+        INTO got USING query.q;
+      IF got IS DISTINCT FROM want THEN
+        RAISE EXCEPTION '% ranked scan % mismatch: %', stage, arm, query.name;
+      END IF;
+      checks := checks + 4;
+    END LOOP;
+  END LOOP;
+  RETURN checks;
+END
+$$;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM lp_on WHERE d @@@ 'alpha w/1 beta w/1 gamma'::ftsquery;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Index Scan using lp_on_idx on lp_on
+   Index Cond: (d @@@ '((''alpha'' w/1 ''beta'') w/1 ''gamma'')'::ftsquery)
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM lp_off WHERE d @@@ 'alpha w/1 beta w/1 gamma'::ftsquery;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Index Scan using lp_off_idx on lp_off
+   Index Cond: (d @@@ '((''alpha'' w/1 ''beta'') w/1 ''gamma'')'::ftsquery)
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT id FROM lp_on WHERE d @@@ 'alpha w/1 beta w/1 gamma'::ftsquery
+ORDER BY d <=> 'alpha w/1 beta w/1 gamma'::ftsquery LIMIT 2048;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit
+   ->  Index Scan using lp_on_idx on lp_on
+         Index Cond: (d @@@ '((''alpha'' w/1 ''beta'') w/1 ''gamma'')'::ftsquery)
+         Order By: (d <=> '((''alpha'' w/1 ''beta'') w/1 ''gamma'')'::ftsquery)
+(4 rows)
+
+SELECT lp_check('pending') AS pending_checks;
+ pending_checks 
+----------------
+            801
+(1 row)
+
+SELECT fts_merge('lp_on_idx') AND fts_merge('lp_off_idx') AS flushed_pending;
+ flushed_pending 
+-----------------
+ t
+(1 row)
+
+SELECT lp_check('flushed') AS flushed_checks;
+ flushed_checks 
+----------------
+            801
+(1 row)
+
+-- Adaptive ranked scans recompute top-k at larger k.  Every score and rank
+-- in the first batch must be identical to the full pass, including tied docs.
+WITH qs(name, q) AS (
+  VALUES ('four_leaf', (SELECT q FROM lp_queries WHERE name = 'phrase_or')),
+         ('three_leaf', 'alpha | beta | gamma'::ftsquery)),
+small AS MATERIALIZED (
+  SELECT qs.name, r.ctid, r.score,
+         row_number() OVER (PARTITION BY qs.name ORDER BY r.score DESC, r.ctid) AS ord
+  FROM qs, LATERAL fts_search('lp_on_idx', qs.q, 100) r),
+all_ranked AS MATERIALIZED (
+  SELECT qs.name, r.ctid, r.score,
+         row_number() OVER (PARTITION BY qs.name ORDER BY r.score DESC, r.ctid) AS ord
+  FROM qs, LATERAL fts_search('lp_on_idx', qs.q, 2048) r)
+SELECT s.name, count(*) AS first_page,
+       bool_and(s.ctid = a.ctid AND s.score = a.score) AS exact_prefix
+FROM small s JOIN all_ranked a USING (name, ord)
+GROUP BY s.name ORDER BY s.name;
+    name    | first_page | exact_prefix 
+------------+------------+--------------
+ four_leaf  |        100 | t
+ three_leaf |        100 | t
+(2 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- Native PostgreSQL defines exact phrase distance, including zero and nested
+-- phrases.  Exercise both our text parser and conversion from native tsquery.
+SELECT count(*) AS native_exact_mismatches
+FROM lp_queries q CROSS JOIN lp_docs d
+WHERE q.native IS NOT NULL AND
+  ((d.v @@ q.native) IS DISTINCT FROM (to_ftsdoc(d.v) @@@ q.q)
+   OR (d.v @@ q.native) IS DISTINCT FROM (to_ftsdoc(d.v) @@@ q.native::ftsquery));
+ native_exact_mismatches 
+-------------------------
+                       0
+(1 row)
+
+WITH phrases(phrase) AS (VALUES ('breach of contract'), ('breach of the contract'),
+                               ('the breach of contract is')),
+     documents(body) AS (VALUES ('breach contract'), ('breach of contract'),
+       ('breach of the contract'), ('breach arbitrary contract'),
+       ('the breach of contract is'), ('contract breach'))
+SELECT count(*) FILTER (WHERE to_tsvector('english', body) @@
+                              phraseto_tsquery('english', phrase)) > 0 AS native_matches,
+       count(*) FILTER (WHERE
+         (to_ftsdoc('english', body) @@@ to_ftsquery('english', '"' || phrase || '"'))
+         IS DISTINCT FROM
+         (to_tsvector('english', body) @@ phraseto_tsquery('english', phrase)))
+       AS stopword_gap_mismatches
+FROM phrases CROSS JOIN documents;
+ native_matches | stopword_gap_mismatches 
+----------------+-------------------------
+ t              |                       0
+(1 row)
+
+SELECT bool_and(ftsquery_send(q) = ftsquery_send(q::text::ftsquery)) AS text_roundtrip
+FROM lp_queries;
+ text_roundtrip 
+----------------
+ t
+(1 row)
+
+COPY (SELECT name, q FROM lp_queries ORDER BY name)
+  TO '/tmp/pg_fts_legal_proximity.bin' WITH (FORMAT binary);
+CREATE TABLE lp_binary (name text, q ftsquery);
+COPY lp_binary FROM '/tmp/pg_fts_legal_proximity.bin' WITH (FORMAT binary);
+SELECT count(*) AS binary_queries,
+       bool_and(ftsquery_send(a.q) = ftsquery_send(b.q)) AS binary_roundtrip
+FROM lp_queries a JOIN lp_binary b USING (name);
+ binary_queries | binary_roundtrip 
+----------------+------------------
+             89 | t
+(1 row)
+
+DROP FUNCTION lp_check(text);
+DROP TABLE lp_binary, lp_on, lp_off, lp_truth, lp_queries, lp_docs;
+DROP FUNCTION lp_occurrences(text[], text[], jsonb);
+DROP FUNCTION lp_edit_distance(text, text);
+RESET jit;
+RESET max_parallel_workers_per_gather;
+RESET client_min_messages;

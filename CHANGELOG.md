@@ -2,6 +2,55 @@
 
 All notable changes to pg_fts are documented here.
 
+## Unreleased
+
+### Proximity, phrase search, and ranking
+
+- Added unordered `w/N`, chained/nested groups, OR alternatives and phrases on
+  either side. Complete first/last-word spans preserve every valid combination.
+  `p/N` and `NEAR` retain ordered endpoint behavior. AND/NOT inside text proximity
+  remain explicit errors.
+- Added exact `<->` / `<N>` operators, including `<0>`. Quoted phrases preserve
+  stopword gaps. Native `tsquery` imports retain exact gaps, prefixes and weights.
+  Text and binary query roundtrips preserve operators and distances.
+- Prefix, fuzzy and regex operands now contribute their actual positions inside
+  phrases. Weighted prefixes retain their mask; unsupported modifier combinations
+  raise errors. Unterminated regex input now errors instead of returning empty.
+- Compound positive proximity uses stored index positions, with shared span
+  evaluation and exact heap fallback when positions are unavailable or oversized.
+  Compound fuzzy/regex candidates preserve ordinary OR alternatives and use native
+  character edit distances. No index format change or REINDEX is required.
+- Ranked searches now include pending documents and modifier matches using an
+  exact heap fallback. The existing literal-term BM25 scoring formula is unchanged;
+  expansion-only matches can score zero. Stable score/TID ordering fixes missing
+  and duplicate rows when an ordered scan grows its result batch.
+- Standalone fuzzy matches now use character edit distances consistently for
+  Unicode and long terms. Removed unsound trigram and byte-length exclusions;
+  bounded ASCII dictionary skipping remains available.
+- Binary query input rejects conflicting modifiers, invalid weights, and
+  out-of-range distances. Legacy boolean distances and zero-distance ordered
+  operators retain their existing interpretation when read.
+- Runtime NULL index keys no longer crash the server. A NULL search predicate
+  produces no matches; a NULL order key with a valid predicate preserves the
+  matches. An unfiltered NULL-only index ordering raises an explicit error.
+- Fixed four inherited ranked-search defects: a seek could read another term's
+  block header, block bounds could be applied past their valid document range,
+  MaxScore used suffix bounds for a low-impact prefix, and cutoff ties could
+  evict the wrong row. Strict regressions compare small result limits with the
+  exhaustive score/TID order, without the former percentage tolerance.
+- Fixed score-addition order across ranked result limits. Tiny floating-point
+  changes could reorder tied rows and make adaptive index scans repeat or omit
+  results. Pruning bounds use the same addition order as final scores so they
+  cannot underestimate a candidate through grouped rounding. Three-term and
+  four-term queries now have exact prefix checks.
+- Independent exhaustive SQL checks cover direct, indexed, counted and ranked
+  result sets with positions on/off, pending/flushed data, and text/binary I/O.
+  Strict checks compare ranked prefixes and complete indexed result sets.
+- Known inherited limitation: the configured analyzer caps positions at 16,383.
+  For example, a phrase after 17,000 filler words fails on that analyzer but works
+  with the unconfigured analyzer. This change does not recover already-lost input
+  positions or redesign the dictionary pipeline.
+
 ## 1.8.3 - 2026-09-18
 
 **Correctness release: two deadlocks that shipped in every prior version, found while
