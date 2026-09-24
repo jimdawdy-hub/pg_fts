@@ -1413,10 +1413,11 @@ DROP TABLE vac;
 --   (ii)  reaches a low dead-space ratio (within 15% of a freshly-built twin),
 --   (iii) is STABLE across repeated calls (no oscillation, never exceeds pre).
 -- Deterministic: fixed data, parallelism off (a parallel merge/build changes
--- the page layout and the segment count).
+-- the page layout and the segment count), and autovacuum off on the table (an
+-- autovacuum pass can run the index cleanup between two fts_vacuum calls).
 SET max_parallel_maintenance_workers = 0;
 SET max_parallel_workers_per_gather = 0;
-CREATE TABLE vconv (id int, d ftsdoc);
+CREATE TABLE vconv (id int, d ftsdoc) WITH (autovacuum_enabled = off);
 INSERT INTO vconv SELECT g, to_ftsdoc('term'||(g%800)||' shared'||' w'||(g%53)||' doc'||g)
   FROM generate_series(1,40000) g;
 CREATE INDEX vconv_bm25 ON vconv USING fts (d);

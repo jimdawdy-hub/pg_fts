@@ -141,6 +141,11 @@ All notable changes to pg_fts are documented here.
 
 ### Tests
 
+- The `fts_vacuum()` convergence check keeps autovacuum off its table. It asserts that three
+  consecutive `fts_vacuum()` calls leave the index size unchanged, and an autovacuum pass
+  between two of them could run the index cleanup and change the size: under aggressive
+  autovacuum settings 1.8.3 failed the check in 3 of 5 runs; with autovacuum off on the table
+  it passed every run. The assertion itself is unchanged.
 - A regression block compares ten NOT shapes through the index (bitmap scan and
   `fts_count`) with the heap matcher, across two segments with tombstones plus the
   pending list.
