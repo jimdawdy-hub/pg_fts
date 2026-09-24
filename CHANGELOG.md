@@ -81,6 +81,64 @@ All notable changes to pg_fts are documented here.
   full-segment decode it never used. The universe is now built per segment only for a
   negated final result. Answers are unchanged.
 
+- **The ranked scan ignored a `WHERE` query that differed from its `ORDER BY` query.**
+  `bm25_rescan` kept the first scan key's query and then overwrote it with the `<=>` query,
+  so the ordering scan ranked *and filtered* by the `ORDER BY` query alone -- and it returns
+  `xs_recheck = false`, so the executor never re-applied the `WHERE`. It returned `ORDER BY`
+  matches that fail the `WHERE`, missed the `WHERE` rows holding no ranking term, and let
+  the ranking query's own boolean operators filter. Reproduction:
+
+      CREATE TABLE t (id int, d ftsdoc);
+      INSERT INTO t VALUES (1, to_ftsdoc('simple', 'apple cherry')),
+                           (2, to_ftsdoc('simple', 'apple')),
+                           (3, to_ftsdoc('simple', 'cherry cherry'));
+      CREATE INDEX ON t USING fts (d);
+      SET enable_seqscan = off; SET enable_bitmapscan = off;
+      SELECT id FROM t WHERE d @@@ 'apple'::ftsquery
+       ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;     -- 1.8.3: 3, 1   now: 1, 2
+
+  The filter is now the AND of every scan key (next entry) and the rank is the `ORDER BY`
+  query. When the single `WHERE` query is byte-identical to the `ORDER BY` query -- the
+  common shape, including one CTE or parameter value feeding both -- the scan takes the
+  unchanged path. Otherwise the ordering scan materializes the filter set with the
+  `@@@` evaluator, scores every row of it by the `ORDER BY` query's terms in one merge-join
+  pass over their postings (the per-term BM25 contribution the top-k engine uses; the
+  ranking query's operators do not filter, as `ORDER BY` never does), and returns the scored
+  rows by descending score, equal scores in heap order, then the rows holding no ranking term
+  at distance 1. It can return every filter row, each exactly once, however deep the executor
+  pulls. A filter row still in the pending list comes back unranked with the distance-1 rows;
+  an over-generating filter is rechecked by the executor on only the rows it pulls.
+- **Only the first `WHERE` key was applied.** `bm25_rescan` read `keyData[0]` alone, so two
+  `@@@` quals served by one bitmap, plain or ordering index scan applied only the first --
+  and those paths return no recheck for an exact query, so the executor never applied the
+  second either. With `t` from the entry above (rows 1 and 2 hold `apple`, only row 1 also
+  `cherry`): `SELECT id FROM t WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;`
+  returned 1, 2 on 1.8.3 and returns 1 now, as a sequential scan does. Every scan key is now
+  read and the scan returns their AND (byte-identical keys folded, so a repeated qual keeps
+  its single-key path); the COUNT pushdown was not affected (it takes only single-qual
+  counts).
+- **A NULL `ORDER BY` argument is served by the filtered ordering scan.** The runtime
+  NULL-key entry above already stopped the crash. A NULL `<=>` argument beside a `WHERE`
+  filter now takes the filtered scan, which returns the filter rows (the AND of every key)
+  with a NULL distance for every `ORDER BY` key; the previous path stored one distance
+  whatever the number of keys. A NULL `WHERE` key still returns no rows, and an unfiltered
+  ordering by distance to NULL still raises an error.
+
+### Known issues
+
+- **A deep ordering scan can return duplicate rows and miss others (identical `WHERE` and
+  `ORDER BY` query; present in 1.8.3, narrowed but not fixed here).** On a two-segment
+  fixture (2,000 documents holding `cherry` with tf 1-7, 10% deleted and re-inserted, then
+  VACUUM), `WHERE d @@@ 'cherry' ORDER BY d <=> 'cherry' LIMIT 100000` returns 2,000 rows but
+  only 1,785 distinct ids on this tree (129 returned twice, 43 three times, 215 matching
+  rows never returned), against 1,762 distinct on 1.8.3;
+  `fts_search(idx, 'cherry', 100000)` returns all 2,000 distinct rows on the same fixture.
+  The adaptive-k ordering scan recomputes the top-k for a larger k and resumes at the count
+  of rows already returned, which assumes each larger top-k extends the previous one in the
+  same order. The `wand_skip_blocks` last-block skip is fixed above (inherited ranked-search
+  defects); the filtered scan decodes forward rather than calling `wand_seek`, and returns
+  every filter row exactly once.
+
 ### Tests
 
 - A regression block compares ten NOT shapes through the index (bitmap scan and
@@ -91,6 +149,18 @@ All notable changes to pg_fts are documented here.
   and a positions = off index, and the heap matcher on each table), over two segments,
   tombstones and a pending list. Every expected count was checked against an independent
   computation of the fixture's truth.
+
+- One existing expected line changed, to the heap truth: `SELECT count(*) FROM psh WHERE d
+  @@@ 'term1' AND d @@@ 'body'` now expects 0, not 50. The english configuration stores
+  "body" as `bodi`, so the raw `'body'` matches no row -- a sequential scan answers 0 on
+  1.8.3 too -- and 1.8.3's 50 came from applying only the first key (above). A new line with
+  the stemmed `'bodi'` expects the 50.
+- `pg_fts` regression: filter-vs-rank through the ordering scan (stored and expression
+  index, positions on and off), pending rows, two `WHERE` keys on the bitmap, plain and
+  ordering paths against a sequential scan, the one-value CTE shape (unchanged top-k path;
+  its pending row is ranked by the exact pending fallback), a deep pull across segments with deletes, VACUUM
+  and heap-slot reuse (every filter row exactly once, in exact order), and NULL `WHERE` and
+  `ORDER BY` values.
 
 ## 1.8.3 - 2026-09-18
 

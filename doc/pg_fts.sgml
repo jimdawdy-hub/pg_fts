@@ -157,6 +157,24 @@ SELECT id FROM docs
   </para>
 
   <para>
+   The <literal>WHERE</literal> query and the <literal>ORDER BY</literal> query
+   need not be the same.  <literal>WHERE</literal> filters and
+   <literal>ORDER BY</literal> only ranks: the scan returns every row the
+   <literal>WHERE</literal> clause admits (every <literal>@@@</literal>
+   condition on the index applies), ordered by the <literal>ORDER BY</literal>
+   query's BM25 score; a row holding none of the ranking terms scores 0
+   (distance 1) and follows every scored row:
+<programlisting>
+SELECT id FROM docs
+  WHERE to_ftsdoc('english', body) @@@ to_ftsquery('english', '"query planner"')
+  ORDER BY to_ftsdoc('english', body) &lt;=&gt; to_ftsquery('english', 'index | scan')
+  LIMIT 10;
+</programlisting>
+   The ranking query's boolean operators do not filter here: its terms are
+   scored, as the <literal>&lt;=&gt;</literal> operator scores them.
+  </para>
+
+  <para>
    The index is a set of immutable segments plus a small pending write buffer.
    An <command>INSERT</command> appends to the pending buffer and is immediately
    searchable without a <command>REINDEX</command>.  A flush &mdash; performed
@@ -888,7 +906,12 @@ SELECT * FROM messages
      Pending documents and modifier queries use an exact heap ranking fallback.
      Plain merged queries retain WAND. Ranking uses literal query-term BM25
      scores, so expansion-only matches can score zero. Equal scores are ordered
-     by tuple identifier to keep pagination stable.
+     by tuple identifier to keep pagination stable.  When the
+     <literal>WHERE</literal> query differs from the <literal>ORDER BY</literal>
+     query, the rows satisfying every <literal>WHERE</literal> key are ranked by
+     the <literal>ORDER BY</literal> query's terms; a document still in the
+     pending write buffer, or holding none of those terms, is returned unranked
+     (distance 1), after the ranked rows.
     </para>
    </listitem>
    <listitem>

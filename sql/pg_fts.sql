@@ -2941,6 +2941,11 @@ SET enable_seqscan = off;
 SELECT count(*) FROM psh WHERE d @@@ (SELECT 'term1'::ftsquery);
 -- two @@@ quals -> more than one qual, no single-@@@ pushdown
 SELECT count(*) FROM psh WHERE d @@@ 'term1'::ftsquery AND d @@@ 'body'::ftsquery;
+-- (0, as a heap scan answers: the english config stores "body" as 'bodi', so
+-- the raw 'body' matches no row.  Through 1.8.3 the index read only the first
+-- of the two keys and answered 50.  With the stemmed term both keys match the
+-- same 50 rows.)
+SELECT count(*) FROM psh WHERE d @@@ 'term1'::ftsquery AND d @@@ 'bodi'::ftsquery;
 -- @@@ on a rel where the matched column also has a non-fts index (index-list walk)
 SELECT count(*) FROM psh WHERE d @@@ 'term1'::ftsquery;
 -- count over a rel with NO fts index at all (LHS has no matching fts index)
@@ -3316,3 +3321,254 @@ DROP TABLE notpos_on;
 DROP TABLE notpos_off;
 DROP FUNCTION notpos_counts(text);
 DROP FUNCTION notpos_doc(int);
+
+-- ============================================================================
+-- WHERE and ORDER BY may carry DIFFERENT queries, and EVERY WHERE key counts.
+--
+-- Two defects through 1.8.3 (see CHANGELOG):
+--  (a) the <=> ordering scan read only the ORDER BY query.  bm25_rescan
+--      overwrote the WHERE key's query with it, and the ordered path returns
+--      xs_recheck = false, so the executor never re-applied the WHERE:
+--      `WHERE d @@@ apple ORDER BY d <=> cherry` returned cherry rows lacking
+--      apple and missed the apple rows that hold no cherry;
+--  (b) only the first scan key was ever read, so `WHERE d @@@ a AND d @@@ b`
+--      served by ONE index scan returned a-rows lacking b.
+-- The filter is the AND of every WHERE key; the rank is the ORDER BY query.
+-- A filter row holding none of the rank terms scores 0 (distance 1.0) and
+-- comes after every scored row.  Identical WHERE and ORDER BY queries -- the
+-- common shape -- keep the unchanged path.
+-- Every wr document has six tokens, so a rank term's BM25 order is its tf
+-- order; equal scores come out in heap (TID) order.
+-- ============================================================================
+CREATE TABLE wr (id int, d ftsdoc);
+INSERT INTO wr VALUES
+  ( 1, to_ftsdoc('simple', 'apple cherry cherry cherry kiwi lime')),
+  ( 2, to_ftsdoc('simple', 'apple cherry cherry kiwi lime mango')),
+  ( 3, to_ftsdoc('simple', 'apple cherry kiwi lime mango pear')),
+  ( 4, to_ftsdoc('simple', 'apple banana kiwi lime mango pear')),
+  ( 5, to_ftsdoc('simple', 'apple kiwi lime mango pear plum')),
+  ( 6, to_ftsdoc('simple', 'cherry cherry cherry cherry kiwi lime')),
+  ( 7, to_ftsdoc('simple', 'cherry cherry cherry kiwi lime mango')),
+  ( 8, to_ftsdoc('simple', 'banana cherry kiwi lime mango pear')),
+  ( 9, to_ftsdoc('simple', 'banana kiwi lime mango pear plum')),
+  (10, to_ftsdoc('simple', 'kiwi lime mango pear plum quince'));
+CREATE INDEX wr_fts ON wr USING fts (d);
+ANALYZE wr;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+-- (1) filter apple, rank cherry, through the ordering Index Scan
+EXPLAIN (COSTS OFF)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+-- every apple row: the cherry holders by tf (1, 2, 3), then 4 and 5 (score 0)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+SELECT count(*) AS filter_rows,
+       count(*) FILTER (WHERE NOT d @@@ 'apple'::ftsquery) AS filter_violations
+FROM (SELECT d FROM wr WHERE d @@@ 'apple'::ftsquery
+      ORDER BY d <=> 'cherry'::ftsquery LIMIT 100) s;                 -- 5 | 0
+-- ORDER BY does not filter: ranking by an AND query still returns every
+-- filter row, by the summed score of its terms (4: banana; 1, 2, 3: cherry)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry & banana'::ftsquery LIMIT 10;
+-- (2) a filter row still in the pending list is returned unranked (distance
+-- 1.0, after the scored rows): the ranked scan scores segments only, but the
+-- WHERE must admit every matching row.  After a flush it ranks normally.
+INSERT INTO wr VALUES (11, to_ftsdoc('simple', 'apple cherry kiwi lime mango pear'));
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+SELECT fts_merge('wr_fts') AS merged;
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+-- (3) two WHERE keys on one index: both are applied on the bitmap, the plain
+-- and the ordering index paths, matching a sequential scan
+RESET enable_bitmapscan; SET enable_indexscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+SELECT array_agg(id ORDER BY id) AS bitmap_two_keys
+FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+RESET enable_indexscan; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+SELECT array_agg(id ORDER BY id) AS plain_two_keys
+FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'banana'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+SELECT id FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'banana'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;
+RESET enable_seqscan; SET enable_indexscan = off;
+SELECT array_agg(id ORDER BY id) AS seq_two_keys
+FROM wr WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+RESET enable_indexscan; RESET enable_bitmapscan;
+DROP TABLE wr;
+
+-- (4) The common shape -- ONE query value feeds both WHERE and ORDER BY
+-- through a CTE -- is byte-identical on both sides and keeps the unchanged
+-- top-k path.  Rows 1-12 have 13 tokens each, so they come in apple tf
+-- order; row 13, still in the pending list, is ranked by the exact pending
+-- fallback (1.8.3 left it out).  A duplicated WHERE key is folded to one, so
+-- it keeps that path too.
+CREATE TABLE wrq (id int, d ftsdoc);
+INSERT INTO wrq SELECT g, to_ftsdoc('simple',
+    repeat('apple ', g) || repeat('kiwi ', 12 - g) || 'cherry')
+  FROM generate_series(1, 12) g;
+CREATE INDEX wrq_fts ON wrq USING fts (d);
+ANALYZE wrq;
+INSERT INTO wrq VALUES (13, to_ftsdoc('simple', 'apple cherry kiwi'));
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+WITH q AS (SELECT to_ftsquery('simple', 'apple & cherry') AS query)
+SELECT id FROM wrq WHERE d @@@ (SELECT query FROM q)
+ORDER BY d <=> (SELECT query FROM q) LIMIT 20;
+WITH q AS (SELECT to_ftsquery('simple', 'apple & cherry') AS query)
+SELECT id FROM wrq WHERE d @@@ (SELECT query FROM q)
+ORDER BY d <=> (SELECT query FROM q) LIMIT 20;
+WITH q AS (SELECT to_ftsquery('simple', 'apple & cherry') AS query)
+SELECT id FROM wrq WHERE d @@@ (SELECT query FROM q) AND d @@@ (SELECT query FROM q)
+ORDER BY d <=> (SELECT query FROM q) LIMIT 20;
+RESET enable_seqscan; RESET enable_bitmapscan;
+DROP TABLE wrq;
+
+-- (5) Deep pull: an ORDER BY index scan must be able to return EVERY filter
+-- row exactly once and in order -- by descending score (here: descending
+-- cherry tf, as every document has five tokens, so id % 4 ascending), equal
+-- scores in heap (ctid) order, then the rows holding no cherry -- across
+-- segments, with deleted rows both before VACUUM (the heap fetch drops them)
+-- and after it (the index has tombstoned them), and with later rows that may
+-- reuse the vacuumed heap slots.  Filter rows: ids 1..1500, 2001..2500 and
+-- 3001..3200.
+CREATE TABLE wrd (id int, d ftsdoc);
+INSERT INTO wrd SELECT g, to_ftsdoc('simple', 'apple ' ||
+    (ARRAY['cherry cherry cherry', 'cherry cherry kiwi', 'cherry kiwi kiwi',
+           'kiwi kiwi kiwi'])[1 + g % 4] || ' w' || (g % 50))
+  FROM generate_series(1, 1500) g;
+INSERT INTO wrd SELECT g, to_ftsdoc('simple', 'cherry cherry cherry kiwi w' || (g % 50))
+  FROM generate_series(1501, 2000) g;
+CREATE INDEX wrd_fts ON wrd USING fts (d);
+INSERT INTO wrd SELECT g, to_ftsdoc('simple', 'apple ' ||
+    (ARRAY['cherry cherry cherry', 'cherry cherry kiwi', 'cherry kiwi kiwi',
+           'kiwi kiwi kiwi'])[1 + g % 4] || ' w' || (g % 50))
+  FROM generate_series(2001, 2500) g;
+VACUUM ANALYZE wrd;                        -- flushes the pending rows: a second segment
+SELECT fts_index_nsegments('wrd_fts') > 1 AS multi_segment;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wrd WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000;
+SELECT count(*) AS filter_rows, count(DISTINCT id) AS distinct_ids,
+       count(*) FILTER (WHERE NOT d @@@ 'apple'::ftsquery) AS filter_violations
+FROM (SELECT id, d FROM wrd WHERE d @@@ 'apple'::ftsquery
+      ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000) s;          -- 2000 | 2000 | 0
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM wrd WHERE d @@@ 'apple'::ftsquery
+          ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000) s)
+     = (SELECT array_agg(id ORDER BY id % 4, ctid) FROM wrd
+        WHERE id <= 1500 OR id BETWEEN 2001 AND 2500 OR id > 3000)
+       AS deep_order_exact;
+DELETE FROM wrd WHERE id % 10 = 0;
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM wrd WHERE d @@@ 'apple'::ftsquery
+          ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000) s)
+     = (SELECT array_agg(id ORDER BY id % 4, ctid) FROM wrd
+        WHERE id <= 1500 OR id BETWEEN 2001 AND 2500 OR id > 3000)
+       AS deep_order_after_delete;
+RESET enable_seqscan; RESET enable_bitmapscan;
+VACUUM wrd;
+INSERT INTO wrd SELECT g, to_ftsdoc('simple', 'apple ' ||
+    (ARRAY['cherry cherry cherry', 'cherry cherry kiwi', 'cherry kiwi kiwi',
+           'kiwi kiwi kiwi'])[1 + g % 4] || ' w' || (g % 50))
+  FROM generate_series(3001, 3200) g;
+VACUUM wrd;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SELECT count(*) AS filter_rows, count(DISTINCT id) AS distinct_ids
+FROM (SELECT id FROM wrd WHERE d @@@ 'apple'::ftsquery
+      ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000) s;          -- 2000 | 2000
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM wrd WHERE d @@@ 'apple'::ftsquery
+          ORDER BY d <=> 'cherry'::ftsquery LIMIT 100000) s)
+     = (SELECT array_agg(id ORDER BY id % 4, ctid) FROM wrd
+        WHERE id <= 1500 OR id BETWEEN 2001 AND 2500 OR id > 3000)
+       AS deep_order_after_reuse;
+RESET enable_seqscan; RESET enable_bitmapscan;
+DROP TABLE wrd;
+
+-- (6) A phrase filter ranked by other words fills a whole page with phrase
+-- rows -- answered from positions (positions = on), or over-generated and
+-- then dropped by the executor's heap recheck (positions = off) -- and the
+-- page holds the best-ranked of them (every one carries "date").
+CREATE TABLE wrp (id int, body text);
+INSERT INTO wrp SELECT g,
+    (ARRAY['apple banana cherry', 'cherry banana apple', 'banana apple kiwi'])[1 + g % 3]
+    || (ARRAY[' date date', ' fig', ' kiwi lime', ' lime', ' plum'])[1 + g % 5]
+  FROM generate_series(1, 600) g;
+CREATE INDEX wrp_fts ON wrp USING fts (to_ftsdoc('simple', body)) WITH (positions = on);
+ANALYZE wrp;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wrp WHERE to_ftsdoc('simple', body) @@@ to_ftsquery('simple', '"apple banana cherry"')
+ORDER BY to_ftsdoc('simple', body) <=> to_ftsquery('simple', 'date | fig') LIMIT 20;
+SELECT count(*) AS page_rows,
+       count(*) FILTER (WHERE NOT to_ftsdoc('simple', body)
+                        @@@ to_ftsquery('simple', '"apple banana cherry"')) AS filter_violations,
+       count(*) FILTER (WHERE body LIKE '%date%') AS best_ranked
+FROM (SELECT body FROM wrp
+      WHERE to_ftsdoc('simple', body) @@@ to_ftsquery('simple', '"apple banana cherry"')
+      ORDER BY to_ftsdoc('simple', body) <=> to_ftsquery('simple', 'date | fig') LIMIT 20) s;
+DROP INDEX wrp_fts;
+CREATE INDEX wrp_fts_nopos ON wrp USING fts (to_ftsdoc('simple', body));
+SELECT count(*) AS page_rows,
+       count(*) FILTER (WHERE NOT to_ftsdoc('simple', body)
+                        @@@ to_ftsquery('simple', '"apple banana cherry"')) AS filter_violations,
+       count(*) FILTER (WHERE body LIKE '%date%') AS best_ranked
+FROM (SELECT body FROM wrp
+      WHERE to_ftsdoc('simple', body) @@@ to_ftsquery('simple', '"apple banana cherry"')
+      ORDER BY to_ftsdoc('simple', body) <=> to_ftsquery('simple', 'date | fig') LIMIT 20) s;
+RESET enable_seqscan; RESET enable_bitmapscan;
+DROP TABLE wrp;
+
+-- (7) The filter-vs-rank shape through an english expression index with
+-- only sequential scans disabled: 1 holds apple and cherry, 4 only apple.
+CREATE TABLE wre (id int, body text);
+INSERT INTO wre VALUES (1, 'an apple and cherry pie'), (2, 'a cherry tart'),
+  (3, 'cherries and more cherries'), (4, 'an apple a day'), (5, 'plums and pears');
+CREATE INDEX wre_fts ON wre USING fts (to_ftsdoc('english', body)) WITH (positions = on);
+ANALYZE wre;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM wre WHERE to_ftsdoc('english', body) @@@ to_ftsquery('english', 'apple')
+ORDER BY to_ftsdoc('english', body) <=> to_ftsquery('english', 'cherry') LIMIT 10;
+SELECT id FROM wre WHERE to_ftsdoc('english', body) @@@ to_ftsquery('english', 'apple')
+ORDER BY to_ftsdoc('english', body) <=> to_ftsquery('english', 'cherry') LIMIT 10;
+RESET enable_seqscan;
+DROP TABLE wre;
+
+-- (8) A NULL query value (a NULL runtime parameter) crashed the backend
+-- through 1.8.3.  @@@ is strict, so a NULL WHERE key admits no row on any
+-- path; d <=> NULL is NULL for every row, so a NULL ORDER BY argument returns
+-- every filter row, each with a NULL distance.
+CREATE TABLE wrn (id int, d ftsdoc);
+INSERT INTO wrn VALUES (1, to_ftsdoc('simple', 'apple cherry')),
+  (2, to_ftsdoc('simple', 'apple')), (3, to_ftsdoc('simple', 'cherry'));
+CREATE INDEX wrn_fts ON wrn USING fts (d);
+ANALYZE wrn;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF)
+WITH q AS (SELECT NULL::ftsquery AS query)
+SELECT id FROM wrn WHERE d @@@ (SELECT query FROM q)
+ORDER BY d <=> 'apple'::ftsquery LIMIT 10;
+WITH q AS (SELECT NULL::ftsquery AS query)
+SELECT id FROM wrn WHERE d @@@ (SELECT query FROM q)
+ORDER BY d <=> 'apple'::ftsquery LIMIT 10;
+WITH q AS (SELECT NULL::ftsquery AS query)
+SELECT coalesce(array_agg(id), '{}') AS plain_null_key
+FROM wrn WHERE d @@@ (SELECT query FROM q);
+RESET enable_bitmapscan; SET enable_indexscan = off;
+WITH q AS (SELECT NULL::ftsquery AS query)
+SELECT coalesce(array_agg(id), '{}') AS bitmap_null_key
+FROM wrn WHERE d @@@ (SELECT query FROM q);
+RESET enable_indexscan; SET enable_bitmapscan = off;
+WITH q AS (SELECT NULL::ftsquery AS query)
+SELECT array_agg(id ORDER BY id) AS null_rank_rows,
+       bool_and(dist IS NULL) AS null_distances
+FROM (SELECT id, d <=> (SELECT query FROM q) AS dist FROM wrn
+      WHERE d @@@ 'apple'::ftsquery
+      ORDER BY d <=> (SELECT query FROM q) LIMIT 10) s;
+RESET enable_seqscan; RESET enable_bitmapscan;
+DROP TABLE wrn;

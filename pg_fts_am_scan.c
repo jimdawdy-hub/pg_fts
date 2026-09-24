@@ -116,7 +116,32 @@ typedef struct BM25ScanOpaqueData
 {
 	FtsQuery	query;			/* copied into the scan's context */
 	bool		queryValid;
-	bool		orderByNull;	/* strict NULL <=> key: filter rows, return NULL distance */
+	/*
+	 * The WHERE filter: the scan keys' distinct queries, ANDed.  A single
+	 * @@@ qual (every scan the planner builds for one) is one entry; a
+	 * byte-identical repeated qual is folded into it, keeping that path.
+	 */
+	FtsQuery   *filtq;
+	int			nfiltq;
+	/*
+	 * An ordering scan whose filter is NOT its ORDER BY query -- a different
+	 * WHERE query, several WHERE keys, or a NULL ORDER BY argument -- is
+	 * served by bm25_gettuple_filtered rather than the top-k engine below,
+	 * which ranks and gates by the ORDER BY query alone.
+	 */
+	bool		filterDiffers;
+	bool		rankNull;		/* NULL ORDER BY argument: every distance is NULL */
+	/* filtered ordering scan state (filterDiffers), materialized on first call */
+	bool		filtInit;
+	ScoredTid  *filtHits;		/* filter rows holding a rank term: a max-heap
+								 * on (score, then TID) */
+	int			nfiltHits;
+	ItemPointerData *filtZero;	/* filter rows holding none: score 0, TID order */
+	int			nfiltZero;
+	int			filtZeroPos;
+	bool		filtRecheck;	/* the filter over-generates: executor rechecks */
+	Oid		   *filtOrderTypes;	/* per ORDER BY key, for the distance store */
+	IndexOrderByDistance *filtOrderDist;
 	/* ordering-scan (amgettuple) state, materialized on first call */
 	bool		orderInit;		/* have we computed the ordered results? */
 	ScoredTid  *ordered;		/* top-k by ascending distance */
@@ -135,6 +160,11 @@ typedef struct BM25ScanOpaqueData
 } BM25ScanOpaqueData;
 
 typedef BM25ScanOpaqueData *BM25ScanOpaque;
+
+static void bm25_collect_filter(Relation index, BM25ScanOpaque so, TidSet *out,
+								bool *recheck);
+static int bm25_rank_filter(Relation index, FtsQuery rankq, TidSet *rows,
+							ScoredTid **hits_out);
 
 static int
 cmp_tid(const void *a, const void *b)
@@ -1463,6 +1493,8 @@ bm25_beginscan(Relation r, int nkeys, int norderbys)
 
 	so->query = NULL;
 	so->queryValid = false;
+	so->filtq = (FtsQuery *) palloc(Max(nkeys, 1) * sizeof(FtsQuery));
+	so->nfiltq = 0;
 	so->orderInit = false;
 	so->ordered = NULL;
 	so->nordered = 0;
@@ -1476,10 +1508,31 @@ bm25_beginscan(Relation r, int nkeys, int norderbys)
 	/* the AM owns allocation of the order-by result arrays */
 	if (norderbys > 0)
 	{
+		int			i;
+
 		scan->xs_orderbyvals = palloc0(sizeof(Datum) * norderbys);
 		scan->xs_orderbynulls = palloc(sizeof(bool) * norderbys);
+		/* the filtered scan ranks the first ORDER BY key; any further key
+		 * reports NULL rather than reading past a one-element distance */
+		so->filtOrderTypes = (Oid *) palloc(sizeof(Oid) * norderbys);
+		so->filtOrderDist = (IndexOrderByDistance *)
+			palloc(sizeof(IndexOrderByDistance) * norderbys);
+		for (i = 0; i < norderbys; i++)
+		{
+			so->filtOrderTypes[i] = FLOAT8OID;
+			so->filtOrderDist[i].value = 0.0;
+			so->filtOrderDist[i].isnull = true;
+		}
 	}
 	return scan;
+}
+
+/* Byte-identical ftsquery values?  Both are detoasted (4-byte header). */
+static inline bool
+fts_query_equal(FtsQuery a, FtsQuery b)
+{
+	return a == b ||
+		(VARSIZE(a) == VARSIZE(b) && memcmp(a, b, VARSIZE(a)) == 0);
 }
 
 void
@@ -1487,23 +1540,44 @@ bm25_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 			ScanKey orderbys, int norderbys)
 {
 	BM25ScanOpaque so = (BM25ScanOpaque) scan->opaque;
-	bool		nullFilter = false;
+	bool		nullkey = false;
 	int			i;
 
 	if (scankey && scan->numberOfKeys > 0)
 		memmove(scan->keyData, scankey,
 				scan->numberOfKeys * sizeof(ScanKeyData));
 
-	for (i = 0; i < scan->numberOfKeys; i++)
-		if (scan->keyData[i].sk_flags & SK_ISNULL)
-			nullFilter = true;
-	so->query = NULL;
+	/*
+	 * The WHERE filter is the AND of EVERY scan key.  `WHERE d @@@ a AND d @@@
+	 * b` on one index is one scan with two keys, and the bitmap and plain
+	 * paths return xs_recheck = false for an exact query, so a key nobody
+	 * reads is a qual nobody applies (only keyData[0] was read through
+	 * 1.8.3).  Byte-identical keys are folded.  @@@ is strict, so a NULL key
+	 * (a NULL runtime parameter) can never be satisfied: the scan returns
+	 * nothing -- detoasting the NULL datum crashed the backend.
+	 */
 	so->queryValid = false;
-	if (scan->numberOfKeys >= 1 && !nullFilter)
+	so->nfiltq = 0;
+	for (i = 0; i < scan->numberOfKeys; i++)
 	{
-		FtsQuery	q = DatumGetFtsQuery(scan->keyData[0].sk_argument);
+		FtsQuery	q;
+		int			j;
 
-		so->query = q;
+		if (scan->keyData[i].sk_flags & SK_ISNULL)
+		{
+			nullkey = true;
+			break;
+		}
+		q = DatumGetFtsQuery(scan->keyData[i].sk_argument);
+		for (j = 0; j < so->nfiltq; j++)
+			if (fts_query_equal(so->filtq[j], q))
+				break;
+		if (j == so->nfiltq)
+			so->filtq[so->nfiltq++] = q;
+	}
+	if (so->nfiltq >= 1 && !nullkey)
+	{
+		so->query = so->filtq[0];
 		so->queryValid = true;
 	}
 
@@ -1520,21 +1594,46 @@ bm25_rescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->nplain = 0;
 	so->plainpos = 0;
 	so->plainRecheck = false;
-	so->orderByNull = false;
-	if (scan->numberOfOrderBys >= 1)
+	so->filterDiffers = false;
+	so->rankNull = false;
+	so->filtInit = false;
+	if (so->filtHits)
+		pfree(so->filtHits);
+	so->filtHits = NULL;
+	so->nfiltHits = 0;
+	if (so->filtZero)
+		pfree(so->filtZero);
+	so->filtZero = NULL;
+	so->nfiltZero = 0;
+	so->filtZeroPos = 0;
+	so->filtRecheck = false;
+	if (scan->numberOfOrderBys >= 1 && !nullkey)
 	{
 		if (scan->orderByData[0].sk_flags & SK_ISNULL)
 		{
-			so->orderByNull = true;
-			if (scan->numberOfKeys == 0)
+			if (so->nfiltq == 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("pg_fts: ORDER BY distance to NULL requires a search filter")));
+			/* d <=> NULL is NULL for every row: the filter rows, unranked */
+			so->rankNull = true;
+			so->filterDiffers = true;
 		}
-		else if (!nullFilter)
+		else
 		{
 			so->query = DatumGetFtsQuery(scan->orderByData[0].sk_argument);
 			so->queryValid = true;
+
+			/*
+			 * Rank by the ORDER BY query, filter by the WHERE keys.  The top-k
+			 * engine gates by the ORDER BY query's own boolean structure, which
+			 * IS the filter only when the single WHERE query is byte-identical
+			 * to it -- the common `WHERE d @@@ q ORDER BY d <=> q` shape, one
+			 * CTE or parameter value feeding both -- and then that path is
+			 * taken unchanged.  Anything else is the filtered scan.
+			 */
+			so->filterDiffers = so->nfiltq >= 1 &&
+				!(so->nfiltq == 1 && fts_query_equal(so->filtq[0], so->query));
 		}
 	}
 }
@@ -1591,6 +1690,151 @@ bm25_set_itup(IndexScanDesc scan, BM25ScanOpaque so)
 }
 
 /*
+ * The filtered ordering scan's result order: a higher score first, equal
+ * scores in heap (TID) order.  A total order, so the stream is deterministic.
+ */
+static inline bool
+scored_precedes(const ScoredTid *a, const ScoredTid *b)
+{
+	if (a->score != b->score)
+		return a->score > b->score;
+	return ItemPointerCompare((ItemPointer) &a->tid, (ItemPointer) &b->tid) < 0;
+}
+
+/* Restore the max-heap property (scored_precedes) below h[i] of n entries. */
+static void
+scored_sift_down(ScoredTid *h, int n, int i)
+{
+	for (;;)
+	{
+		int			best = i;
+		int			l = 2 * i + 1;
+		ScoredTid	tmp;
+
+		if (l < n && scored_precedes(&h[l], &h[best]))
+			best = l;
+		if (l + 1 < n && scored_precedes(&h[l + 1], &h[best]))
+			best = l + 1;
+		if (best == i)
+			return;
+		tmp = h[i];
+		h[i] = h[best];
+		h[best] = tmp;
+		i = best;
+	}
+}
+
+/*
+ * bm25_collect_filter: the TIDs satisfying EVERY WHERE key -- the AND of the
+ * scan's distinct key queries -- and whether they need a heap recheck.  One
+ * key (every single-qual scan) is exactly bm25_collect_matches.  More keys
+ * intersect the per-key sets, each key keeping its own fast paths (a
+ * positional phrase stays exact beside a plain term), and recheck if any key
+ * over-generates: the executor's recheck re-applies every qual.  Shared by
+ * the bitmap, plain and filtered ordering scans.
+ */
+static void
+bm25_collect_filter(Relation index, BM25ScanOpaque so, TidSet *out, bool *recheck)
+{
+	int			i;
+
+	if (so->nfiltq == 0)
+	{
+		out->tids = NULL;
+		out->n = 0;
+		*recheck = false;
+		return;
+	}
+	bm25_collect_matches(index, so->filtq[0], out, recheck);
+	for (i = 1; i < so->nfiltq && out->n > 0; i++)
+	{
+		TidSet		m;
+		TidSet		both;
+		bool		r;
+
+		bm25_collect_matches(index, so->filtq[i], &m, &r);
+		both = tidset_and(*out, m);
+		if (out->tids)
+			pfree(out->tids);
+		if (m.tids)
+			pfree(m.tids);
+		*out = both;
+		*recheck = *recheck || r;
+	}
+}
+
+/*
+ * bm25_gettuple_filtered: the ordering scan when the WHERE filter is not the
+ * ORDER BY query (see bm25_rescan).  ORDER BY does not filter, so the result
+ * is exactly the filter's rows -- what a bitmap scan of the WHERE keys
+ * returns -- ranked by the ORDER BY query's BM25 score.  The first call
+ * materializes the filter set and scores every row of it in one pass
+ * (bm25_rank_filter); each call then returns the next row:
+ *
+ *  - rows holding a rank term, by descending score, equal scores in TID
+ *    order (a max-heap, so a LIMIT page does not pay for a full sort);
+ *  - then the rows holding none of them: score 0, distance 1.0, TID order.
+ *
+ * The whole filter set is materialized, so the scan can return every row --
+ * an amcanorderbyop scan must, the executor's LIMIT being the only bound --
+ * and returns each exactly once, with no top-k regrowth.  A row still in the
+ * pending list has no postings to score and comes out with the score-0 rows.
+ * An over-generating filter (positions-off phrase, fuzzy/regex funnel,
+ * weighted term) is handed to the executor with xs_recheck, which re-applies
+ * every WHERE qual to only the rows it pulls; dropping rows from an ordered
+ * stream leaves it ordered.  Visibility is the heap fetch's job, as for any
+ * plain index scan.
+ */
+static bool
+bm25_gettuple_filtered(IndexScanDesc scan, BM25ScanOpaque so)
+{
+	IndexOrderByDistance *dist = so->filtOrderDist;
+
+	if (!so->filtInit)
+	{
+		TidSet		rows;
+
+		pgstat_count_index_scan(scan->indexRelation);
+		bm25_collect_filter(scan->indexRelation, so, &rows, &so->filtRecheck);
+		so->nfiltHits = bm25_rank_filter(scan->indexRelation,
+										 so->rankNull ? NULL : so->query,
+										 &rows, &so->filtHits);
+		so->filtZero = rows.tids;	/* the unscored rows, compacted in place */
+		so->nfiltZero = rows.n;
+		so->filtZeroPos = 0;
+		so->filtInit = true;
+	}
+
+	/*
+	 * A scored row precedes the score-0 rows while its score is positive.  (A
+	 * negative score -- possible only through the negative IDF of a term held
+	 * by more documents than the live count -- sorts after them, keeping the
+	 * distance ascending.)
+	 */
+	if (so->nfiltHits > 0 &&
+		(so->filtHits[0].score > 0.0 || so->filtZeroPos >= so->nfiltZero))
+	{
+		scan->xs_heaptid = so->filtHits[0].tid;
+		dist[0].value = 1.0 / (1.0 + so->filtHits[0].score);
+		so->filtHits[0] = so->filtHits[--so->nfiltHits];
+		scored_sift_down(so->filtHits, so->nfiltHits, 0);
+	}
+	else if (so->filtZeroPos < so->nfiltZero)
+	{
+		scan->xs_heaptid = so->filtZero[so->filtZeroPos++];
+		dist[0].value = 1.0;
+	}
+	else
+		return false;
+
+	scan->xs_recheck = so->filtRecheck;
+	bm25_set_itup(scan, so);
+	dist[0].isnull = so->rankNull;
+	index_store_float8_orderby_distances(scan, so->filtOrderTypes, dist, false);
+	return true;
+}
+
+/*
  * bm25_gettuple: ordering scan for ORDER BY (ftsdoc <=> ftsquery) LIMIT k.
  * On the first call it computes the block-max WAND top-k (visibility-filtered)
  * into scan state, then returns tuples one per call in ascending distance
@@ -1616,14 +1860,14 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 	 * from the same evaluator, so results are identical; the executor applies
 	 * MVCC visibility on the heap fetch.
 	 */
-	if (scan->numberOfOrderBys == 0 || so->orderByNull)
+	if (scan->numberOfOrderBys == 0)
 	{
 		if (!so->plainInit)
 		{
 			TidSet		m;
 
 			pgstat_count_index_scan(scan->indexRelation);
-			bm25_collect_matches(scan->indexRelation, so->query, &m, &so->plainRecheck);
+			bm25_collect_filter(scan->indexRelation, so, &m, &so->plainRecheck);
 			so->plainTids = m.tids;
 			so->nplain = m.n;
 			so->plainpos = 0;
@@ -1634,17 +1878,12 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 		scan->xs_heaptid = so->plainTids[so->plainpos++];
 		scan->xs_recheck = so->plainRecheck;
 		bm25_set_itup(scan, so);
-		if (so->orderByNull)
-		{
-			IndexOrderByDistance dist;
-			Oid			typ = FLOAT8OID;
-
-			dist.value = 0;
-			dist.isnull = true;
-			index_store_float8_orderby_distances(scan, &typ, &dist, false);
-		}
 		return true;
 	}
+
+	/* WHERE filter differs from the ORDER BY query (see bm25_rescan) */
+	if (so->filterDiffers)
+		return bm25_gettuple_filtered(scan, so);
 
 	if (!so->orderInit)
 	{
@@ -2856,7 +3095,8 @@ bm25_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	/* Count the index scan for pg_stat_user_indexes.idx_scan; idx_tup_read is
 	 * added by index_getbitmap() from our return value. */
 	pgstat_count_index_scan(scan->indexRelation);
-	bm25_collect_matches(scan->indexRelation, so->query, &matches, &recheck);
+	/* the AND of every distinct WHERE key (see bm25_collect_filter) */
+	bm25_collect_filter(scan->indexRelation, so, &matches, &recheck);
 	if (matches.n > 0)
 		tbm_add_tuples(tbm, matches.tids, matches.n, recheck);
 	return matches.n;
@@ -4555,6 +4795,120 @@ bm25_topk_exact(Relation index, FtsQuery q, const BM25MetaPageData *meta,
 }
 
 /*
+ * bm25_open_cursors: one WandCursor per (query term, segment holding it), each
+ * carrying the term's global IDF and the BM25 constants -- the per-term scoring
+ * state of every ranked path, shared so the top-k engine and the filtered
+ * ordering scan score a document identically.  Loads the per-segment
+ * tombstones into *tombs (the caller frees them after the traversal).  Returns
+ * the number of cursors; *nterms_out receives the query's term count (the
+ * BoolGate's termidx space).
+ */
+static int
+bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
+				  uint64 docid_lo, uint64 docid_hi,
+				  BM25DoclenDirCache *doclendir, BM25DoclenResident *doclenres,
+				  BM25Tombstones *tombs, WandCursor **cursors_out, int *nterms_out)
+{
+	double		N = meta->ndocs < 1.0 ? 1.0 : meta->ndocs;
+	double		avgdl = meta->ndocs > 0 ? meta->sumdoclen / meta->ndocs : 1.0;
+	double		k1 = 1.2;
+	const char **terms;
+	int		   *lens;
+	int			nterms;
+	WandCursor *cursors;
+	int			t,
+				nactive = 0;
+
+	nterms = fts_query_terms(q, &terms, &lens);
+	/* up to one cursor per (term, segment) */
+	cursors = (WandCursor *) palloc(Max(nterms * Max((int) meta->nsegments, 1), 1) *	/* alloc-ok: query terms x <=128 segments */
+									sizeof(WandCursor));
+
+	/* per-segment tombstones: each cursor skips docids deleted in its own
+	 * segment, so reused heap TIDs live in another segment still rank */
+	bm25_tombstones_load(index, meta, tombs);
+
+	/* v4 doclen sidecar: each cursor gets a FORWARD cursor over its segment's
+	 * sidecar chain (initialised per cursor below), reading only the pages that
+	 * cover the docids it actually scores -- NOT a whole-segment preload, which
+	 * on a many-segment index dominated the scan (the 1.5.0 slowdown report). */
+
+	for (t = 0; t < nterms; t++)
+	{
+		uint64		gdf = 0;	/* summed across segments; uint64 (feeds IDF as double) */
+		uint32		s;
+		double		idf;
+		double		b = 0.75;
+
+		/* global df across all segments -> IDF (segments share the corpus) */
+		for (s = 0; s < meta->nsegments; s++)
+		{
+			uint32		df,
+						max_tf;
+			BlockNumber firstblk;
+			uint32		firstoff;
+
+			if (bm25_lookup_dict(index, &meta->segs[s], terms[t], lens[t],
+								 &df, &max_tf, &firstblk, &firstoff))
+				gdf += df;
+		}
+		if (gdf == 0)
+			continue;			/* term absent in every segment */
+		idf = log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
+
+		/* one cursor per segment that contains the term */
+		for (s = 0; s < meta->nsegments; s++)
+		{
+			uint32		df,
+						max_tf;
+			BlockNumber firstblk;
+			uint32		firstoff;
+			double		mtf;
+
+			if (!bm25_lookup_dict(index, &meta->segs[s], terms[t], lens[t],
+								  &df, &max_tf, &firstblk, &firstoff))
+				continue;
+			mtf = (double) max_tf;
+			cursors[nactive].index = index;
+			cursors[nactive].firstblk = firstblk;
+			cursors[nactive].firstoff = firstoff;
+			cursors[nactive].df = df;
+			cursors[nactive].termidx = t;
+			cursors[nactive].blkbuf = NULL;
+			cursors[nactive].blkcount = 0;
+			cursors[nactive].cur = 0;
+			cursors[nactive].docid = 0;
+			cursors[nactive].idf = idf;
+			cursors[nactive].avgdl = avgdl;
+			cursors[nactive].k1b_inv_avgdl = k1 * b / avgdl;
+			cursors[nactive].k1_1mb = k1 * (1.0 - b);
+			cursors[nactive].idf_k1p1 = idf * (k1 + 1.0);
+			cursors[nactive].max_contrib =
+				idf * mtf * (k1 + 1.0) / (mtf + k1 * (1.0 - b));
+			cursors[nactive].tombs = tombs;
+			cursors[nactive].segidx = s;
+			cursors[nactive].has_doclen_col =
+				(meta->segs[s].doclenstart == InvalidBlockNumber);
+			bm25_doclen_cursor_init(&cursors[nactive].doclenc, index,
+									meta->segs[s].doclenstart, doclendir,
+									doclenres ? &doclenres[s] : NULL);
+			cursors[nactive].docid_lo = docid_lo;
+			cursors[nactive].docid_hi = docid_hi;
+			{
+				sm_cursor_t ini = SM_CURSOR_INIT;
+
+				cursors[nactive].tombcursor = ini;
+			}
+			nactive++;
+		}
+	}
+
+	*cursors_out = cursors;
+	*nterms_out = nterms;
+	return nactive;
+}
+
+/*
  * bm25_topk_visible: shared top-k engine for both the fts_search SRF and the
  * amgettuple ordering scan.  Runs block-max WAND / MaxScore over the index's
  * SEGMENTS for `q`, over-fetches candidates so MVCC visibility filtering still
@@ -4574,10 +4928,6 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 						   uint64 docid_lo, uint64 docid_hi, ScoredTid **out)
 {
 	BM25MetaPageData meta;
-	double		N,
-				avgdl;
-	const char **terms;
-	int		   *lens;
 	int			nterms;
 	WandCursor *cursors;
 	ScoredTid  *cand;
@@ -4594,9 +4944,7 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	BoolGate	gate;
 	BoolGate   *gatep = NULL;
 	int			ncand;
-	int			t,
-				nactive = 0;
-	double		k1 = 1.2;
+	int			nactive;
 
 	if (wantk < 1)
 		wantk = 1;
@@ -4605,8 +4953,6 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	if (meta.npending > 0 || fts_query_has_modifier(q))
 		return bm25_topk_exact(index, q, &meta, wantk,
 							   docid_lo, docid_hi, out);
-	N = meta.ndocs < 1.0 ? 1.0 : meta.ndocs;
-	avgdl = meta.ndocs > 0 ? meta.sumdoclen / meta.ndocs : 1.0;
 	/* relcache page directory over the v4 doclen sidecars (built once per backend,
 	 * keyed by meta.generation); NULL if no v4 sidecar segment exists */
 	doclendir = bm25_doclendir_cache(index, &meta);
@@ -4685,89 +5031,8 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 		}
 	}
 
-	nterms = fts_query_terms(q, &terms, &lens);
-	/* up to one cursor per (term, segment) */
-	cursors = (WandCursor *) palloc(Max(nterms * Max((int) meta.nsegments, 1), 1) *	/* alloc-ok: query terms x <=128 segments */
-									sizeof(WandCursor));
-
-	/* per-segment tombstones: each cursor skips docids deleted in its own
-	 * segment, so reused heap TIDs live in another segment still rank */
-	bm25_tombstones_load(index, &meta, &tombs);
-
-	/* v4 doclen sidecar: each cursor gets a FORWARD cursor over its segment's
-	 * sidecar chain (initialised per cursor below), reading only the pages that
-	 * cover the docids it actually scores -- NOT a whole-segment preload, which
-	 * on a many-segment index dominated the scan (the 1.5.0 slowdown report). */
-
-	for (t = 0; t < nterms; t++)
-	{
-		uint64		gdf = 0;	/* summed across segments; uint64 (feeds IDF as double) */
-		uint32		s;
-		double		idf;
-		double		b = 0.75;
-
-		/* global df across all segments -> IDF (segments share the corpus) */
-		for (s = 0; s < meta.nsegments; s++)
-		{
-			uint32		df,
-						max_tf;
-			BlockNumber firstblk;
-			uint32		firstoff;
-
-			if (bm25_lookup_dict(index, &meta.segs[s], terms[t], lens[t],
-								 &df, &max_tf, &firstblk, &firstoff))
-				gdf += df;
-		}
-		if (gdf == 0)
-			continue;			/* term absent in every segment */
-		idf = log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
-
-		/* one cursor per segment that contains the term */
-		for (s = 0; s < meta.nsegments; s++)
-		{
-			uint32		df,
-						max_tf;
-			BlockNumber firstblk;
-			uint32		firstoff;
-			double		mtf;
-
-			if (!bm25_lookup_dict(index, &meta.segs[s], terms[t], lens[t],
-								  &df, &max_tf, &firstblk, &firstoff))
-				continue;
-			mtf = (double) max_tf;
-			cursors[nactive].index = index;
-			cursors[nactive].firstblk = firstblk;
-			cursors[nactive].firstoff = firstoff;
-			cursors[nactive].df = df;
-			cursors[nactive].termidx = t;
-			cursors[nactive].blkbuf = NULL;
-			cursors[nactive].blkcount = 0;
-			cursors[nactive].cur = 0;
-			cursors[nactive].docid = 0;
-			cursors[nactive].idf = idf;
-			cursors[nactive].avgdl = avgdl;
-			cursors[nactive].k1b_inv_avgdl = k1 * b / avgdl;
-			cursors[nactive].k1_1mb = k1 * (1.0 - b);
-			cursors[nactive].idf_k1p1 = idf * (k1 + 1.0);
-			cursors[nactive].max_contrib =
-				idf * mtf * (k1 + 1.0) / (mtf + k1 * (1.0 - b));
-			cursors[nactive].tombs = &tombs;
-			cursors[nactive].segidx = s;
-			cursors[nactive].has_doclen_col =
-				(meta.segs[s].doclenstart == InvalidBlockNumber);
-			bm25_doclen_cursor_init(&cursors[nactive].doclenc, index,
-									meta.segs[s].doclenstart, doclendir,
-									doclenres ? &doclenres[s] : NULL);
-			cursors[nactive].docid_lo = docid_lo;
-			cursors[nactive].docid_hi = docid_hi;
-			{
-				sm_cursor_t ini = SM_CURSOR_INIT;
-
-				cursors[nactive].tombcursor = ini;
-			}
-			nactive++;
-		}
-	}
+	nactive = bm25_open_cursors(index, &meta, q, docid_lo, docid_hi,
+								doclendir, doclenres, &tombs, &cursors, &nterms);
 
 	/* build the lazy BoolGate now that nterms is known (pure-boolean path) */
 	if (gatep != NULL)
@@ -4790,6 +5055,163 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 
 	*out = cand;
 	return ncand;
+}
+
+/*
+ * bm25_rank_filter: score EVERY row of a materialized WHERE filter set by a
+ * different ORDER BY query (for bm25_gettuple_filtered).  The rows are TID-
+ * sorted and docids are monotonic in TID order, so one ascending pass merge-
+ * joins them with the rank query's cursors (bm25_open_cursors): each cursor
+ * decodes forward to the next row (rank_seek), and a row's score is the sum of
+ * wand_contrib_cur over the cursors sitting on it, the per-term BM25
+ * contribution the top-k engine scores with.  Nothing is pruned (every row
+ * must be ordered); the work is the filter set plus the docid column of the
+ * rank blocks passed -- tf and doclen are decoded only for postings a row
+ * actually holds.  The rank query's boolean structure is deliberately NOT a
+ * gate: ORDER BY does not filter.
+ *
+ * Returns the rows holding a rank term as a max-heap (scored_precedes) in
+ * *hits_out, and compacts the rest -- the score-0 rows -- in place at the
+ * front of rows->tids (TID order; rows->n updated).  A NULL rankq (a NULL
+ * ORDER BY argument) scores nothing.  Like bm25_topk_visible, the pass is
+ * bracketed by the directory generation and redone from a fresh snapshot if a
+ * concurrent merge/vacuum moved it (bounded).
+ */
+/*
+ * Advance a cursor (docid < target) to its first posting >= target, decoding
+ * forward block by block.  Unlike wand_seek it never skips a block by header:
+ * wand_skip_blocks proves a block lies wholly below target from the NEXT block
+ * header on the page, and after a term's LAST block that header belongs to the
+ * next term (with an unrelated first docid), so the term's last block can be
+ * skipped and its postings lost.  wand_load_block stops at the term's df.
+ */
+static void
+rank_seek(WandCursor *c, uint64 target)
+{
+	for (;;)
+	{
+		while (c->cur < c->blkcount && c->docids[c->cur] < target)
+			c->cur++;
+		if (c->cur < c->blkcount)
+		{
+			c->docid = c->docids[c->cur];
+			wand_skip_own_tombstoned(c);
+			return;
+		}
+		wand_load_block(c);		/* the term's next block, or exhausted */
+		if (c->docid == UINT64_MAX)
+			return;
+	}
+}
+
+static int
+bm25_rank_filter(Relation index, FtsQuery rankq, TidSet *rows,
+				 ScoredTid **hits_out)
+{
+	ScoredTid  *hits = NULL;
+	int			nhit = 0;
+	int			gen_retries = 0;
+	int			i;
+
+	*hits_out = NULL;
+	if (rankq == NULL || rows->n == 0)
+		return 0;
+
+	for (;;)
+	{
+		BM25MetaPageData meta;
+		BM25DoclenDirCache *doclendir;
+		BM25DoclenResident *doclenres = NULL;
+		BM25Tombstones tombs;
+		WandCursor *cursors;
+		int			ncur,
+					nterms,
+					cap,
+					t;
+		uint64		sumdf = 0;
+		uint32		gen0 = bm25_read_meta_generation(index);
+
+		bm25_read_meta(index, &meta);
+		doclendir = bm25_doclendir_cache(index, &meta);
+		if (doclendir != NULL)
+			doclenres = (BM25DoclenResident *)
+				palloc0(sizeof(BM25DoclenResident) * Max((int) meta.nsegments, 1));
+		ncur = bm25_open_cursors(index, &meta, rankq, 0, UINT64_MAX,
+								 doclendir, doclenres, &tombs, &cursors, &nterms);
+		for (t = 0; t < ncur; t++)
+		{
+			sumdf += cursors[t].df;
+			wand_prime(&cursors[t]);
+		}
+
+		/* only a row some cursor holds is scored: at most sum(df) of them */
+		cap = (sumdf < (uint64) rows->n) ? (int) sumdf : rows->n;
+		if (hits)
+			pfree(hits);
+		hits = (ScoredTid *) FTS_ALLOC_MAYBE_HUGE((Size) Max(cap, 1) * sizeof(ScoredTid));
+		nhit = 0;
+
+		for (i = 0; i < rows->n; i++)
+		{
+			uint64		d = bm25_tid_to_docid(&rows->tids[i]);
+			double		score = 0.0;
+			bool		hit = false;
+
+			CHECK_FOR_INTERRUPTS();	/* per row; cursor blocks are palloc'd copies, no lock held */
+			for (t = 0; t < ncur; t++)
+			{
+				WandCursor *c = &cursors[t];
+
+				if (c->docid < d)
+					rank_seek(c, d);
+				if (c->docid == d)
+				{
+					score += wand_contrib_cur(c);
+					hit = true;
+				}
+			}
+			/* (the cap is structural; the check keeps a corrupt df from ever
+			 * writing past it -- such a row is merely left unscored) */
+			if (hit && nhit < cap)
+			{
+				hits[nhit].tid = rows->tids[i];
+				hits[nhit].score = score;
+				nhit++;
+			}
+		}
+
+		for (t = 0; t < ncur; t++)
+		{
+			if (cursors[t].blkbuf)
+				pfree(cursors[t].blkbuf);
+			bm25_doclen_cursor_free(&cursors[t].doclenc);
+		}
+		pfree(cursors);
+		bm25_tombstones_free(&tombs);
+
+		if (bm25_read_meta_generation(index) == gen0 || gen_retries++ >= 10)
+			break;
+	}
+
+	/* hits[] is a subsequence of rows->tids, both in TID order: compact the
+	 * unscored rows to the front, then heapify the scored ones */
+	{
+		int			j = 0,
+					nzero = 0;
+
+		for (i = 0; i < rows->n; i++)
+		{
+			if (j < nhit && ItemPointerEquals(&rows->tids[i], &hits[j].tid))
+				j++;
+			else
+				rows->tids[nzero++] = rows->tids[i];
+		}
+		rows->n = nzero;
+	}
+	for (i = nhit / 2 - 1; i >= 0; i--)
+		scored_sift_down(hits, nhit, i);
+	*hits_out = hits;
+	return nhit;
 }
 
 /*
