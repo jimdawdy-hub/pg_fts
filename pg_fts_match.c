@@ -303,20 +303,18 @@ span_join(FtsMatchValue left, FtsMatchValue right, uint8 op, uint32 distance,
 	return out;
 }
 
-/* Shared RPN evaluator. Leaf values are indexed by query item. Callers own
- * the memory context; index callers reset it after each candidate document. */
-bool
-fts_match_eval(FtsQuery query, FtsMatchValue *values, int maxspans, bool *overflow)
+/*
+ * needpos[i]: does item i's value need its spans (it is an operand of a
+ * proximity operator, possibly through ORs)?  Everywhere else only presence
+ * counts, so a caller may leave those values without spans.
+ */
+void
+fts_match_needpos(FtsQuery query, bool *needpos)
 {
-	FtsMatchValue *stack = palloc(query->nitems * sizeof(FtsMatchValue));
-	bool	   *needpos = palloc0(query->nitems * sizeof(bool));
 	bool	   *work = palloc(Max(query->nitems, 1) * sizeof(bool));
-	int			depth = 1,
-				top = 0;
+	int			depth = 1;
 	uint32		i;
-	bool		result;
 
-	*overflow = false;
 	work[0] = false;
 	for (i = query->nitems; i-- > 0;)
 	{
@@ -333,6 +331,22 @@ fts_match_eval(FtsQuery query, FtsMatchValue *values, int maxspans, bool *overfl
 		if (it->op != FTS_OP_NOT)
 			work[depth++] = need;
 	}
+	pfree(work);
+}
+
+/* Shared RPN evaluator. Leaf values are indexed by query item. Callers own
+ * the memory context; index callers reset it after each candidate document. */
+bool
+fts_match_eval(FtsQuery query, FtsMatchValue *values, int maxspans, bool *overflow)
+{
+	FtsMatchValue *stack = palloc(query->nitems * sizeof(FtsMatchValue));
+	bool	   *needpos = palloc(Max(query->nitems, 1) * sizeof(bool));
+	int			top = 0;
+	uint32		i;
+	bool		result;
+
+	*overflow = false;
+	fts_match_needpos(query, needpos);
 	for (i = 0; i < query->nitems && !*overflow; i++)
 	{
 		FtsQueryItem *it = &query->items[i];
@@ -379,7 +393,6 @@ fts_match_eval(FtsQuery query, FtsMatchValue *values, int maxspans, bool *overfl
 	result = !*overflow && top == 1 && stack[0].present;
 	pfree(stack);
 	pfree(needpos);
-	pfree(work);
 	return result;
 }
 

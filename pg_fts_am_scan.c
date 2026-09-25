@@ -38,6 +38,8 @@ static bool bm25_trgm_candidates(Relation index, BlockNumber trgmstart,
 								 int min_trigrams, bool is_regex, bool has_doclen_col,
 								 TidSet *out);
 static void bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck);
+static void bm25_collect_matches_split(Relation index, FtsQuery query,
+									   TidSet *exact, TidSet *unsure);
 static void bm25_recheck_exact(Relation index, FtsQuery query, TidSet *set);
 static double bm25_query_maxhits(Relation index, FtsQuery q, double N);
 static TidSet bm25_universe_bounded(Relation index, BlockNumber dictstart,
@@ -163,6 +165,8 @@ typedef BM25ScanOpaqueData *BM25ScanOpaque;
 
 static void bm25_collect_filter(Relation index, BM25ScanOpaque so, TidSet *out,
 								bool *recheck);
+static void bm25_collect_filter_split(Relation index, BM25ScanOpaque so,
+									  TidSet *exact, TidSet *unsure);
 static int bm25_rank_filter(Relation index, FtsQuery rankq, TidSet *rows,
 							ScoredTid **hits_out);
 
@@ -1725,42 +1729,56 @@ scored_sift_down(ScoredTid *h, int n, int i)
 }
 
 /*
- * bm25_collect_filter: the TIDs satisfying EVERY WHERE key -- the AND of the
- * scan's distinct key queries -- and whether they need a heap recheck.  One
- * key (every single-qual scan) is exactly bm25_collect_matches.  More keys
- * intersect the per-key sets, each key keeping its own fast paths (a
- * positional phrase stays exact beside a plain term), and recheck if any key
- * over-generates: the executor's recheck re-applies every qual.  Shared by
- * the bitmap, plain and filtered ordering scans.
+ * bm25_collect_filter_split: the TIDs satisfying EVERY WHERE key -- the AND
+ * of the scan's distinct key queries -- split as bm25_collect_matches_split
+ * splits one key's: *exact the rows every key decided, *unsure the rest, which
+ * the executor's recheck (re-applying every qual) decides.  One key (every
+ * single-qual scan) is exactly bm25_collect_matches_split; more keys intersect
+ * the per-key sets, each key keeping its own fast paths (a positional phrase
+ * stays exact beside a plain term).  Shared by the bitmap, plain and filtered
+ * ordering scans.
  */
 static void
-bm25_collect_filter(Relation index, BM25ScanOpaque so, TidSet *out, bool *recheck)
+bm25_collect_filter_split(Relation index, BM25ScanOpaque so, TidSet *exact,
+						  TidSet *unsure)
 {
 	int			i;
 
+	exact->tids = unsure->tids = NULL;
+	exact->n = unsure->n = 0;
 	if (so->nfiltq == 0)
-	{
-		out->tids = NULL;
-		out->n = 0;
-		*recheck = false;
 		return;
-	}
-	bm25_collect_matches(index, so->filtq[0], out, recheck);
-	for (i = 1; i < so->nfiltq && out->n > 0; i++)
+	bm25_collect_matches_split(index, so->filtq[0], exact, unsure);
+	for (i = 1; i < so->nfiltq && exact->n + unsure->n > 0; i++)
 	{
-		TidSet		m;
-		TidSet		both;
-		bool		r;
+		TidSet		e,
+					u,
+					all,
+					both,
+					sure;
 
-		bm25_collect_matches(index, so->filtq[i], &m, &r);
-		both = tidset_and(*out, m);
-		if (out->tids)
-			pfree(out->tids);
-		if (m.tids)
-			pfree(m.tids);
-		*out = both;
-		*recheck = *recheck || r;
+		bm25_collect_matches_split(index, so->filtq[i], &e, &u);
+		/* a row of every key's set; decided only if every key decided it */
+		all = tidset_or(*exact, *unsure);
+		both = tidset_and(all, tidset_or(e, u));
+		sure = tidset_and(*exact, e);
+		*unsure = tidset_andnot(both, sure);
+		*exact = sure;
 	}
+}
+
+/* bm25_collect_filter: the filter as one TID set, *recheck iff part of it
+ * still needs the heap recheck (the plain and filtered ordering scans, whose
+ * recheck flag covers the whole scan) */
+static void
+bm25_collect_filter(Relation index, BM25ScanOpaque so, TidSet *out, bool *recheck)
+{
+	TidSet		exact,
+				unsure;
+
+	bm25_collect_filter_split(index, so, &exact, &unsure);
+	*recheck = (unsure.n > 0);
+	*out = (unsure.n > 0) ? tidset_or(exact, unsure) : exact;
 }
 
 /*
@@ -2002,7 +2020,8 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 typedef struct PosPosting
 {
 	uint64		docid;
-	uint32	   *pos;			/* tf ascending positions (into an arena) */
+	uint32	   *pos;			/* tf ascending positions (into an arena), or
+								 * NULL when the posting's block stored none */
 	int			npos;
 }			PosPosting;
 
@@ -2010,6 +2029,7 @@ typedef struct PosTermList
 {
 	PosPosting *posts;
 	int			nposts;
+	bool		complete;		/* every posting has its positions */
 	BM25Posting *raw;			/* decoder output (owns tids/pos slots) */
 	uint32	   *arena;			/* positions arena to free */
 }			PosTermList;
@@ -2138,7 +2158,12 @@ bm25_phrase_chain(FtsQuery q, int *termidx, uint32 *stepdist, bool *stepexact,
 	return (stack == 1 && nt >= 2);
 }
 
-/* Compound proximity/OR with plain positive terms can use the span matcher. */
+/*
+ * Proximity combined in any way with AND / OR / NOT, over plain terms, can use
+ * the span matcher (bm25_span_eval_seg).  A prefix, fuzzy, regex or
+ * weight-restricted term cannot: the postings hold neither its expansions'
+ * positions nor zone labels.
+ */
 static bool
 bm25_span_query(FtsQuery q)
 {
@@ -2154,12 +2179,9 @@ bm25_span_query(FtsQuery q)
 			if (it->flags != 0)
 				return false;
 		}
-		else if (it->type == FTS_QI_OPR &&
-				 (it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
-				  it->op == FTS_OP_EXACT))
+		else if (it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
+				 it->op == FTS_OP_EXACT)
 			has_proximity = true;
-		else if (it->type != FTS_QI_OPR || it->op != FTS_OP_OR)
-			return false;
 	}
 	return has_proximity;
 }
@@ -2175,21 +2197,12 @@ cmp_pospost_docid(const void *a, const void *b)
 
 /*
  * Look up one term in a segment and decode its postings WITH positions,
- * docid-sorted.  Returns:
- *   BM25_POSLOOKUP_OK      -- found, positions present (out is populated)
- *   BM25_POSLOOKUP_ABSENT  -- term not in this segment (clean empty phrase)
- *   BM25_POSLOOKUP_NOPOS   -- found but a block dropped positions (Sum(tf)
- *                             overflowed a page): caller MUST fall back to the
- *                             recheck path for correctness.
+ * docid-sorted.  Returns false if the term is absent from the segment.  A
+ * posting whose block dropped its positions (Sum(tf) overflowed a page) keeps
+ * pos == NULL and clears out->complete: adjacency cannot be verified for that
+ * document here, only by the heap recheck.
  */
-typedef enum
-{
-	BM25_POSLOOKUP_OK = 0,
-	BM25_POSLOOKUP_ABSENT,
-	BM25_POSLOOKUP_NOPOS
-}			BM25PosLookup;
-
-static BM25PosLookup
+static bool
 bm25_lookup_term_pos(Relation index, const BM25SegMeta *seg,
 					 const char *term, int termlen, PosTermList *out)
 {
@@ -2198,6 +2211,7 @@ bm25_lookup_term_pos(Relation index, const BM25SegMeta *seg,
 
 	out->posts = NULL;
 	out->nposts = 0;
+	out->complete = true;
 	out->raw = NULL;
 	out->arena = NULL;
 
@@ -2256,14 +2270,7 @@ bm25_lookup_term_pos(Relation index, const BM25SegMeta *seg,
 			for (k = 0; k < np; k++)
 			{
 				if (post[k].pos == NULL && post[k].tf > 0)
-				{
-					/* a block dropped positions: cannot verify adjacency here */
-					pfree(pp);
-					pfree(post);
-					if (arena)
-						pfree(arena);
-					return BM25_POSLOOKUP_NOPOS;
-				}
+					out->complete = false;
 				pp[k].docid = bm25_tid_to_docid(&post[k].tid);
 				pp[k].pos = post[k].pos;
 				pp[k].npos = (int) post[k].tf;
@@ -2274,12 +2281,12 @@ bm25_lookup_term_pos(Relation index, const BM25SegMeta *seg,
 			out->nposts = np;
 			out->raw = post;
 			out->arena = arena;
-			return BM25_POSLOOKUP_OK;
+			return true;
 		}
 		if (onlyone)
 			break;
 	}
-	return BM25_POSLOOKUP_ABSENT;	/* term absent in this segment */
+	return false;				/* term absent in this segment */
 }
 
 static void
@@ -2318,11 +2325,26 @@ bm25_pospost_find(PosTermList *pl, uint64 docid)
 	return NULL;
 }
 
+/* append one TID to a growable array (NULL when empty) */
+static void
+bm25_tidbuf_push(ItemPointerData **tids, int *ntids, int *captids,
+				 ItemPointerData tid)
+{
+	if (*ntids >= *captids)
+	{
+		*captids = Max(*captids * 2, 16);
+		*tids = *tids ? repalloc(*tids, (Size) *captids * sizeof(ItemPointerData)) :
+			palloc((Size) *captids * sizeof(ItemPointerData));
+	}
+	(*tids)[(*ntids)++] = tid;
+}
+
 /*
  * Evaluate a pure phrase chain positionally over one segment, appending exact
  * matches to *out (a growable TidSet-like buffer).  Returns true on success;
- * false means "fall back to recheck" (a term lacked positions).  seg_tombs/s
- * are used to drop tombstoned docids from this segment's contribution.
+ * false means the span evaluator must decide the segment instead (a term
+ * lacked positions, or one document's positions overflowed the buffer), and
+ * the caller discards what this call appended.
  */
 static bool
 bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
@@ -2343,17 +2365,16 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 	for (t = 0; t < nterms; t++)
 	{
 		FtsQueryItem *it = &q->items[termidx[t]];
-		BM25PosLookup rc = bm25_lookup_term_pos(index, seg,
-												FTS_QUERY_ITEMTEXT(q, it),
-												it->termlen, &tl[t]);
+		bool		found = bm25_lookup_term_pos(index, seg,
+												 FTS_QUERY_ITEMTEXT(q, it),
+												 it->termlen, &tl[t]);
 
-		if (rc == BM25_POSLOOKUP_NOPOS)
+		if (found && !tl[t].complete)
 		{
-			ok = false;			/* found but positions missing: fall back to recheck */
+			ok = false;			/* positions missing: the span evaluator decides */
 			goto done;
 		}
-		if (rc == BM25_POSLOOKUP_ABSENT &&
-			(or_anchor < 0 || t == or_anchor))
+		if (!found && (or_anchor < 0 || t == or_anchor))
 			goto done;			/* term absent: phrase cannot match this segment */
 		if (or_anchor < 0 && (base < 0 || tl[t].nposts < tl[base].nposts))
 			base = t;
@@ -2440,12 +2461,7 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		if (nacc > 0)
 		{
 			bm25_docid_to_tid(docid, &tid);
-			if (*ntids >= *captids)
-			{
-				*captids = Max(*captids * 2, 16);
-				*tids = repalloc(*tids, (Size) *captids * sizeof(ItemPointerData));
-			}
-			(*tids)[(*ntids)++] = tid;
+			bm25_tidbuf_push(tids, ntids, captids, tid);
 		}
 	}
 
@@ -2458,34 +2474,58 @@ done:
 	return ok;
 }
 
-/* Verify compound proximity candidates without fetching heap tuples. */
-static bool
+/*
+ * Decide compound proximity candidates from the stored positions, without
+ * fetching heap tuples.  The candidates are bm25_eval_query's superset (a
+ * proximity operand read as the AND of its terms, or as nothing under an odd
+ * number of NOTs); the shared span matcher (fts_match_eval) then evaluates
+ * the whole query for each one, so the index and the heap recheck agree by
+ * construction.  Each distinct term is decoded once per segment.  A candidate
+ * that a proximity operand cannot decide here -- its positions were not
+ * stored, or they overflow the span bound -- is appended to utids for the heap
+ * recheck; a term read only for its presence never needs positions.  Every
+ * other candidate is decided, and the matches are appended to tids.  Both come
+ * out in ascending TID order.
+ */
+static void
 bm25_span_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
-				   ItemPointerData **tids, int *ntids, int *captids)
+				   ItemPointerData **tids, int *ntids, int *captids,
+				   ItemPointerData **utids, int *nutids, int *caputids)
 {
 	MemoryContext segctx = AllocSetContextCreate(CurrentMemoryContext,
 											  "pg_fts span segment", ALLOCSET_DEFAULT_SIZES);
 	MemoryContext docctx;
 	MemoryContext oldctx = MemoryContextSwitchTo(segctx);
 	PosTermList *terms = palloc0((Size) q->nitems * sizeof(PosTermList));
+	int		   *owner = palloc((Size) q->nitems * sizeof(int));	/* the VAL whose decode an equal VAL shares */
+	bool	   *needpos = palloc((Size) Max(q->nitems, 1) * sizeof(bool));
 	TidSet		candidates = bm25_eval_query(index, seg, q);
-	uint32		i;
+	uint32		i,
+				j;
 	int			ci;
-	bool		ok = true;
 
 	if (candidates.n == 0)
 		goto done;
+	fts_match_needpos(q, needpos);
 	for (i = 0; i < q->nitems; i++)
 	{
 		FtsQueryItem *it = &q->items[i];
 
-		if (it->type == FTS_QI_VAL &&
-			bm25_lookup_term_pos(index, seg, FTS_QUERY_ITEMTEXT(q, it),
-								it->termlen, &terms[i]) == BM25_POSLOOKUP_NOPOS)
-		{
-			ok = false;
-			goto done;
-		}
+		if (it->type != FTS_QI_VAL)
+			continue;
+		owner[i] = (int) i;
+		for (j = 0; j < i; j++)
+			if (q->items[j].type == FTS_QI_VAL &&
+				q->items[j].termlen == it->termlen &&
+				memcmp(FTS_QUERY_ITEMTEXT(q, &q->items[j]),
+					   FTS_QUERY_ITEMTEXT(q, it), it->termlen) == 0)
+			{
+				owner[i] = owner[j];
+				break;
+			}
+		if (owner[i] == (int) i)
+			(void) bm25_lookup_term_pos(index, seg, FTS_QUERY_ITEMTEXT(q, it),
+										it->termlen, &terms[i]);
 	}
 	docctx = AllocSetContextCreate(segctx, "pg_fts span document",
 									 ALLOCSET_SMALL_SIZES);
@@ -2495,8 +2535,8 @@ bm25_span_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 	{
 		uint64		docid = bm25_tid_to_docid(&candidates.tids[ci]);
 		FtsMatchValue *values;
-		bool		overflow = false;
-		bool		matched;
+		bool		undecided = false;
+		bool		matched = false;
 
 		CHECK_FOR_INTERRUPTS();
 		MemoryContextSwitchTo(docctx);
@@ -2504,54 +2544,45 @@ bm25_span_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		for (i = 0; i < q->nitems; i++)
 		{
 			PosPosting *pp;
-			int			j;
+			int			k;
 
 			if (q->items[i].type != FTS_QI_VAL)
 				continue;
-			pp = bm25_pospost_find(&terms[i], docid);
+			pp = bm25_pospost_find(&terms[owner[i]], docid);
 			if (pp == NULL)
 				continue;
-			if (pp->npos > BM25_PHRASE_POSBUF)
+			values[i].present = true;
+			if (!needpos[i])
+				continue;
+			if (pp->pos == NULL || pp->npos > BM25_PHRASE_POSBUF)
 			{
-				overflow = true;
+				undecided = true;
 				break;
 			}
-			values[i].present = true;
 			values[i].nspans = pp->npos;
 			values[i].spans = palloc((Size) Max(pp->npos, 1) * sizeof(FtsMatchSpan)); /* alloc-ok: npos <= BM25_PHRASE_POSBUF above */
-			for (j = 0; j < pp->npos; j++)
-				values[i].spans[j].start = values[i].spans[j].end =
-					FTS_POS_ORD(pp->pos[j]);
+			for (k = 0; k < pp->npos; k++)
+				values[i].spans[k].start = values[i].spans[k].end =
+					FTS_POS_ORD(pp->pos[k]);
 		}
-		matched = !overflow &&
-			fts_match_eval(q, values, BM25_PHRASE_POSBUF, &overflow);
+		if (!undecided)
+			matched = fts_match_eval(q, values, BM25_PHRASE_POSBUF, &undecided);
 		MemoryContextSwitchTo(oldctx);
 		MemoryContextReset(docctx);
-		if (overflow)
-		{
-			ok = false;
-			break;
-		}
-		if (matched)
-		{
-			if (*ntids >= *captids)
-			{
-				*captids = Max(*captids * 2, 16);
-				*tids = repalloc(*tids, (Size) *captids * sizeof(ItemPointerData));
-			}
-			(*tids)[(*ntids)++] = candidates.tids[ci];
-		}
+		if (undecided)
+			bm25_tidbuf_push(utids, nutids, caputids, candidates.tids[ci]);
+		else if (matched)
+			bm25_tidbuf_push(tids, ntids, captids, candidates.tids[ci]);
 	}
 done:
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextDelete(segctx);
-	return ok;
 }
 
 /*
- * Per-scan evaluation state shared between bm25_collect_matches and the
+ * Per-scan evaluation state shared between bm25_collect_matches_split and the
  * per-segment evaluator it delegates to.  Bundled so the evaluator's signature
- * stays readable; every field is owned by bm25_collect_matches.
+ * stays readable; every field is owned by bm25_collect_matches_split.
  */
 typedef struct BM25CollectCtx
 {
@@ -2568,39 +2599,49 @@ typedef struct BM25CollectCtx
 	bool	   *pexact;
 	int			npterm;
 	int			or_anchor;
-	ItemPointerData *ptids;
+	ItemPointerData *ptids;		/* decided matches */
 	int			nptids;
 	int			captids;
+	ItemPointerData *utids;		/* candidates only the heap recheck can decide */
+	int			nutids;
+	int			caputids;
 	/* accumulators */
 	TidSet		acc;
-	bool		need_recheck;
+	bool		need_recheck;	/* acc as a whole needs the heap recheck */
 } BM25CollectCtx;
 
-typedef enum
+/* drop segment s's tombstoned TIDs from tids[start..*n), which ascend */
+static void
+bm25_tidbuf_filter_seg(BM25Tombstones *t, uint32 s, ItemPointerData *tids,
+					   int start, int *n)
 {
-	SEG_OK,						/* segment evaluated (or skipped as empty) */
-	SEG_RESTART					/* positional fast path abandoned: caller restarts from segment 0 */
-} BM25SegStatus;
+	TidSet		part;
+
+	if (*n <= start)
+		return;
+	part.tids = tids + start;
+	part.n = *n - start;
+	bm25_filter_tombstoned_seg(t, s, &part);
+	*n = start + part.n;
+}
 
 /*
  * bm25_collect_segment: evaluate the query against ONE segment and fold its
- * matches into ctx->acc (or, on the positional-phrase fast path, into
- * ctx->ptids).  Returns SEG_RESTART when the positional path had to be
- * abandoned mid-way (a term lacked positions); the caller then discards all
- * accumulated state and re-runs every segment on the AND+recheck path.
+ * matches into ctx->acc (or, on the positional fast path, its decided matches
+ * into ctx->ptids and its undecided candidates into ctx->utids).
  *
  * Split out of bm25_collect_matches (was a 176-line loop body inside a 412-line
- * function).  Behaviour is unchanged: the three branches -- fuzzy/regex
- * candidates, positional phrase, general boolean -- are exactly as they were.
+ * function).  The three branches: fuzzy/regex candidates, positional
+ * proximity, general boolean.
  */
-static BM25SegStatus
+static void
 bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *ctx)
 {
 	FtsQuery	query = ctx->query;
 	TidSet		universe;
 
 	if (sg->dictstart == InvalidBlockNumber)
-		return SEG_OK;
+		return;
 
 	if (ctx->has_fuzzy_regex && query->nitems > 1)
 	{
@@ -2610,7 +2651,7 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 		bm25_filter_tombstoned_seg(ctx->seg_tombs, s, &candidates);
 		if (candidates.n > 0)
 			ctx->acc = tidset_or(ctx->acc, candidates);
-		return SEG_OK;
+		return;
 	}
 
 	if (ctx->has_fuzzy_regex)
@@ -2694,45 +2735,38 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 					ctx->acc = tidset_or(ctx->acc, universe);
 			}
 		}
-		return SEG_OK;
+		return;
 	}
 
 	if (ctx->use_pos_phrase)
 	{
-		/* evaluate the phrase from this segment's positional postings; the
-		 * matched TIDs accumulate in ptids across segments, and are folded
-		 * into acc after the loop.  A false return means a term lacked
-		 * positions (a rare page-overflow block) -- abandon the fast path
-		 * and fall back to the AND + recheck path for correctness. */
+		/*
+		 * Decide the proximity query from this segment's positional postings:
+		 * decided matches accumulate in ptids and undecided candidates in
+		 * utids, both folded in after the segment loop.  The pure-chain
+		 * evaluator hands a segment it cannot finish (a term lacked positions,
+		 * or one document's overflowed its buffer) to the span evaluator,
+		 * which settles every document it can and leaves only the rest to the
+		 * heap recheck.
+		 */
 		int			seg_start = ctx->nptids;
+		int			useg_start = ctx->nutids;
 
-		if (ctx->ptids == NULL)
+		if (ctx->use_pos_span ||
+			!bm25_phrase_eval_seg(index, sg, query, ctx->pterm, ctx->pstep,
+								  ctx->pexact, ctx->npterm, ctx->or_anchor,
+								  &ctx->ptids, &ctx->nptids, &ctx->captids))
 		{
-			ctx->captids = 64;
-			ctx->ptids = (ItemPointerData *) palloc(ctx->captids * sizeof(ItemPointerData));
+			ctx->nptids = seg_start;
+			bm25_span_eval_seg(index, sg, query,
+							   &ctx->ptids, &ctx->nptids, &ctx->captids,
+							   &ctx->utids, &ctx->nutids, &ctx->caputids);
 		}
-		if (!(ctx->use_pos_span ?
-			  bm25_span_eval_seg(index, sg, query,
-								 &ctx->ptids, &ctx->nptids, &ctx->captids) :
-			  bm25_phrase_eval_seg(index, sg, query, ctx->pterm, ctx->pstep,
-								   ctx->pexact, ctx->npterm, ctx->or_anchor,
-								   &ctx->ptids, &ctx->nptids, &ctx->captids)))
-			return SEG_RESTART;
-
-		/* filter ONLY this segment's new hits (ptids[seg_start..nptids])
-		 * against THIS segment's tombstones -- they are docid-ascending (the
-		 * driver posting list is docid-sorted).  Prior segments' hits were
-		 * already filtered against their own maps. */
-		if (ctx->nptids > seg_start)
-		{
-			TidSet		phr;
-
-			phr.tids = ctx->ptids + seg_start;
-			phr.n = ctx->nptids - seg_start;
-			bm25_filter_tombstoned_seg(ctx->seg_tombs, s, &phr);
-			ctx->nptids = seg_start + phr.n;
-		}
-		return SEG_OK;
+		/* this segment's new TIDs ascend; filter them against its own
+		 * tombstones (earlier segments' were filtered against theirs) */
+		bm25_tidbuf_filter_seg(ctx->seg_tombs, s, ctx->ptids, seg_start, &ctx->nptids);
+		bm25_tidbuf_filter_seg(ctx->seg_tombs, s, ctx->utids, useg_start, &ctx->nutids);
+		return;
 	}
 
 	{
@@ -2752,7 +2786,6 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 			}
 		}
 	}
-	return SEG_OK;
 }
 
 /*
@@ -2838,20 +2871,24 @@ bm25_collect_pending(Relation index, const BM25MetaPageData *meta,
 }
 
 /*
- * bm25_collect_matches: evaluate the scan's query across all segments + the
- * pending list; return matching TIDs (sorted, unique) and a *recheck flag
- * (true iff any term used the over-generating trigram funnel / regex / NOT-
- * universe path).  Shared by the bitmap scan and the plain gettuple scan.
+ * bm25_collect_matches_split: evaluate the scan's query across all segments +
+ * the pending list.  *exact gets the TIDs that match, *unsure the candidates
+ * only the heap recheck can decide: everything, on the paths that over-
+ * generate as a whole (the fuzzy/regex trigram funnel, a weight-restricted
+ * term, a proximity operator without stored positions), but on the positional
+ * path only the documents whose positions were not stored.  Both sorted,
+ * unique and disjoint.  Callers recheck *unsure alone.
  */
 static void
-bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck)
+bm25_collect_matches_split(Relation index, FtsQuery query, TidSet *exact,
+						   TidSet *unsure)
 {
 	BM25MetaPageData meta;
 	TidSet		acc;
+	TidSet		unsure_acc;
 	TidSet		pending_acc;
 	BM25Tombstones seg_tombs;
 	bool		has_fuzzy_regex = false;
-	bool		has_not = false;
 	bool		has_phrase = false;
 	bool		has_weighted = false;
 	bool		need_recheck = false;
@@ -2862,22 +2899,17 @@ bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck)
 	bool		pexact[FTS_QUERY_MAX_PHRASE_TERMS] = {false};
 	int			npterm = 0;
 	int			or_anchor = -1;
-	ItemPointerData *ptids = NULL;
-	int			nptids = 0;
-	int			captids = 0;
 	uint32		i;
 	uint32		s;
 	uint32		gen0;			/* directory generation at the metapage snapshot */
 	int			gen_retries = 0;
 
-	acc.tids = NULL;
-	acc.n = 0;
-	*recheck = false;
+	exact->tids = NULL;
+	exact->n = 0;
+	unsure->tids = NULL;
+	unsure->n = 0;
 	if (query == NULL)
-	{
-		*out = acc;
 		return;
-	}
 
 	bm25_read_meta(index, &meta);
 
@@ -2906,13 +2938,13 @@ collect_retry:
 	gen0 = meta.generation;
 	acc.tids = NULL;
 	acc.n = 0;
+	unsure_acc.tids = NULL;
+	unsure_acc.n = 0;
 
 	for (i = 0; i < query->nitems; i++)
 	{
 		FtsQueryItem *it = &query->items[i];
 
-		if (it->type == FTS_QI_OPR && it->op == FTS_OP_NOT)
-			has_not = true;
 		if (it->type == FTS_QI_OPR &&
 			(it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
 			 it->op == FTS_OP_EXACT))
@@ -2930,19 +2962,18 @@ collect_retry:
 	 * (every doc containing the term) and the heap recheck applies the label
 	 * filter, exactly as it does for fuzzy/regex.  Force recheck.
 	 */
-	if (has_weighted)
-		need_recheck = true;
+	need_recheck = has_weighted;
 
 	/*
-	 * Positional phrase fast path: if the index carries token positions
-	 * (WITH positions=on) and the query is a pure phrase chain, evaluate it
-	 * DIRECTLY from the posting lists -- intersect on docid, verify adjacency
-	 * from the stored positions -- with NO heap access and need_recheck=false.
-	 * This is the cliff fix.  When positions are off, or the phrase mixes with
-	 * boolean operators, we keep the AND + heap-recheck path below (correct,
-	 * slower).
+	 * Positional fast path: if the index carries token positions (WITH
+	 * positions=on) and every term is plain, decide the proximity operators
+	 * DIRECTLY from the posting lists -- a pure phrase chain by intersecting on
+	 * docid, anything combining proximity with AND / OR / NOT by the span
+	 * matcher -- with NO heap access except for the documents whose positions
+	 * were not stored.  When positions are off we keep the AND + heap-recheck
+	 * path below (correct, slower).
 	 */
-	if (has_phrase && !has_fuzzy_regex && !has_not && !has_weighted &&
+	if (has_phrase && !has_fuzzy_regex && !has_weighted &&
 		bm25_index_wants_positions(index))
 	{
 		if (bm25_phrase_chain(query, pterm, pstep, pexact, &npterm, &or_anchor))
@@ -2973,62 +3004,47 @@ collect_retry:
 		ctx.pexact = pexact;
 		ctx.npterm = npterm;
 		ctx.or_anchor = or_anchor;
-		ctx.ptids = ptids;
-		ctx.nptids = nptids;
-		ctx.captids = captids;
+		ctx.ptids = NULL;
+		ctx.nptids = 0;
+		ctx.captids = 0;
+		ctx.utids = NULL;
+		ctx.nutids = 0;
+		ctx.caputids = 0;
 		ctx.acc = acc;
 		ctx.need_recheck = need_recheck;
 
 		for (s = 0; s < meta.nsegments; s++)
 		{
 			CHECK_FOR_INTERRUPTS();	/* per segment; no lock/window held (meta is in memory) */
-			if (bm25_collect_segment(index, &meta.segs[s], s, &ctx) == SEG_RESTART)
-			{
-				/* positional fast path abandoned: restart collection from
-				 * scratch via the AND path (see bm25_collect_segment) */
-				ctx.use_pos_phrase = false;
-				if (ctx.ptids)
-				{
-					pfree(ctx.ptids);
-					ctx.ptids = NULL;
-				}
-				ctx.nptids = 0;
-				if (ctx.acc.tids)
-				{
-					pfree(ctx.acc.tids);
-					ctx.acc.tids = NULL;
-				}
-				ctx.acc.n = 0;
-				s = (uint32) -1;	/* restart the segment loop (s++ -> 0) */
-				continue;
-			}
+			bm25_collect_segment(index, &meta.segs[s], s, &ctx);
 		}
 
-		/* hand the evaluator's state back to the function-scope locals the
-		 * remainder of this function was written against */
-		use_pos_phrase = ctx.use_pos_phrase;
-		ptids = ctx.ptids;
-		nptids = ctx.nptids;
-		captids = ctx.captids;
+		/*
+		 * Fold in the positional path's decided matches and undecided
+		 * candidates (each already tombstone-filtered per segment).  They
+		 * ascend per segment but not globally (segments overlap in docid
+		 * range), so sort+uniq before the merge.
+		 */
 		acc = ctx.acc;
 		need_recheck = ctx.need_recheck;
-	}
+		if (ctx.nptids > 0)
+		{
+			TidSet		phr;
 
-	/* fold in the positional-phrase matches (already tombstone-filtered per
-	 * segment); need_recheck stays false -- the positions gave the exact set.
-	 * ptids is per-segment-ascending but not globally sorted (segments overlap
-	 * in docid range), so sort+uniq before the merge. */
-	if (use_pos_phrase && nptids > 0)
-	{
-		TidSet		phr;
-
-		phr.tids = ptids;
-		phr.n = nptids;
-		tidset_sort_uniq(&phr);
-		acc = tidset_or(acc, phr);
+			phr.tids = ctx.ptids;
+			phr.n = ctx.nptids;
+			tidset_sort_uniq(&phr);
+			acc = tidset_or(acc, phr);
+		}
+		if (ctx.nutids > 0)
+		{
+			unsure_acc.tids = ctx.utids;
+			unsure_acc.n = ctx.nutids;
+			tidset_sort_uniq(&unsure_acc);
+		}
+		if (ctx.ptids)
+			pfree(ctx.ptids);
 	}
-	if (ptids)
-		pfree(ptids);
 
 	/* pending list: verbatim docs matched by the exact per-doc matcher.
 	 * Collect these separately from the segment matches: a pending doc is a
@@ -3066,51 +3082,72 @@ collect_retry:
 	{
 		if (acc.tids)
 			pfree(acc.tids);
+		if (unsure_acc.tids)
+			pfree(unsure_acc.tids);
 		if (pending_acc.tids)
 			pfree(pending_acc.tids);
-		if (ptids)
-			pfree(ptids);
-		ptids = NULL;
-		nptids = 0;
-		captids = 0;
-		need_recheck = false;
-		bm25_tombstones_free(&seg_tombs);
 		bm25_read_meta(index, &meta);
 		goto collect_retry;
 	}
 
-	*out = acc;
-	*recheck = need_recheck;
+	if (need_recheck)
+	{
+		/* an over-generating path: the heap recheck decides every candidate */
+		*unsure = (unsure_acc.n > 0) ? tidset_or(acc, unsure_acc) : acc;
+		return;
+	}
+	*exact = acc;
+	/* a TID matched exactly (e.g. as a pending doc) needs no recheck */
+	*unsure = (unsure_acc.n > 0) ? tidset_andnot(unsure_acc, acc) : unsure_acc;
+}
+
+/*
+ * bm25_collect_matches: the matches as one sorted TID set, with *recheck set
+ * iff some of them still need the heap recheck.
+ */
+static void
+bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck)
+{
+	TidSet		exact,
+				unsure;
+
+	bm25_collect_matches_split(index, query, &exact, &unsure);
+	*recheck = (unsure.n > 0);
+	*out = (unsure.n > 0) ? tidset_or(exact, unsure) : exact;
 }
 
 int64
 bm25_getbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	BM25ScanOpaque so = (BM25ScanOpaque) scan->opaque;
-	TidSet		matches;
-	bool		recheck;
+	TidSet		exact,
+				unsure;
 
 	if (!so->queryValid || so->query == NULL)
 		return 0;
 	/* Count the index scan for pg_stat_user_indexes.idx_scan; idx_tup_read is
 	 * added by index_getbitmap() from our return value. */
 	pgstat_count_index_scan(scan->indexRelation);
-	/* the AND of every distinct WHERE key (see bm25_collect_filter) */
-	bm25_collect_filter(scan->indexRelation, so, &matches, &recheck);
-	if (matches.n > 0)
-		tbm_add_tuples(tbm, matches.tids, matches.n, recheck);
-	return matches.n;
+	/* the AND of every distinct WHERE key (see bm25_collect_filter_split);
+	 * only the undecided rows carry the recheck flag */
+	bm25_collect_filter_split(scan->indexRelation, so, &exact, &unsure);
+	if (exact.n > 0)
+		tbm_add_tuples(tbm, exact.tids, exact.n, false);
+	if (unsure.n > 0)
+		tbm_add_tuples(tbm, unsure.tids, unsure.n, true);
+	return (int64) exact.n + unsure.n;
 }
 
 /*
  * bm25_recheck_exact: shrink `set` to the EXACT @@@ match set.
  *
- * bm25_collect_matches returns recheck=true for queries the index over-
- * generates (PHRASE/NEAR: adjacency not enforced by the positionless posting
- * lists; FUZZY/REGEX: the trigram funnel yields candidates).  The bitmap-heap
- * scan hands these to the executor with a recheck flag so it re-evaluates @@@
- * against the heap ftsdoc.  The ranked <=> scan and fts_count() have no
- * executor recheck, so they must do it here: recompute the indexed ftsdoc from
+ * bm25_collect_matches_split returns in `unsure` the candidates the index
+ * cannot decide (FUZZY/REGEX: the trigram funnel yields candidates; a
+ * weight-restricted term: positions carry no labels; PHRASE/NEAR where the
+ * positions were not stored).  The bitmap-heap scan hands these to the
+ * executor with a recheck flag so it re-evaluates @@@ against the heap
+ * ftsdoc.  The ranked <=> scan and fts_count() have no executor recheck, so
+ * they must do it here, on that set alone: recompute the indexed ftsdoc from
  * each candidate's live heap tuple (evaluating the index expression, exactly
  * as build/insert do) and drop any that fail fts_doc_matches.  After this the
  * TID set is precisely what "WHERE d @@@ q" (with heap recheck) admits.
@@ -4989,20 +5026,21 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	}
 	else if (!fts_query_is_pure_or(q))
 	{
-		TidSet		matches;
-		bool		recheck;
+		TidSet		matches,
+					unsure;
 		int			i;
 
-		bm25_collect_matches(index, q, &matches, &recheck);
+		bm25_collect_matches_split(index, q, &matches, &unsure);
 		/*
 		 * matches is the SAME boolean set @@@ uses through this index (it is
-		 * built by the identical evaluator). A phrase/proximity query can
-		 * over-generate when positions are unavailable or its span set exceeds
-		 * the index evaluator's bound (recheck=true). The bitmap-
-		 * heap scan resolves this with an executor recheck of @@@; the ranked
-		 * scan has none, so we recheck here -- shrink matches to the EXACT set
-		 * against the heap ftsdoc.  After this the docid filter is precise, so
-		 * the ranked scan never admits a doc "WHERE d @@@ q" would reject.
+		 * built by the identical evaluator); unsure holds the candidates the
+		 * index cannot decide -- a phrase/proximity query's documents whose
+		 * positions were not stored or whose span set exceeds the index
+		 * evaluator's bound.  The bitmap-heap scan resolves those with an
+		 * executor recheck of @@@; the ranked scan has none, so we recheck them
+		 * here against the heap ftsdoc and keep the ones that match.  After
+		 * this the docid filter is precise, so the ranked scan never admits a
+		 * doc "WHERE d @@@ q" would reject.
 		 *
 		 * Modifier queries use bm25_topk_exact above: the literal-only WAND
 		 * cursors cannot generate documents that match only an expanded term.
@@ -5010,8 +5048,12 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 		 * TidSet is TID-sorted and bm25_tid_to_docid is monotonic in TID
 		 * order, so the docid array comes out sorted (binary-searchable).
 		 */
-		if (recheck)
-			bm25_recheck_exact(index, q, &matches);
+		if (unsure.n > 0)
+		{
+			bm25_recheck_exact(index, q, &unsure);
+			if (unsure.n > 0)
+				matches = tidset_or(matches, unsure);
+		}
 		if (matches.n > 0)
 		{
 			filter_docids = (uint64 *) palloc(matches.n * sizeof(uint64));
@@ -5467,17 +5509,16 @@ bm25_count_dictdf_fastpath(Relation index, FtsQuery q)
  * whole run of TIDs counts without touching the heap; only pages the VM does
  * not mark all-visible are probed with table_index_fetch_tuple.  This is the
  * count-pushdown path the CustomScan uses to answer count(*) at index speed.
- * If `recheck` is set (fuzzy/regex/NOT/PHRASE over-generation), the collected
- * TIDs are a SUPERSET of the exact matches, so bm25_recheck_exact() shrinks
- * them to the precise set (recomputing the heap ftsdoc and re-running @@@)
- * before the visibility count.  Without recheck the collected TIDs are already
- * exact and we only need visibility.
+ * The candidates the index cannot decide (fuzzy/regex funnel, weight-restricted
+ * terms, phrase/NEAR candidates whose positions were not stored) are rechecked
+ * by bm25_recheck_exact() (recomputing the heap ftsdoc and re-running @@@)
+ * before the visibility count; the exact matches only need visibility.
  */
 static int64
 bm25_count_visible(Relation index, FtsQuery q)
 {
-	TidSet		matches;
-	bool		recheck;
+	TidSet		matches,
+				unsure;
 	Snapshot	snap = GetActiveSnapshot();
 	Relation	heap;
 	IndexFetchTableData *fetch = NULL;
@@ -5508,13 +5549,17 @@ bm25_count_visible(Relation index, FtsQuery q)
 		}
 	}
 
-	bm25_collect_matches(index, q, &matches, &recheck);
+	bm25_collect_matches_split(index, q, &matches, &unsure);
 	/*
-	 * Shrink over-generated sets (fuzzy/regex/PHRASE/NEAR) to the exact @@@
-	 * match set against the heap ftsdoc; after this the count is precise.
+	 * Decide the undecided candidates against the heap ftsdoc and keep the ones
+	 * that match; after this the count is precise.
 	 */
-	if (recheck)
-		bm25_recheck_exact(index, q, &matches);
+	if (unsure.n > 0)
+	{
+		bm25_recheck_exact(index, q, &unsure);
+		if (unsure.n > 0)
+			matches = tidset_or(matches, unsure);
+	}
 	pgstat_count_index_tuples(index, matches.n);
 	if (matches.n == 0)
 		return 0;

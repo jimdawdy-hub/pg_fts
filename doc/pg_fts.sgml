@@ -430,8 +430,8 @@ SELECT fts_count('docs_bm25', to_ftsquery('english', 'brown'));
   </para>
   <para>
    Building the index <literal>WITH (positions = on)</literal> stores per-token
-   positions in the posting lists. Positive combinations of plain terms,
-   phrases, OR groups and nested proximity can be answered directly from
+   positions in the posting lists. Any combination of plain terms, phrases,
+   OR groups, nested proximity, AND and NOT is then answered directly from
    those positions, without heap rechecks:
 <programlisting>
 CREATE INDEX docs_bm25 ON docs USING fts (to_ftsdoc('english', body))
@@ -440,9 +440,10 @@ CREATE INDEX docs_bm25 ON docs USING fts (to_ftsdoc('english', body))
    The trade-off is index size: positions roughly double the posting bytes on
    high-term-frequency corpora (little effect when terms occur once per
    document).  Positions are decoded lazily, so plain ranked / boolean / count
-   queries are unaffected whether positions are on or off. Modifier terms,
-   weighted terms, AND/NOT combinations and oversized position sets use exact
-   heap rechecks. Results agree with either position setting. The earlier introduction of stored positions changed the
+   queries are unaffected whether positions are on or off. Modifier and
+   weighted terms use exact heap rechecks, as does a document whose positions
+   the index could not store (a posting block too large for one page) or that
+   exceed the evaluator's bound -- that document alone. Results agree with either position setting. The earlier introduction of stored positions changed the
    on-disk format (BM25 v2 &rarr; v3) and required <command>REINDEX</command>.
    The proximity syntax described here does not change that format.
   </para>

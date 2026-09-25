@@ -71,7 +71,32 @@ All notable changes to pg_fts are documented here.
       SET enable_seqscan = off;
       SELECT count(*) FROM t WHERE d @@@ 'alpha & !"bravo cherry"';
 
+- **A scan retried after a concurrent merge freed two buffers twice.** When the segment
+  directory changed during a scan, the retry path freed the tombstone maps and the
+  positional path's TID buffer, both already freed. Found by reading the code while
+  reworking the positional path (the first was reported by the `claudefts` branch); not
+  reproduced, since it needs a merge to land inside the scan window, which only the
+  test-hook build can force. The retry no longer frees either.
+
 ### Performance
+
+- **Proximity combined with AND or NOT is decided from the stored positions.** On a
+  `positions = on` index only a query of proximity and OR operators used the positions;
+  once a phrase, `w/N`, `<N>` or `NEAR` operand sat beside an AND or under a NOT, every
+  candidate was rechecked against the heap -- re-deriving its `ftsdoc` from the table row
+  -- in the bitmap scan, `fts_count` and the ranked scan alike. Such queries now take the
+  span matcher the heap recheck itself uses (`fts_match_eval`), fed from the postings:
+  each distinct term is decoded once per segment and every candidate is decided there.
+  In the regression corpus a bitmap scan of `apple & "bravo cherry"` used to remove 172
+  rechecked rows; it now rechecks none. Answers are unchanged.
+
+  A posting block that could not store its positions (its Sum(tf) overflowed a page), or
+  a document whose positions overflow the evaluator's bound, used to abandon the
+  positional path for the WHOLE query, recheck included. Now only those documents go to
+  the heap recheck, and only when a proximity operator needs their positions -- a term
+  read for its presence alone never does. The bitmap scan flags just those rows for the
+  executor's recheck; `fts_count` and the ranked scan recheck just that subset. Prefix,
+  fuzzy, regex and weight-restricted terms keep the recheck path.
 
 - **`a & !b` no longer decodes every posting list in the segment.** Whenever a query
   contained NOT, the evaluator behind bitmap scans and counts first built each segment's

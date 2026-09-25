@@ -230,8 +230,10 @@ spacing: `to_ftsquery('english','"breach of contract"')` yields
 Prefix, fuzzy and regex terms work positionally inside phrases. Prefixes may
 also carry weights (`attorn*:A`); fuzzy+weight and regex modifiers error.
 
-Use `WITH (positions=on)` for compound proximity without heap rechecks.
-Weighted/expanded terms and oversized position sets still use exact rechecks.
+Use `WITH (positions=on)` for compound proximity without heap rechecks, also
+when combined with AND and NOT. Weighted/expanded terms still use exact
+rechecks, and so does a document whose positions were not stored or are
+oversized (that document alone).
 The configured analyzer inherits PostgreSQL's position cap of 16,383; matches
 beyond it can be lost. The unconfigured `to_ftsdoc(text)` analyzer stores wider
 positions. This inherited limitation needs resolution before a legal-corpus

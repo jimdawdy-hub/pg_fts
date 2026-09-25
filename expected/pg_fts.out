@@ -6560,6 +6560,178 @@ DROP TABLE notpos_on;
 DROP TABLE notpos_off;
 DROP FUNCTION notpos_counts(text);
 DROP FUNCTION notpos_doc(int);
+-- ---------------------------------------------------------------------------
+-- A phrase, within-N or exact-distance operand combined with AND / OR / NOT
+-- is decided from the stored positions, as a pure phrase chain is, instead of
+-- rechecking every candidate against the heap: a bitmap scan of a
+-- positions = on index then removes no rows by recheck.  Only a document
+-- whose positions the index did not store goes to the recheck, and only when
+-- a proximity operator needs them.  Every shape must count the same seven
+-- ways (heap matcher on each table; bitmap scan and fts_count on each index;
+-- plain index scan on positions = on) over two segments, tombstones and a
+-- pending list, and the ranked scan must return exactly the matches.
+-- bravo/cherry occur adjacent (g % 3 = 0), apart (g % 3 = 1) or reversed
+-- (g % 3 = 2); delta/echo adjacent (g % 5 = 0) or reversed (g % 5 = 1).
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION xpos_doc(g int) RETURNS ftsdoc LANGUAGE sql AS $$
+  SELECT to_ftsdoc('simple', 'w' || g
+           || CASE g % 3 WHEN 0 THEN ' bravo cherry' WHEN 1 THEN ' bravo x cherry'
+                         ELSE ' cherry bravo' END
+           || CASE WHEN g % 2 = 0 THEN ' apple' ELSE '' END
+           || CASE g % 5 WHEN 0 THEN ' delta echo' WHEN 1 THEN ' echo delta'
+                         ELSE '' END) $$;
+CREATE TABLE xpos_on (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+CREATE TABLE xpos_off (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+INSERT INTO xpos_on(d) SELECT xpos_doc(g) FROM generate_series(1, 300) g;
+INSERT INTO xpos_off(d) SELECT xpos_doc(g) FROM generate_series(1, 300) g;
+CREATE INDEX xpos_on_fts ON xpos_on USING fts (d) WITH (positions = on);
+CREATE INDEX xpos_off_fts ON xpos_off USING fts (d) WITH (positions = off);
+INSERT INTO xpos_on(d) SELECT xpos_doc(g) FROM generate_series(301, 600) g;
+INSERT INTO xpos_off(d) SELECT xpos_doc(g) FROM generate_series(301, 600) g;
+VACUUM xpos_on; VACUUM xpos_off;                                -- segment 2
+DELETE FROM xpos_on WHERE id % 7 = 0; DELETE FROM xpos_off WHERE id % 7 = 0;
+VACUUM xpos_on; VACUUM xpos_off;                                -- tombstones
+INSERT INTO xpos_on(d) SELECT xpos_doc(g) FROM generate_series(601, 700) g;
+INSERT INTO xpos_off(d) SELECT xpos_doc(g) FROM generate_series(601, 700) g;
+SELECT fts_index_nsegments('xpos_on_fts') AS on_segments,
+       fts_index_nsegments('xpos_off_fts') AS off_segments;
+ on_segments | off_segments 
+-------------+--------------
+           2 |            2
+(1 row)
+
+-- rows the executor's recheck removed from a bitmap scan of tbl (NULL unless
+-- the plan really is a bitmap heap scan)
+CREATE FUNCTION xpos_removed(tbl text, qry text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE p json;
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = on;
+  EXECUTE format('EXPLAIN (ANALYZE, FORMAT JSON, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+                 'SELECT id FROM %I WHERE d @@@ %L::ftsquery', tbl, qry) INTO p;
+  IF p->0->'Plan'->>'Node Type' <> 'Bitmap Heap Scan' THEN
+    RETURN NULL;
+  END IF;
+  RETURN (p->0->'Plan'->>'Rows Removed by Index Recheck')::bigint;
+END $$;
+CREATE FUNCTION xpos_counts(qry text, OUT heap bigint, OUT heap_off bigint,
+                            OUT on_bitmap bigint, OUT on_index bigint, OUT on_count bigint,
+                            OUT off_bitmap bigint, OUT off_count bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = on;
+  EXECUTE format('SELECT count(id) FROM xpos_on WHERE d @@@ %L::ftsquery', qry) INTO on_bitmap;
+  EXECUTE format('SELECT count(id) FROM xpos_off WHERE d @@@ %L::ftsquery', qry) INTO off_bitmap;
+  SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = on;
+  EXECUTE format('SELECT count(id) FROM xpos_on WHERE d @@@ %L::ftsquery', qry) INTO on_index;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off;
+  EXECUTE format('SELECT count(id) FROM xpos_on WHERE d @@@ %L::ftsquery', qry) INTO heap;
+  EXECUTE format('SELECT count(id) FROM xpos_off WHERE d @@@ %L::ftsquery', qry) INTO heap_off;
+  on_count := fts_count('xpos_on_fts', qry::ftsquery);
+  off_count := fts_count('xpos_off_fts', qry::ftsquery);
+END $$;
+CREATE TABLE xpos_shapes (ord int, q text);
+INSERT INTO xpos_shapes VALUES
+  (1, '"bravo cherry" | "delta echo"'), (2, 'apple & "bravo cherry"'),
+  (3, '"bravo cherry" & !apple'), (4, 'apple & (bravo w/1 cherry)'),
+  (5, 'apple & (bravo <-> cherry)'), (6, '("bravo cherry" | "delta echo") & apple'),
+  (7, '"bravo cherry" & ("delta echo" | apple)'), (8, 'apple & !"delta echo"'),
+  (9, '!("bravo cherry" & apple)'), (10, 'NEAR(bravo cherry, 1) & !"delta echo"'),
+  (11, '((bravo | delta) w/1 (cherry | echo)) & apple');
+-- 615 live rows per table.  Row 1 (no AND / NOT) was already exact; removed
+-- is 0 wherever the positions decide, and the positions = off index is the
+-- positive control that the recheck is visible at all.
+SELECT s.q, c.heap, c.on_bitmap, c.on_index, c.on_count, c.off_bitmap, c.off_count,
+       c.heap > 0 AND c.heap_off = c.heap AND c.on_bitmap = c.heap
+         AND c.on_index = c.heap AND c.on_count = c.heap
+         AND c.off_bitmap = c.heap AND c.off_count = c.heap AS agree,
+       xpos_removed('xpos_on', s.q) AS on_removed,
+       xpos_removed('xpos_off', s.q) > 0 AS off_rechecked
+FROM xpos_shapes s, LATERAL xpos_counts(s.q) c
+ORDER BY s.ord;
+                       q                       | heap | on_bitmap | on_index | on_count | off_bitmap | off_count | agree | on_removed | off_rechecked 
+-----------------------------------------------+------+-----------+----------+----------+------------+-----------+-------+------------+---------------
+ "bravo cherry" | "delta echo"                 |  287 |       287 |      287 |      287 |        287 |       287 | t     |          0 | t
+ apple & "bravo cherry"                        |  102 |       102 |      102 |      102 |        102 |       102 | t     |          0 | t
+ "bravo cherry" & !apple                       |  103 |       103 |      103 |      103 |        103 |       103 | t     |          0 | t
+ apple & (bravo w/1 cherry)                    |  205 |       205 |      205 |      205 |        205 |       205 | t     |          0 | t
+ apple & (bravo <-> cherry)                    |  102 |       102 |      102 |      102 |        102 |       102 | t     |          0 | t
+ ("bravo cherry" | "delta echo") & apple       |  143 |       143 |      143 |      143 |        143 |       143 | t     |          0 | t
+ "bravo cherry" & ("delta echo" | apple)       |  122 |       122 |      122 |      122 |        122 |       122 | t     |          0 | t
+ apple & !"delta echo"                         |  246 |       246 |      246 |      246 |        246 |       246 | t     |          0 | t
+ !("bravo cherry" & apple)                     |  513 |       513 |      513 |      513 |        513 |       513 | t     |          0 | t
+ NEAR(bravo cherry, 1) & !"delta echo"         |  164 |       164 |      164 |      164 |        164 |       164 | t     |          0 | t
+ ((bravo | delta) w/1 (cherry | echo)) & apple |  247 |       247 |      247 |      247 |        247 |       247 | t     |          0 | t
+(11 rows)
+
+-- ranked: with the pending list flushed, the ranked scan (DocidFilter over the
+-- exact match set) returns every match and nothing else (a top-level NOT holds
+-- no positive term to rank by, so it is left out)
+VACUUM xpos_on;
+SELECT s.ord, count(r.*) AS ranked,
+       count(r.*) = (SELECT count(*) FROM xpos_on WHERE d @@@ s.q::ftsquery)
+         AND bool_and(x.d @@@ s.q::ftsquery) AS ranked_exact
+FROM xpos_shapes s
+     CROSS JOIN LATERAL fts_search('xpos_on_fts', s.q::ftsquery, 10000) r
+     JOIN xpos_on x ON x.ctid = r.ctid
+WHERE s.ord <> 9
+GROUP BY s.ord, s.q ORDER BY s.ord;
+ ord | ranked | ranked_exact 
+-----+--------+--------------
+   1 |    287 | t
+   2 |    102 | t
+   3 |    103 | t
+   4 |    205 | t
+   5 |    102 | t
+   6 |    143 | t
+   7 |    122 | t
+   8 |    246 | t
+  10 |    164 | t
+  11 |    247 | t
+(10 rows)
+
+DROP TABLE xpos_on;
+DROP TABLE xpos_off;
+DROP TABLE xpos_shapes;
+DROP FUNCTION xpos_counts(text);
+DROP FUNCTION xpos_doc(int);
+-- A term whose posting blocks store no positions (60 widely spaced
+-- occurrences per document overflow a page per block of postings) is still
+-- decided exactly where a phrase does not need its positions; where one does,
+-- only those documents are rechecked, and the count stays right.  'hot' ends
+-- at 60000; even rows then read 'edge tail', odd rows 'tail x edge'.
+CREATE TABLE xposbig (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+INSERT INTO xposbig(d)
+SELECT (CASE WHEN g % 2 = 0 THEN $$'edge':1@60001 $$ ELSE $$'edge':1@60003 $$ END
+        || $$'hot':60@$$ || (SELECT string_agg((k * 1000)::text, ',') FROM generate_series(1, 60) k)
+        || CASE WHEN g % 2 = 0 THEN $$ 'tail':1@60002$$ ELSE $$ 'tail':1@60001 'x':1@60002$$ END)::ftsdoc
+FROM generate_series(1, 400) g;
+CREATE INDEX xposbig_fts ON xposbig USING fts (d) WITH (positions = on);
+SET enable_seqscan = off;
+SELECT q,
+       (SELECT count(*) FROM xposbig WHERE d @@@ q::ftsquery) AS bitmap,
+       fts_count('xposbig_fts', q::ftsquery) AS fts_count,
+       xpos_removed('xposbig', q) AS removed
+FROM (VALUES ('"edge tail"'), ('"hot edge"'), ('"edge tail" & hot'),
+             ('"hot edge" & tail')) v(q);
+         q         | bitmap | fts_count | removed 
+-------------------+--------+-----------+---------
+ "edge tail"       |    200 |       200 |       0
+ "hot edge"        |    200 |       200 |     192
+ "edge tail" & hot |    200 |       200 |       0
+ "hot edge" & tail |    200 |       200 |     192
+(4 rows)
+
+SET enable_seqscan = on; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SELECT count(*) FILTER (WHERE d @@@ '"edge tail" & hot'::ftsquery) AS heap_edge_tail,
+       count(*) FILTER (WHERE d @@@ '"hot edge" & tail'::ftsquery) AS heap_hot_edge
+FROM xposbig;
+ heap_edge_tail | heap_hot_edge 
+----------------+---------------
+            200 |           200
+(1 row)
+
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+DROP TABLE xposbig;
+DROP FUNCTION xpos_removed(text, text);
 -- ============================================================================
 -- WHERE and ORDER BY may carry DIFFERENT queries, and EVERY WHERE key counts.
 --

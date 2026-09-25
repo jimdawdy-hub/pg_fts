@@ -216,6 +216,7 @@ typedef struct FtsMatchValue
 
 extern bool fts_match_eval(FtsQuery query, FtsMatchValue *values,
 						   int maxspans, bool *overflow);
+extern void fts_match_needpos(FtsQuery query, bool *needpos);
 /* shared phrase adjacency over raw ascending position arrays (single source of
  * truth for the in-memory matcher and the index posting-list phrase eval) */
 extern void fts_phrase_step_pos(const uint32 *left, int nleft,
