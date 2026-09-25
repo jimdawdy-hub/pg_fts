@@ -854,10 +854,56 @@ typedef struct EvalVal
 	bool		negated;		/* true => set represents docs NOT to include */
 } EvalVal;
 
+/*
+ * Per item: is it under an odd number of NOTs?
+ *
+ * bm25_eval_query approximates two kinds of operand by term presence alone: a
+ * PHRASE / WITHIN / EXACT operator (as the AND of its operands -- it never
+ * reads positions) and a weight-restricted term (the postings carry no zone
+ * labels).  Presence is a superset of the true matches, and the callers'
+ * heap recheck trims a superset exactly.  But a NOT turns a superset into a
+ * subset, which no recheck can restore: 'a & !"b c"' dropped every document
+ * holding b and c anywhere.  So under an odd number of NOTs such an operand
+ * is approximated from below (the empty set) instead.  AND, OR and NOT are
+ * monotone in their operands, so the whole result stays a superset.
+ */
+static bool *
+bm25_not_parity(FtsQuery q)
+{
+	bool	   *odd = palloc(q->nitems * sizeof(bool));
+	bool	   *work = palloc(q->nitems * sizeof(bool));
+	int			depth = 0;
+	uint32		i;
+
+	/* walk the RPN from its root: each operator hands its parity down */
+	work[depth++] = false;
+	for (i = q->nitems; i-- > 0;)
+	{
+		FtsQueryItem *it = &q->items[i];
+		bool		p;
+
+		Assert(depth > 0);
+		p = work[--depth];
+		odd[i] = p;
+		if (it->type == FTS_QI_VAL)
+			continue;
+		if (it->op == FTS_OP_NOT)
+			work[depth++] = !p;
+		else
+		{
+			work[depth++] = p;
+			work[depth++] = p;
+		}
+	}
+	pfree(work);
+	return odd;
+}
+
 static TidSet
 bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 {
 	EvalVal    *stack;
+	bool	   *odd;
 	int			top = 0;
 	uint32		i;
 	TidSet		result;
@@ -870,6 +916,7 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 	}
 
 	stack = palloc(q->nitems * sizeof(EvalVal));
+	odd = bm25_not_parity(q);
 
 	for (i = 0; i < q->nitems; i++)
 	{
@@ -879,7 +926,13 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 		{
 			TidSet		s;
 
-			if (it->flags & (FTS_QF_FUZZY | FTS_QF_REGEX))
+			if (odd[i] && (it->flags & FTS_QF_WEIGHTED))
+			{
+				/* the index cannot see zone labels: see bm25_not_parity */
+				s.tids = NULL;
+				s.n = 0;
+			}
+			else if (it->flags & (FTS_QF_FUZZY | FTS_QF_REGEX))
 				s = bm25_lookup_pattern(index, seg, q, it);
 			else if (it->flags & FTS_QF_PREFIX)
 				bm25_lookup_prefix(index, seg,
@@ -915,8 +968,16 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 			EvalVal		a = stack[--top];
 			EvalVal		res;
 
-			if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE ||
-				it->op == FTS_OP_WITHIN || it->op == FTS_OP_EXACT)
+			if (odd[i] && (it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
+						   it->op == FTS_OP_EXACT))
+			{
+				/* lower bound under an odd number of NOTs: see bm25_not_parity */
+				res.set.tids = NULL;
+				res.set.n = 0;
+				res.negated = false;
+			}
+			else if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE ||
+					 it->op == FTS_OP_WITHIN || it->op == FTS_OP_EXACT)
 			{
 				/* Proximity is treated as AND for candidate generation; the
 				 * bitmap heap recheck (@@@) enforces distance exactly. */
@@ -985,6 +1046,7 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q)
 	else
 		result = stack[0].set;
 
+	pfree(odd);
 	return result;
 }
 

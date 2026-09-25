@@ -51,6 +51,26 @@ All notable changes to pg_fts are documented here.
   with the unconfigured analyzer. This change does not recover already-lost input
   positions or redesign the dictionary pipeline.
 
+### Fixed
+
+- **NOT over a phrase, proximity or field-restricted operand under-counted through the
+  index.** The boolean evaluator behind bitmap scans, `fts_count` and ranked filtering
+  approximates a phrase, `w/N`, `<N>` or `NEAR` operand as the AND of its terms, and a
+  `term:LABEL` operand as the term's presence (postings carry no zone labels). Presence is
+  a superset of the true matches, which the heap recheck trims -- but under a NOT the
+  superset becomes a subset, and a recheck cannot restore rows it never sees. With or
+  without stored positions, `apple & !"bravo cherry"` returned 34 of 206 matching rows,
+  and `apple & !cherry:A` 25 of 154. Such operands are now approximated from below (as
+  matching nothing) when they sit under an odd number of NOTs, so the candidate set stays
+  a superset and the recheck is exact again. Reproduction (1.8.3 and the previous
+  Unreleased state return 0; correct and now returned: 1):
+
+      CREATE TABLE t (d ftsdoc);
+      INSERT INTO t VALUES (to_ftsdoc('alpha bravo x cherry'));
+      CREATE INDEX ON t USING fts (d);
+      SET enable_seqscan = off;
+      SELECT count(*) FROM t WHERE d @@@ 'alpha & !"bravo cherry"';
+
 ### Performance
 
 - **`a & !b` no longer decodes every posting list in the segment.** Whenever a query
@@ -66,6 +86,11 @@ All notable changes to pg_fts are documented here.
 - A regression block compares ten NOT shapes through the index (bitmap scan and
   `fts_count`) with the heap matcher, across two segments with tombstones plus the
   pending list.
+- A regression block counts fourteen shapes with NOT over a phrase, `w/N`, `<->`,
+  `NEAR` and `term:A` operand six ways (bitmap scan and `fts_count` on a positions = on
+  and a positions = off index, and the heap matcher on each table), over two segments,
+  tombstones and a pending list. Every expected count was checked against an independent
+  computation of the fixture's truth.
 
 ## 1.8.3 - 2026-09-18
 

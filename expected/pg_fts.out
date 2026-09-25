@@ -6456,3 +6456,96 @@ ORDER BY v.ord;
 DROP TABLE notseg;
 DROP FUNCTION notseg_counts(text);
 DROP FUNCTION notseg_doc(int);
+-- ---------------------------------------------------------------------------
+-- NOT over an inexact operand through the index.
+--
+-- Without positions -- or in the boolean evaluator, which never reads them --
+-- the index approximates a phrase, within-N or exact-distance operand (and a
+-- field-restricted term) by term presence alone: a superset of its true
+-- matches, which the heap recheck then trims.  Under an odd number of NOTs a
+-- superset becomes a subset, and a recheck cannot restore rows it never sees,
+-- so those operands must be approximated from below there instead.  Every
+-- shape must count the same six ways: bitmap scan and fts_count on a
+-- positions = on and a positions = off index, and the heap matcher under a
+-- forced seqscan on each table.  Both indexes have two segments, tombstones
+-- and a pending list.  bravo/cherry occur adjacent (g % 3 = 0), apart
+-- (g % 3 = 1) or reversed (g % 3 = 2); cherry also occurs in zone A when
+-- g % 4 = 0; the rest of each document is zone C.
+-- ---------------------------------------------------------------------------
+CREATE FUNCTION notpos_doc(g int) RETURNS ftsdoc LANGUAGE sql AS $$
+  SELECT to_ftsdoc('simple', 'w' || g
+           || CASE g % 3 WHEN 0 THEN ' bravo cherry' WHEN 1 THEN ' bravo x cherry'
+                         ELSE ' cherry bravo' END
+           || CASE WHEN g % 2 = 0 THEN ' apple' ELSE '' END
+           || CASE WHEN g % 5 = 0 THEN ' zeta' ELSE '' END, 'C')
+      || to_ftsdoc('simple', CASE WHEN g % 4 = 0 THEN 'cherry' ELSE 'kappa' END, 'A') $$;
+CREATE TABLE notpos_on (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+CREATE TABLE notpos_off (id serial, d ftsdoc) WITH (autovacuum_enabled = off);
+INSERT INTO notpos_on(d) SELECT notpos_doc(g) FROM generate_series(1, 300) g;
+INSERT INTO notpos_off(d) SELECT notpos_doc(g) FROM generate_series(1, 300) g;
+CREATE INDEX notpos_on_fts ON notpos_on USING fts (d) WITH (positions = on);
+CREATE INDEX notpos_off_fts ON notpos_off USING fts (d) WITH (positions = off);
+INSERT INTO notpos_on(d) SELECT notpos_doc(g) FROM generate_series(301, 600) g;
+INSERT INTO notpos_off(d) SELECT notpos_doc(g) FROM generate_series(301, 600) g;
+VACUUM notpos_on; VACUUM notpos_off;                            -- segment 2
+DELETE FROM notpos_on WHERE id % 7 = 0; DELETE FROM notpos_off WHERE id % 7 = 0;
+VACUUM notpos_on; VACUUM notpos_off;                            -- tombstones
+INSERT INTO notpos_on(d) SELECT notpos_doc(g) FROM generate_series(601, 700) g;
+INSERT INTO notpos_off(d) SELECT notpos_doc(g) FROM generate_series(601, 700) g;
+SELECT fts_index_nsegments('notpos_on_fts') AS on_segments,
+       fts_index_nsegments('notpos_off_fts') AS off_segments;
+ on_segments | off_segments 
+-------------+--------------
+           2 |            2
+(1 row)
+
+CREATE FUNCTION notpos_counts(qry text, OUT on_bitmap bigint, OUT on_count bigint,
+                              OUT off_bitmap bigint, OUT off_count bigint,
+                              OUT heap bigint, OUT heap_off bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = on;
+  EXECUTE format('SELECT count(id) FROM notpos_on WHERE d @@@ %L::ftsquery', qry) INTO on_bitmap;
+  EXECUTE format('SELECT count(id) FROM notpos_off WHERE d @@@ %L::ftsquery', qry) INTO off_bitmap;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off;
+  EXECUTE format('SELECT count(id) FROM notpos_on WHERE d @@@ %L::ftsquery', qry) INTO heap;
+  EXECUTE format('SELECT count(id) FROM notpos_off WHERE d @@@ %L::ftsquery', qry) INTO heap_off;
+  on_count := fts_count('notpos_on_fts', qry::ftsquery);
+  off_count := fts_count('notpos_off_fts', qry::ftsquery);
+END $$;
+-- 615 live rows per table.  Rows 1-2 are positive controls; every heap count
+-- is non-zero.
+SELECT v.q, c.heap, c.on_bitmap, c.on_count, c.off_bitmap, c.off_count,
+       c.heap > 0 AND c.heap_off = c.heap AND c.on_bitmap = c.heap
+         AND c.on_count = c.heap AND c.off_bitmap = c.heap
+         AND c.off_count = c.heap AS agree
+FROM (VALUES (1, 'apple & "bravo cherry"'), (2, 'apple & cherry:A'),
+             (3, 'apple & !"bravo cherry"'), (4, 'apple & !(bravo w/1 cherry)'),
+             (5, 'apple & !(bravo <-> cherry)'), (6, 'apple & !NEAR(bravo cherry, 1)'),
+             (7, '!"bravo cherry"'), (8, 'apple & !("bravo cherry" | zeta)'),
+             (9, '"bravo cherry" | !apple'), (10, '!(apple & !"bravo cherry")'),
+             (11, 'apple & !cherry:A'), (12, '!cherry:A'),
+             (13, 'apple & !(cherry:A & zeta)'), (14, '!!"bravo cherry"')) v(ord, q),
+     LATERAL notpos_counts(v.q) c
+ORDER BY v.ord;
+                q                 | heap | on_bitmap | on_count | off_bitmap | off_count | agree 
+----------------------------------+------+-----------+----------+------------+-----------+-------
+ apple & "bravo cherry"           |  102 |       102 |      102 |        102 |       102 | t
+ apple & cherry:A                 |  154 |       154 |      154 |        154 |       154 | t
+ apple & !"bravo cherry"          |  206 |       206 |      206 |        206 |       206 | t
+ apple & !(bravo w/1 cherry)      |  103 |       103 |      103 |        103 |       103 | t
+ apple & !(bravo <-> cherry)      |  206 |       206 |      206 |        206 |       206 | t
+ apple & !NEAR(bravo cherry, 1)   |  206 |       206 |      206 |        206 |       206 | t
+ !"bravo cherry"                  |  410 |       410 |      410 |        410 |       410 | t
+ apple & !("bravo cherry" | zeta) |  165 |       165 |      165 |        165 |       165 | t
+ "bravo cherry" | !apple          |  409 |       409 |      409 |        409 |       409 | t
+ !(apple & !"bravo cherry")       |  409 |       409 |      409 |        409 |       409 | t
+ apple & !cherry:A                |  154 |       154 |      154 |        154 |       154 | t
+ !cherry:A                        |  461 |       461 |      461 |        461 |       461 | t
+ apple & !(cherry:A & zeta)       |  277 |       277 |      277 |        277 |       277 | t
+ !!"bravo cherry"                 |  205 |       205 |      205 |        205 |       205 | t
+(14 rows)
+
+DROP TABLE notpos_on;
+DROP TABLE notpos_off;
+DROP FUNCTION notpos_counts(text);
+DROP FUNCTION notpos_doc(int);
