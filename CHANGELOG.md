@@ -2,6 +2,196 @@
 
 All notable changes to pg_fts are documented here.
 
+## Unreleased
+
+### Proximity, phrase search, and ranking
+
+- Added unordered `w/N`, chained/nested groups, OR alternatives and phrases on
+  either side. Complete first/last-word spans preserve every valid combination.
+  `p/N` and `NEAR` retain ordered endpoint behavior. AND/NOT inside text proximity
+  remain explicit errors.
+- Added exact `<->` / `<N>` operators, including `<0>`. Quoted phrases preserve
+  stopword gaps. Native `tsquery` imports retain exact gaps, prefixes and weights.
+  Text and binary query roundtrips preserve operators and distances.
+- Prefix, fuzzy and regex operands now contribute their actual positions inside
+  phrases. Weighted prefixes retain their mask; unsupported modifier combinations
+  raise errors. Unterminated regex input now errors instead of returning empty.
+- Compound positive proximity uses stored index positions, with shared span
+  evaluation and exact heap fallback when positions are unavailable or oversized.
+  Compound fuzzy/regex candidates preserve ordinary OR alternatives and use native
+  character edit distances. No index format change or REINDEX is required.
+- Ranked searches now include pending documents and modifier matches using an
+  exact heap fallback. The existing literal-term BM25 scoring formula is unchanged;
+  expansion-only matches can score zero. Stable score/TID ordering fixes missing
+  and duplicate rows when an ordered scan grows its result batch.
+- Standalone fuzzy matches now use character edit distances consistently for
+  Unicode and long terms. Removed unsound trigram and byte-length exclusions;
+  bounded ASCII dictionary skipping remains available.
+- Binary query input rejects conflicting modifiers, invalid weights, and
+  out-of-range distances. Legacy boolean distances and zero-distance ordered
+  operators retain their existing interpretation when read.
+- Runtime NULL index keys no longer crash the server. A NULL search predicate
+  produces no matches; a NULL order key with a valid predicate preserves the
+  matches. An unfiltered NULL-only index ordering raises an explicit error.
+- Fixed four inherited ranked-search defects: a seek could read another term's
+  block header, block bounds could be applied past their valid document range,
+  MaxScore used suffix bounds for a low-impact prefix, and cutoff ties could
+  evict the wrong row. Strict regressions compare small result limits with the
+  exhaustive score/TID order, without the former percentage tolerance.
+- Fixed score-addition order across ranked result limits. Tiny floating-point
+  changes could reorder tied rows and make adaptive index scans repeat or omit
+  results. Pruning bounds use the same addition order as final scores so they
+  cannot underestimate a candidate through grouped rounding. Three-term and
+  four-term queries now have exact prefix checks.
+- Independent exhaustive SQL checks cover direct, indexed, counted and ranked
+  result sets with positions on/off, pending/flushed data, and text/binary I/O.
+  Strict checks compare ranked prefixes and complete indexed result sets.
+- Known inherited limitation: the configured analyzer caps positions at 16,383.
+  For example, a phrase after 17,000 filler words fails on that analyzer but works
+  with the unconfigured analyzer. This change does not recover already-lost input
+  positions or redesign the dictionary pipeline.
+
+### Fixed
+
+- **NOT over a phrase, proximity or field-restricted operand under-counted through the
+  index.** The boolean evaluator behind bitmap scans, `fts_count` and ranked filtering
+  approximates a phrase, `w/N`, `<N>` or `NEAR` operand as the AND of its terms, and a
+  `term:LABEL` operand as the term's presence (postings carry no zone labels). Presence is
+  a superset of the true matches, which the heap recheck trims -- but under a NOT the
+  superset becomes a subset, and a recheck cannot restore rows it never sees. With or
+  without stored positions, `apple & !"bravo cherry"` returned 34 of 206 matching rows,
+  and `apple & !cherry:A` 25 of 154. Such operands are now approximated from below (as
+  matching nothing) when they sit under an odd number of NOTs, so the candidate set stays
+  a superset and the recheck is exact again. Reproduction (1.8.3 and the previous
+  Unreleased state return 0; correct and now returned: 1):
+
+      CREATE TABLE t (d ftsdoc);
+      INSERT INTO t VALUES (to_ftsdoc('alpha bravo x cherry'));
+      CREATE INDEX ON t USING fts (d);
+      SET enable_seqscan = off;
+      SELECT count(*) FROM t WHERE d @@@ 'alpha & !"bravo cherry"';
+
+- **A scan retried after a concurrent merge freed two buffers twice.** When the segment
+  directory changed during a scan, the retry path freed the tombstone maps and the
+  positional path's TID buffer, both already freed. Found by reading the code while
+  reworking the positional path (the first was reported by the `claudefts` branch); not
+  reproduced, since it needs a merge to land inside the scan window, which only the
+  test-hook build can force. The retry no longer frees either.
+
+### Performance
+
+- **Proximity combined with AND or NOT is decided from the stored positions.** On a
+  `positions = on` index only a query of proximity and OR operators used the positions;
+  once a phrase, `w/N`, `<N>` or `NEAR` operand sat beside an AND or under a NOT, every
+  candidate was rechecked against the heap -- re-deriving its `ftsdoc` from the table row
+  -- in the bitmap scan, `fts_count` and the ranked scan alike. Such queries now take the
+  span matcher the heap recheck itself uses (`fts_match_eval`), fed from the postings:
+  each distinct term is decoded once per segment and every candidate is decided there.
+  In the regression corpus a bitmap scan of `apple & "bravo cherry"` used to remove 172
+  rechecked rows; it now rechecks none. Answers are unchanged.
+
+  A posting block that could not store its positions (its Sum(tf) overflowed a page), or
+  a document whose positions overflow the evaluator's bound, used to abandon the
+  positional path for the WHOLE query, recheck included. Now only those documents go to
+  the heap recheck, and only when a proximity operator needs their positions -- a term
+  read for its presence alone never does. The bitmap scan flags just those rows for the
+  executor's recheck; `fts_count` and the ranked scan recheck just that subset. Prefix,
+  fuzzy, regex and weight-restricted terms keep the recheck path.
+
+- **`a & !b` no longer decodes every posting list in the segment.** Whenever a query
+  contained NOT, the evaluator behind bitmap scans and counts first built each segment's
+  "universe" -- every TID in the segment, found by decoding every posting list. It needs
+  that set only when the query's final result is negated (`!a`, `!a & !b`, `a | !b`):
+  negation is tracked with De Morgan, so `a & !b` is a plain set difference and paid for a
+  full-segment decode it never used. The universe is now built per segment only for a
+  negated final result. Answers are unchanged.
+
+- **The ranked scan ignored a `WHERE` query that differed from its `ORDER BY` query.**
+  `bm25_rescan` kept the first scan key's query and then overwrote it with the `<=>` query,
+  so the ordering scan ranked *and filtered* by the `ORDER BY` query alone -- and it returns
+  `xs_recheck = false`, so the executor never re-applied the `WHERE`. It returned `ORDER BY`
+  matches that fail the `WHERE`, missed the `WHERE` rows holding no ranking term, and let
+  the ranking query's own boolean operators filter. Reproduction:
+
+      CREATE TABLE t (id int, d ftsdoc);
+      INSERT INTO t VALUES (1, to_ftsdoc('simple', 'apple cherry')),
+                           (2, to_ftsdoc('simple', 'apple')),
+                           (3, to_ftsdoc('simple', 'cherry cherry'));
+      CREATE INDEX ON t USING fts (d);
+      SET enable_seqscan = off; SET enable_bitmapscan = off;
+      SELECT id FROM t WHERE d @@@ 'apple'::ftsquery
+       ORDER BY d <=> 'cherry'::ftsquery LIMIT 10;     -- 1.8.3: 3, 1   now: 1, 2
+
+  The filter is now the AND of every scan key (next entry) and the rank is the `ORDER BY`
+  query. When the single `WHERE` query is byte-identical to the `ORDER BY` query -- the
+  common shape, including one CTE or parameter value feeding both -- the scan takes the
+  unchanged path. Otherwise the ordering scan materializes the filter set with the
+  `@@@` evaluator, scores every row of it by the `ORDER BY` query's terms in one merge-join
+  pass over their postings (the per-term BM25 contribution the top-k engine uses; the
+  ranking query's operators do not filter, as `ORDER BY` never does), and returns the scored
+  rows by descending score, equal scores in heap order, then the rows holding no ranking term
+  at distance 1. It can return every filter row, each exactly once, however deep the executor
+  pulls. A filter row still in the pending list comes back unranked with the distance-1 rows;
+  an over-generating filter is rechecked by the executor on only the rows it pulls.
+- **Only the first `WHERE` key was applied.** `bm25_rescan` read `keyData[0]` alone, so two
+  `@@@` quals served by one bitmap, plain or ordering index scan applied only the first --
+  and those paths return no recheck for an exact query, so the executor never applied the
+  second either. With `t` from the entry above (rows 1 and 2 hold `apple`, only row 1 also
+  `cherry`): `SELECT id FROM t WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;`
+  returned 1, 2 on 1.8.3 and returns 1 now, as a sequential scan does. Every scan key is now
+  read and the scan returns their AND (byte-identical keys folded, so a repeated qual keeps
+  its single-key path); the COUNT pushdown was not affected (it takes only single-qual
+  counts).
+- **A NULL `ORDER BY` argument is served by the filtered ordering scan.** The runtime
+  NULL-key entry above already stopped the crash. A NULL `<=>` argument beside a `WHERE`
+  filter now takes the filtered scan, which returns the filter rows (the AND of every key)
+  with a NULL distance for every `ORDER BY` key; the previous path stored one distance
+  whatever the number of keys. A NULL `WHERE` key still returns no rows, and an unfiltered
+  ordering by distance to NULL still raises an error.
+
+### Known issues
+
+- **A deep ordering scan can return duplicate rows and miss others (identical `WHERE` and
+  `ORDER BY` query; present in 1.8.3, narrowed but not fixed here).** On a two-segment
+  fixture (2,000 documents holding `cherry` with tf 1-7, 10% deleted and re-inserted, then
+  VACUUM), `WHERE d @@@ 'cherry' ORDER BY d <=> 'cherry' LIMIT 100000` returns 2,000 rows but
+  only 1,785 distinct ids on this tree (129 returned twice, 43 three times, 215 matching
+  rows never returned), against 1,762 distinct on 1.8.3;
+  `fts_search(idx, 'cherry', 100000)` returns all 2,000 distinct rows on the same fixture.
+  The adaptive-k ordering scan recomputes the top-k for a larger k and resumes at the count
+  of rows already returned, which assumes each larger top-k extends the previous one in the
+  same order. The `wand_skip_blocks` last-block skip is fixed above (inherited ranked-search
+  defects); the filtered scan decodes forward rather than calling `wand_seek`, and returns
+  every filter row exactly once.
+
+### Tests
+
+- The `fts_vacuum()` convergence check keeps autovacuum off its table. It asserts that three
+  consecutive `fts_vacuum()` calls leave the index size unchanged, and an autovacuum pass
+  between two of them could run the index cleanup and change the size: under aggressive
+  autovacuum settings 1.8.3 failed the check in 3 of 5 runs; with autovacuum off on the table
+  it passed every run. The assertion itself is unchanged.
+- A regression block compares ten NOT shapes through the index (bitmap scan and
+  `fts_count`) with the heap matcher, across two segments with tombstones plus the
+  pending list.
+- A regression block counts fourteen shapes with NOT over a phrase, `w/N`, `<->`,
+  `NEAR` and `term:A` operand six ways (bitmap scan and `fts_count` on a positions = on
+  and a positions = off index, and the heap matcher on each table), over two segments,
+  tombstones and a pending list. Every expected count was checked against an independent
+  computation of the fixture's truth.
+
+- One existing expected line changed, to the heap truth: `SELECT count(*) FROM psh WHERE d
+  @@@ 'term1' AND d @@@ 'body'` now expects 0, not 50. The english configuration stores
+  "body" as `bodi`, so the raw `'body'` matches no row -- a sequential scan answers 0 on
+  1.8.3 too -- and 1.8.3's 50 came from applying only the first key (above). A new line with
+  the stemmed `'bodi'` expects the 50.
+- `pg_fts` regression: filter-vs-rank through the ordering scan (stored and expression
+  index, positions on and off), pending rows, two `WHERE` keys on the bitmap, plain and
+  ordering paths against a sequential scan, the one-value CTE shape (unchanged top-k path;
+  its pending row is ranked by the exact pending fallback), a deep pull across segments with deletes, VACUUM
+  and heap-slot reuse (every filter row exactly once, in exact order), and NULL `WHERE` and
+  `ORDER BY` values.
+
 ## 1.8.3 - 2026-09-18
 
 **Correctness release: two deadlocks that shipped in every prior version, found while

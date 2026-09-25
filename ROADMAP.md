@@ -43,6 +43,7 @@ These do not touch the index and are the cheapest, highest-leverage work in the 
 | D | **Two-level page bitmaps + SIMD** (TIN-style). Format side is tractable via the 1.5.0 optional-per-segment-pointer + dual-read precedent (**no REINDEX**). Real cost: **no SIMD infrastructure exists** (no intrinsics, no runtime dispatch, no `-mavx2` plumbing) and a scalar fallback must be kept for non-AVX and ARM -- two implementations forever. Largest change the project has attempted, against a competitor that cannot be benchmarked. **Needs explicit sign-off.** Do **not** vectorize the vendored sparsemap. | **blocked on sign-off** | `bench/NOTE_TIN_FEASIBILITY_2026-09-14.md`, `NOTE_SIMD_VENUE_2026-09-14.md` |
 | I3 | **Managed-service validation** on a compute/storage-separated backend (Aurora-style). GenericXLog-only WAL should be safe; unverified externally. | **open, external** | `doc/CAPABILITIES.md` |
 | I4 | **Independent human review of WAL/crash/recovery paths.** Checklist exists in `RELEASING.md`; the review itself is a release-integrator step. | **open, external** | |
+| I7 | **Configured analyzer loses positions after 16,383.** `to_ftsdoc('simple', repeat('filler ',17000) || 'alpha beta') @@@ '"alpha beta"'` is false, while the unconfigured analyzer returns true. PostgreSQL's configured parsing pipeline caps these positions before pg_fts receives them. Existing saved vectors cannot recover lost positions. Verify long-document analysis and stored input positions before adopting this path. | **open, inherited limitation** | README / CHANGELOG Unreleased |
 
 ## Open -- measurement debt
 
@@ -66,6 +67,8 @@ These do not touch the index and are the cheapest, highest-leverage work in the 
 - **Vectorizing sparsemap** -- never a query hotspot; the one time it was the bottleneck (P0, 99.75%) the fix was algorithmic; its compressed layout is SIMD-hostile; it is vendored byte-identical to upstream on purpose.
 
 ## Closed (one line each; detail in CHANGELOG)
+
+- **I6, unreleased:** Chained/nested unordered proximity, phrase and OR operands, exact distances, positional evaluation, stable ranked results, and PostgreSQL 17/18 correctness checks. See CHANGELOG Unreleased.
 
 - **1.8.1** count-path: df fast-count gate tests (10, non-vacuous); block-run VM checking measured ~1%, kept as cleanup.
 - **1.8.0** intra-word `-` `.` `/` are terms, not operators (`pkg-config` no longer parses as `pkg & !config`).

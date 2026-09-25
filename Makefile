@@ -27,7 +27,7 @@ EXTENSION = pg_fts
 DATA = pg_fts--1.8.3.sql pg_fts--0.2.0--0.2.1.sql pg_fts--0.2.1--0.2.2.sql pg_fts--0.2.2--0.2.3.sql pg_fts--0.2.3--0.2.4.sql pg_fts--0.2.4--0.3.0.sql pg_fts--0.3.0--0.3.1.sql pg_fts--0.3.1--0.3.2.sql pg_fts--0.3.2--0.3.3.sql pg_fts--0.3.3--0.3.4.sql pg_fts--0.3.4--0.3.5.sql pg_fts--0.3.5--0.3.6.sql pg_fts--0.3.6--1.0.0.sql pg_fts--1.0.0--1.0.1.sql pg_fts--1.0.1--1.0.2.sql pg_fts--1.0.2--1.0.3.sql pg_fts--1.0.3--1.0.4.sql pg_fts--1.0.4--1.0.5.sql pg_fts--1.0.5--1.0.6.sql pg_fts--1.0.6--1.0.7.sql pg_fts--1.0.7--1.0.8.sql pg_fts--1.0.8--1.1.0.sql pg_fts--1.1.0--1.1.1.sql pg_fts--1.1.1--1.1.2.sql pg_fts--1.1.2--1.1.3.sql pg_fts--1.1.3--1.1.4.sql pg_fts--1.1.4--1.1.5.sql pg_fts--1.1.5--1.1.6.sql pg_fts--1.1.6--1.1.7.sql pg_fts--1.1.7--1.2.0.sql pg_fts--1.2.0--1.2.1.sql pg_fts--1.2.1--1.2.2.sql pg_fts--1.2.2--1.3.0.sql pg_fts--1.3.0--1.3.1.sql pg_fts--1.3.1--1.3.2.sql pg_fts--1.3.2--1.4.0.sql pg_fts--1.4.0--1.4.1.sql pg_fts--1.4.1--1.5.0.sql pg_fts--1.5.0--1.5.1.sql pg_fts--1.5.1--1.5.2.sql pg_fts--1.5.2--1.5.3.sql pg_fts--1.5.3--1.5.4.sql pg_fts--1.5.4--1.5.5.sql pg_fts--1.5.5--1.5.6.sql pg_fts--1.5.6--1.5.7.sql pg_fts--1.5.7--1.5.8.sql pg_fts--1.5.8--1.5.9.sql pg_fts--1.5.9--1.5.10.sql pg_fts--1.5.10--1.6.0.sql pg_fts--1.6.0--1.6.1.sql pg_fts--1.6.1--1.7.0.sql pg_fts--1.7.0--1.7.1.sql pg_fts--1.7.1--1.7.2.sql pg_fts--1.7.2--1.8.0.sql pg_fts--1.8.0--1.8.1.sql pg_fts--1.8.1--1.8.2.sql pg_fts--1.8.2--1.8.3.sql
 PGFILEDESC = "pg_fts - full-text search with BM25 ranking"
 
-REGRESS = pg_fts unicode_fold idx_scan_stats
+REGRESS = pg_fts unicode_fold idx_scan_stats legal_proximity
 ISOLATION = bm25_concurrency bm25_cic
 TAP_TESTS = 1
 

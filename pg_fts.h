@@ -115,7 +115,9 @@ typedef enum FtsQueryOp
 	FTS_OP_NOT = 1,
 	FTS_OP_AND,
 	FTS_OP_OR,
-	FTS_OP_PHRASE				/* two operands adjacent within `distance` */
+	FTS_OP_PHRASE,				/* ordered operands within `distance` */
+	FTS_OP_WITHIN,				/* operands in either order within `distance` */
+	FTS_OP_EXACT				/* exact gap from left end to right start */
 } FtsQueryOp;
 
 typedef struct FtsQueryItem
@@ -123,7 +125,7 @@ typedef struct FtsQueryItem
 	uint8		type;			/* FtsQueryItemType */
 	uint8		op;				/* FtsQueryOp, valid when type == FTS_QI_OPR */
 	uint16		flags;			/* FTS_QF_* flags, valid for FTS_QI_VAL */
-	uint32		distance;		/* max token gap for FTS_OP_PHRASE (1 = adjacent);
+	uint32		distance;		/* max token gap for PHRASE/WITHIN (1 = adjacent);
 								 * on a FTS_QI_VAL with FTS_QF_WEIGHTED, instead holds
 								 * the weight-label mask (bit L set => match label L,
 								 * L in 0..3 for D,C,B,A) -- a VAL never uses the gap */
@@ -197,11 +199,29 @@ extern FtsQuery fts_parse_query_cfg(const char *str, int len, Oid cfgId);
 
 /* pg_fts_match.c -- evaluate a parsed query against an analyzed doc */
 extern bool fts_doc_matches(FtsDoc doc, FtsQuery query);
+/* Match spans shared by document rechecks and positional index scans.
+ * Endpoints are token ordinals, with any field restriction already applied. */
+typedef struct FtsMatchSpan
+{
+	uint32		start;
+	uint32		end;
+} FtsMatchSpan;
+
+typedef struct FtsMatchValue
+{
+	bool		present;
+	FtsMatchSpan *spans;
+	int			nspans;
+} FtsMatchValue;
+
+extern bool fts_match_eval(FtsQuery query, FtsMatchValue *values,
+						   int maxspans, bool *overflow);
+extern void fts_match_needpos(FtsQuery query, bool *needpos);
 /* shared phrase adjacency over raw ascending position arrays (single source of
  * truth for the in-memory matcher and the index posting-list phrase eval) */
 extern void fts_phrase_step_pos(const uint32 *left, int nleft,
 								const uint32 *right, int nright,
-								uint32 distance, uint32 *out, int *nout);
+								uint32 distance, bool exact, uint32 *out, int *nout);
 /* shared: binary-search a term in a doc; returns entry or NULL */
 extern FtsTermEntry *fts_doc_lookup(FtsDoc doc, const char *term, int termlen);
 
@@ -221,6 +241,8 @@ extern bool fts_doc_has_regex(FtsDoc doc, const char *re, int relen);
 
 /* pg_fts_rank.c -- collect distinct query term operands (shared) */
 extern int	fts_query_terms(FtsQuery q, const char ***terms_out, int **lens_out);
+extern double fts_bm25_score_index(FtsDoc doc, FtsQuery q, double N,
+								   double avgdl, const double *dfs);
 
 /* pg_fts_trgm.c -- trigram pre-filter for fuzzy/regex at scale */
 #define FTS_MAX_TRIGRAMS 64

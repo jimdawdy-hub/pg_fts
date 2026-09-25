@@ -17,10 +17,10 @@ the squashed install script `pg_fts--0.3.2.sql`. All
 | BM25 (Okapi) scoring, index-maintained corpus stats (N, avgdl, df) | Yes | `fts_bm25` `pg_fts--0.3.2.sql:156`; `fts_index_stats`/`fts_index_df` `pg_fts--0.3.2.sql:243,251`; metapage `meta->ndocs` `pg_fts_am.c:820,2694` |
 | BM25 variants (lucene, robertson, atire, bm25+, bm25l) | Yes | `fts_bm25_opts` `pg_fts--0.3.2.sql:164` |
 | BM25F multi-field weighting | Yes | `fts_bm25f(ftsdoc[], ftsquery, weights, ...)` `pg_fts--0.3.2.sql:177` |
-| Phrase queries (`"a b c"`) / NEAR via per-term positions | Yes | evaluated from stored positions; adjacency enforced exactly on all paths (`@@@`, bitmap, ranked, `fts_count`) -- verified 2026-09-08 by cross-checking seq scan, index `positions=off` and index `positions=on` against regex ground truth (all 1000/1000). Where adjacency cannot be verified (a doc built without positions, or a boolean sub-expression under a phrase) the result is **false**, matching PostgreSQL's `OP_PHRASE` without `TS_EXEC_PHRASE_NO_POS` -- 1.6.0 fixed a silent degradation to a conjunction here. **One deliberate exception:** a prefix operand inside a phrase (`"quick bro*"`) is presence-only, since prefix positions are not tracked, so it is over-permissive by design |
+| Phrase / nested unordered proximity | Yes | Complete spans support chained w/N, phrase and OR operands; exact gaps preserve stopword spacing; all modifier terms contribute actual positions. Independent legal_proximity oracle checks all scan/count/ranking paths. Configured analysis still inherits the 16,383-position cap. |
 | Index-native phrase/NEAR (no heap recheck) with `WITH (positions=on)` | Yes | token positions stored in the postings (BM25 format v3, 4th lazily-decoded FOR column); phrase count/match answered from postings, no per-candidate heap fetch. Default `positions=off` keeps the smaller index + correct-but-slower heap recheck. Non-phrase queries never decode positions (`bm25_decode_term` skip); size cost ~1.03x (prose) to ~2.8x (high term-repetition) |
 | Prefix (`term*`), fuzzy (`term~k`), regex (`/re/`) | Yes | README lines 31-34; sequential + index paths, `sql/pg_fts.sql:147-271`; optional trigram pre-filter `pg_fts_trgm_index.c`, built only `WITH (trigrams = on)` (default off; regex/long-fuzzy fall back to a dictionary scan without it) |
-| Ranked (`<=>`) over fuzzy/prefix/regex returns a correct **subset** | Partial | the ranked WAND path builds cursors from the literal term, so docs matching only via an expansion aren't ranked; results are always correct (never a non-match) but may be incomplete. Use `@@@` for exhaustive fuzzy/prefix/regex retrieval. PHRASE/NEAR/boolean ranking is exact (`bm25_recheck_exact`, `pg_fts_am_scan.c:1988`) |
+| Ranked (`<=>`) over fuzzy/prefix/regex | Yes, exact matching recall | Heap fallback ranks expansion-only matches too; literal-term BM25 scores are unchanged, so expansion-only matches can score zero. |
 | Highlight / snippet | Yes | `fts_highlight`, `fts_snippet` `pg_fts--0.3.2.sql:188,195` |
 | Fast bulk count (`fts_count(regclass, ftsquery)`) | Yes | `pg_fts--0.3.2.sql:299`; visibility-map-aware, heap probed only for not-all-visible pages. 1.3.0: a single plain term over a tombstone-free / pending-free / all-visible index is answered from the dictionary df alone (no posting decode, ~hundreds of times faster); the transparent `count(*) WHERE @@@` Custom Scan pushdown now also fires for a plain-column index, not only an expression index |
 | Lexical anomaly detection (`fts_anomalous_docs(index, k, max_df)`) | Yes | top-k docs containing globally rare terms, scored by max idf on global df; walks only the low-df dictionary tail (skips high-df terms before decode -> sub-ms, not a full scan) `pg_fts_am_scan.c`; `pg_fts--0.3.2.sql:288`; tombstones honored |
@@ -37,7 +37,7 @@ the squashed install script `pg_fts--0.3.2.sql`. All
 | Unique / multicolumn / ordered-btree / clusterable | No | `amcanunique=false` `:3320`, `amcanmulticol=false` `:3321`, `amcanorder=false` `:3312`, `amclusterable=false` `:3326` |
 | NULL / optional-key indexing | No | `amsearchnulls=false` `:3324`, `amoptionalkey=false` `:3322` (a NULL ftsdoc is not indexed: `bm25_insert` returns early on `isnull[0]` `pg_fts_am.c:2649`) |
 | Predicate locks (SSI) | No | `ampredlocks=false` `pg_fts_am.c:3327` |
-| Ranked scan over unflushed pending docs | No (partial) | `<=>`/`fts_search` cover merged segments only; pending docs matched by `@@@`/counted by `fts_count` but ranked only after a flush |
+| Ranked scan over unflushed pending docs | Yes | Exact heap fallback includes pending docs; merged plain queries retain WAND. |
 | Faceting / aggregation Custom Scan pushdown | No | none in tree; only `fts_count` count-pushdown exists |
 | Impact-ordered postings | No | postings are docid-ordered (block-max WAND); listed as future work, README lines 62-64 |
 | Storage AIO / read_stream prefetch | No (build heap scan gets core AIO free) | 0 `read_stream`/`StartReadBuffers` sites; `nextblk` pointer-chains defeat prefetch; see Q6 |
@@ -138,8 +138,8 @@ online index REPACK beyond VACUUM+`fts_merge()` and REINDEX**.
 - No index-only / covering scan (`amcanreturn`→false, `amcaninclude=false`).
 - No faceting / aggregation Custom Scan pushdown (only count-pushdown exists).
 - No impact-ordered postings — docid-ordered only (README 62-64).
-- `<=>` / `fts_search` ranking does not cover unflushed pending docs until a
-  flush.
+- Configured analysis inherits the 16,383-position cap; long-document proximity
+  can miss matches beyond it. Modifier/pending ranking uses the heap fallback.
 
 Versus Elasticsearch/Tantivy this is a single-node, single-threaded-per-query
 engine with no distributed aggregation; versus tsvector/GIN it adds real BM25

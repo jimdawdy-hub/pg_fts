@@ -17,6 +17,7 @@ regression.out
 .deps/
 
 # editor / OS
+__pycache__/
 *~
 *.swp
 .DS_Store

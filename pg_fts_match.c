@@ -20,31 +20,19 @@
 #include "postgres.h"
 
 #include "pg_fts.h"
+#include "catalog/pg_collation.h"
+#include "miscadmin.h"
+#include "regex/regex.h"
+#include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/varlena.h"
 
-/*
- * Each stack entry is a boolean presence plus, for term and phrase operands, a
- * position list (ascending token positions where the operand ends).  Phrase
- * evaluation intersects a left operand's positions with a right term's
- * positions offset by 1..distance, chaining across a multi-word phrase.
- * Boolean operators (AND/OR/NOT) collapse to presence and drop positions.
- */
+/* A plain term's presence and its ascending position list. */
 typedef struct MatchVal
 {
 	bool		present;
-	uint32	   *pos;			/* NULL if positions unavailable/irrelevant */
+	uint32	   *pos;
 	int			npos;
-	/*
-	 * Why `pos` is NULL, which decides what a phrase over this operand means.
-	 * True only for a PREFIX leaf, whose positions are deliberately not tracked
-	 * ("phrase-with-prefix is not tracked positionally") -- a shipped, lossy
-	 * behaviour we keep.  False everywhere else, including a positionless
-	 * document AND a boolean sub-expression (the AND/OR/NOT arms null `pos`),
-	 * both of which make adjacency unknowable and so must yield FALSE rather
-	 * than degrade to a conjunction.  Checking the document's flag alone is NOT
-	 * sufficient: `quick <-> (brown & fox)` reaches phrase_step with positions
-	 * nulled on a fully positioned doc.
-	 */
-	bool		pos_lossy_prefix;
 }			MatchVal;
 
 /*
@@ -63,7 +51,6 @@ term_positions(FtsDoc doc, const char *term, int termlen, uint16 flags,
 	v.present = false;
 	v.pos = NULL;
 	v.npos = 0;
-	v.pos_lossy_prefix = false;
 
 	if (flags & FTS_QF_REGEX)
 	{
@@ -77,11 +64,8 @@ term_positions(FtsDoc doc, const char *term, int termlen, uint16 flags,
 	}
 	if (flags & FTS_QF_PREFIX)
 	{
-		/* presence only; phrase-with-prefix is not tracked positionally.  Mark
-		 * the absence as the deliberate prefix lossiness so a phrase over this
-		 * operand stays permissive instead of becoming unverifiable-false. */
+		/* Unweighted Boolean presence; proximity expansion uses term_spans. */
 		v.present = fts_doc_has_prefix(doc, term, termlen);
-		v.pos_lossy_prefix = true;
 		return v;
 	}
 	else
@@ -148,7 +132,6 @@ term_positions(FtsDoc doc, const char *term, int termlen, uint16 flags,
 				{
 					v.pos = NULL;
 					v.npos = 0;
-					v.pos_lossy_prefix = false;
 				}
 			}
 		}
@@ -159,7 +142,8 @@ term_positions(FtsDoc doc, const char *term, int termlen, uint16 flags,
 /*
  * Phrase step over raw ascending position arrays: return, in out[0..*nout),
  * the right positions p such that some left position L satisfies
- * 0 < p - L <= distance.  out must have room for nright values.  This is the
+ * p - L == distance when exact, or 0 < p - L <= distance otherwise.
+ * out must have room for nright values.  This is the
  * single source of truth for phrase adjacency; both the in-memory matcher
  * (phrase_step) and the index posting-list phrase evaluator use it, so a
  * phrase answered from the postings is byte-identical to the heap recheck.
@@ -167,7 +151,7 @@ term_positions(FtsDoc doc, const char *term, int termlen, uint16 flags,
 void
 fts_phrase_step_pos(const uint32 *left, int nleft,
 					const uint32 *right, int nright,
-					uint32 distance, uint32 *out, int *nout)
+					uint32 distance, bool exact, uint32 *out, int *nout)
 {
 	int			li = 0,
 				ri,
@@ -178,76 +162,307 @@ fts_phrase_step_pos(const uint32 *left, int nleft,
 		uint32		p = FTS_POS_ORD(right[ri]);	/* ordinal only; ignore label bits */
 
 		/* advance li to the first left position that could be in range */
-		while (li < nleft && FTS_POS_ORD(left[li]) + distance < p)
+		while (li < nleft && FTS_POS_ORD(left[li]) < p &&
+			p - FTS_POS_ORD(left[li]) > distance)
 			li++;
 		/* any left position L with p-distance <= L < p works */
-		if (li < nleft && FTS_POS_ORD(left[li]) < p && p - FTS_POS_ORD(left[li]) <= distance)
+		if (li < nleft &&
+			(exact ? (FTS_POS_ORD(left[li]) <= p && p - FTS_POS_ORD(left[li]) == distance) :
+			 (FTS_POS_ORD(left[li]) < p && p - FTS_POS_ORD(left[li]) <= distance)))
 			out[k++] = right[ri];	/* keep the original (label-bearing) word */
 	}
 	*nout = k;
 }
 
-/*
- * Phrase step: given left positions (ends of the matched-so-far prefix) and
- * the right term's positions, return the right positions p such that some left
- * position L satisfies 0 < p - L <= distance.  Both inputs are ascending.
- */
-static MatchVal
-phrase_step(MatchVal left, MatchVal right, uint32 distance)
+static int
+span_cmp(const void *a, const void *b)
 {
-	MatchVal	r;
+	const FtsMatchSpan *x = a;
+	const FtsMatchSpan *y = b;
 
-	r.present = false;
-	r.pos = NULL;
-	r.npos = 0;
-	r.pos_lossy_prefix = false;
+	if (x->start != y->start)
+		return x->start < y->start ? -1 : 1;
+	return x->end < y->end ? -1 : x->end > y->end;
+}
 
-	/*
-	 * Either side may lack positions, and the right answer depends on WHY.
-	 *
-	 * (a) The DOCUMENT carries no positions at all.  Adjacency is unknowable,
-	 * so the phrase is FALSE.  This matches PostgreSQL: without
-	 * TS_EXEC_PHRASE_NO_POS, "OP_PHRASE always returns false if lexeme
-	 * position information is not available" (tsearch/ts_utils.h), and
-	 * `strip(to_tsvector('simple','quick brown')) @@ 'quick <-> brown'` is
-	 * false upstream even though the words ARE adjacent.  We claim to mirror
-	 * TS_execute (see this file's header), so we must not diverge here.
-	 *
-	 * This branch is reached by more than a positionless document: the
-	 * boolean arms below null out positions, so a boolean sub-expression
-	 * under a phrase (`quick <-> (brown & fox)`, reachable via the tsquery
-	 * cast) lands here even on a fully positioned doc.  Returning
-	 * presence-only AND there answered `t` where PostgreSQL answers `f`.
-	 *
-	 * (b) The operand is a PREFIX leaf, whose positions are deliberately not
-	 * tracked (see fts_doc_term_val: "phrase-with-prefix is not tracked
-	 * positionally").  That is a shipped, documented lossiness -- `"quick bro*"`
-	 * is over-permissive by design -- so keep presence-only there rather than
-	 * silently narrowing a feature people may rely on.
-	 *
-	 * Only the operand's own `pos_lossy_prefix` distinguishes these.  The
-	 * DOCUMENT's FTS_DOC_HAS_POS flag does NOT: the boolean case above arrives
-	 * here with pos == NULL on a fully positioned document.
-	 */
-	if (left.pos == NULL || right.pos == NULL)
+/* Keep all distinct boundaries: two matches with the same end can have
+ * different distances to a later operand on their left. */
+static void
+span_sort(FtsMatchValue *v)
+{
+	int			i,
+				n = 0;
+
+	if (v->nspans < 2)
+		return;
+	qsort(v->spans, v->nspans, sizeof(FtsMatchSpan), span_cmp);
+	for (i = 0; i < v->nspans; i++)
+		if (n == 0 || span_cmp(&v->spans[n - 1], &v->spans[i]) != 0)
+			v->spans[n++] = v->spans[i];
+	v->nspans = n;
+}
+
+static bool
+span_push(FtsMatchValue *v, int *capacity, uint32 start, uint32 end,
+		  int maxspans, bool *overflow)
+{
+	if (maxspans > 0 && v->nspans >= maxspans)
 	{
-		bool		lossy = (left.pos == NULL && left.pos_lossy_prefix) ||
-			(right.pos == NULL && right.pos_lossy_prefix);
-		bool		unknowable = (left.pos == NULL && !left.pos_lossy_prefix) ||
-			(right.pos == NULL && !right.pos_lossy_prefix);
-
-		if (unknowable)
-			return r;			/* (a) -> false, as PostgreSQL does */
-		if (lossy)
-			r.present = left.present && right.present;	/* (b) prefix */
-		return r;
+		*overflow = true;
+		return false;
 	}
+	if (v->nspans == *capacity)
+	{
+		Size		next = *capacity ? (Size) *capacity * 2 : 16;
 
-	r.pos = (uint32 *) palloc(right.npos * sizeof(uint32));
-	fts_phrase_step_pos(left.pos, left.npos, right.pos, right.npos,
-						distance, r.pos, &r.npos);
-	r.present = (r.npos > 0);
-	return r;
+		if (maxspans > 0)
+			next = Min(next, (Size) maxspans);
+		if (next > MaxAllocSize / sizeof(FtsMatchSpan))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("too many phrase matches in one document")));
+		v->spans = v->spans ? repalloc(v->spans, next * sizeof(FtsMatchSpan)) :
+			palloc(next * sizeof(FtsMatchSpan));
+		*capacity = (int) next;
+	}
+	v->spans[v->nspans++] = (FtsMatchSpan) {start, end};
+	v->present = true;
+	return true;
+}
+
+/* First span whose start is >= position; spans are sorted by (start,end). */
+static int
+span_lower_bound(FtsMatchValue v, uint32 position)
+{
+	int			lo = 0,
+				hi = v.nspans;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (v.spans[mid].start < position)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static FtsMatchValue
+span_join(FtsMatchValue left, FtsMatchValue right, uint8 op, uint32 distance,
+		  bool needspans, int maxspans, bool *overflow)
+{
+	FtsMatchValue out = {0};
+	int			capacity = 0;
+	int			pass,
+				i,
+				j;
+
+	for (pass = 0; pass < (op == FTS_OP_WITHIN ? 2 : 1); pass++)
+	{
+		FtsMatchValue a = pass == 0 ? left : right;
+		FtsMatchValue b = pass == 0 ? right : left;
+
+		for (i = 0; i < a.nspans; i++)
+		{
+			uint32		end = a.spans[i].end;
+
+			CHECK_FOR_INTERRUPTS();
+			/* Legacy NEAR/p/N measures endpoints, including right-deep
+			 * queries. New EXACT/WITHIN uses the nearest span boundaries. */
+			j = op == FTS_OP_PHRASE ? 0 : span_lower_bound(b, end);
+			for (; j < b.nspans; j++)
+			{
+				uint32		position = op == FTS_OP_PHRASE ?
+					b.spans[j].end : b.spans[j].start;
+				uint32		gap;
+
+				if (position < end)
+					continue;
+				gap = position - end;
+				if (gap > distance)
+				{
+					if (op != FTS_OP_PHRASE)
+						break;
+					continue;
+				}
+				if (op == FTS_OP_EXACT ? gap != distance : gap == 0)
+					continue;
+				out.present = true;
+				if (!needspans)
+					return out;
+				if (!span_push(&out, &capacity,
+							   Min(a.spans[i].start, b.spans[j].start),
+							   Max(end, b.spans[j].end), maxspans, overflow))
+					return out;
+			}
+		}
+	}
+	span_sort(&out);
+	return out;
+}
+
+/*
+ * needpos[i]: does item i's value need its spans (it is an operand of a
+ * proximity operator, possibly through ORs)?  Everywhere else only presence
+ * counts, so a caller may leave those values without spans.
+ */
+void
+fts_match_needpos(FtsQuery query, bool *needpos)
+{
+	bool	   *work = palloc(Max(query->nitems, 1) * sizeof(bool));
+	int			depth = 1;
+	uint32		i;
+
+	work[0] = false;
+	for (i = query->nitems; i-- > 0;)
+	{
+		FtsQueryItem *it = &query->items[i];
+		bool		need = work[--depth];
+
+		needpos[i] = need;
+		if (it->type == FTS_QI_VAL)
+			continue;
+		if (it->op != FTS_OP_OR)
+			need = it->op == FTS_OP_PHRASE || it->op == FTS_OP_WITHIN ||
+				it->op == FTS_OP_EXACT;
+		work[depth++] = need;
+		if (it->op != FTS_OP_NOT)
+			work[depth++] = need;
+	}
+	pfree(work);
+}
+
+/* Shared RPN evaluator. Leaf values are indexed by query item. Callers own
+ * the memory context; index callers reset it after each candidate document. */
+bool
+fts_match_eval(FtsQuery query, FtsMatchValue *values, int maxspans, bool *overflow)
+{
+	FtsMatchValue *stack = palloc(query->nitems * sizeof(FtsMatchValue));
+	bool	   *needpos = palloc(Max(query->nitems, 1) * sizeof(bool));
+	int			top = 0;
+	uint32		i;
+	bool		result;
+
+	*overflow = false;
+	fts_match_needpos(query, needpos);
+	for (i = 0; i < query->nitems && !*overflow; i++)
+	{
+		FtsQueryItem *it = &query->items[i];
+		FtsMatchValue a,
+					b,
+					out = {0};
+
+		if (it->type == FTS_QI_VAL)
+		{
+			stack[top++] = values[i];
+			continue;
+		}
+		b = stack[--top];
+		if (it->op == FTS_OP_NOT)
+			out.present = !b.present;
+		else
+		{
+			a = stack[--top];
+			if (it->op == FTS_OP_AND)
+				out.present = a.present && b.present;
+			else if (it->op == FTS_OP_OR)
+			{
+				int			capacity = 0,
+							j;
+
+				out.present = a.present || b.present;
+				if (needpos[i])
+				{
+					for (j = 0; j < a.nspans && !*overflow; j++)
+						span_push(&out, &capacity, a.spans[j].start,
+								  a.spans[j].end, maxspans, overflow);
+					for (j = 0; j < b.nspans && !*overflow; j++)
+						span_push(&out, &capacity, b.spans[j].start,
+								  b.spans[j].end, maxspans, overflow);
+					span_sort(&out);
+				}
+			}
+			else
+				out = span_join(a, b, it->op, it->distance, needpos[i],
+								maxspans, overflow);
+		}
+		stack[top++] = out;
+	}
+	result = !*overflow && top == 1 && stack[0].present;
+	pfree(stack);
+	pfree(needpos);
+	return result;
+}
+
+/* Expand positional leaves against the stored lexemes. Native regex and
+ * bounded edit distance are reused; every expansion contributes positions. */
+static FtsMatchValue
+term_spans(FtsDoc doc, FtsQuery q, FtsQueryItem *it)
+{
+	FtsMatchValue out = {0};
+	const char *term = FTS_QUERY_ITEMTEXT(q, it);
+	int			capacity = 0;
+	bool		overflow = false;
+	uint32		i;
+	uint32		mask = it->flags & FTS_QF_WEIGHTED ? it->distance : 0;
+	text	   *pattern = it->flags & FTS_QF_REGEX ?
+		cstring_to_text_with_len(term, it->termlen) : NULL;
+
+	if (!(it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX)))
+	{
+		MatchVal	v = term_positions(doc, term, it->termlen, it->flags,
+									 it->distance);
+
+		out.present = v.present;
+		if (v.npos > 0)
+		{
+			out.spans = palloc((Size) v.npos * sizeof(FtsMatchSpan));
+			for (i = 0; i < (uint32) v.npos; i++)
+				out.spans[i] = (FtsMatchSpan) {FTS_POS_ORD(v.pos[i]),
+					FTS_POS_ORD(v.pos[i])};
+			out.nspans = v.npos;
+		}
+		return out;
+	}
+	for (i = 0; i < doc->nterms; i++)
+	{
+		FtsTermEntry *e = &doc->entries[i];
+		const char *candidate = FTS_DOC_TERMTEXT(doc, e);
+		bool		matches;
+		uint32		j;
+
+		CHECK_FOR_INTERRUPTS();
+		if (it->flags & FTS_QF_PREFIX)
+			matches = e->len >= it->termlen &&
+				memcmp(candidate, term, it->termlen) == 0;
+		else if (it->flags & FTS_QF_FUZZY)
+			matches = varstr_levenshtein_less_equal(term, it->termlen,
+				candidate, e->len, 1, 1, 1, it->distance, true) <= it->distance;
+		else
+			matches = RE_compile_and_execute(pattern, (char *) candidate,
+				e->len, REG_ADVANCED, C_COLLATION_OID, 0, NULL);
+		if (!matches)
+			continue;
+		if (!FTS_DOC_HAS_POS(doc))
+		{
+			out.present = mask == 0;
+			continue;
+		}
+		for (j = 0; j < e->tf; j++)
+		{
+			uint32		p = FTS_DOC_TERMPOS(doc, e)[j];
+
+			if (mask == 0 || (mask & (1u << FTS_POS_LABEL(p))))
+				span_push(&out, &capacity, FTS_POS_ORD(p), FTS_POS_ORD(p),
+						  0, &overflow);
+		}
+	}
+	if (pattern)
+		pfree(pattern);
+	span_sort(&out);
+	return out;
 }
 
 bool
@@ -262,7 +477,25 @@ fts_doc_matches(FtsDoc doc, FtsQuery query)
 	/* An empty query matches nothing (there is no positive evidence). */
 	if (query->nitems == 0)
 		return false;
+	for (i = 0; i < query->nitems; i++)
+		if ((items[i].type == FTS_QI_OPR &&
+			 (items[i].op == FTS_OP_PHRASE || items[i].op == FTS_OP_EXACT ||
+			  items[i].op == FTS_OP_WITHIN)) ||
+			(items[i].type == FTS_QI_VAL &&
+			 (items[i].flags & (FTS_QF_PREFIX | FTS_QF_WEIGHTED)) ==
+			 (FTS_QF_PREFIX | FTS_QF_WEIGHTED)))
+		{
+			FtsMatchValue *values = palloc0(query->nitems * sizeof(FtsMatchValue));
+			bool		overflow;
+			uint32		j;
 
+			for (j = 0; j < query->nitems; j++)
+				if (items[j].type == FTS_QI_VAL)
+					values[j] = term_spans(doc, query, &items[j]);
+			result = fts_match_eval(query, values, 0, &overflow);
+			pfree(values);
+			return result;
+		}
 	stack = (MatchVal *) palloc(query->nitems * sizeof(MatchVal));
 
 	for (i = 0; i < query->nitems; i++)
@@ -280,22 +513,13 @@ fts_doc_matches(FtsDoc doc, FtsQuery query)
 			Assert(top >= 1);
 			stack[top - 1].present = !stack[top - 1].present;
 			stack[top - 1].pos = NULL;
-			stack[top - 1].pos_lossy_prefix = false;
 			stack[top - 1].npos = 0;
-		}
-		else if (it->op == FTS_OP_PHRASE)
-		{
-			Assert(top >= 2);
-			stack[top - 2] = phrase_step(stack[top - 2], stack[top - 1],
-										 it->distance);
-			top--;
 		}
 		else if (it->op == FTS_OP_AND)
 		{
 			Assert(top >= 2);
 			stack[top - 2].present = stack[top - 2].present && stack[top - 1].present;
 			stack[top - 2].pos = NULL;
-			stack[top - 2].pos_lossy_prefix = false;
 			stack[top - 2].npos = 0;
 			top--;
 		}
@@ -304,7 +528,6 @@ fts_doc_matches(FtsDoc doc, FtsQuery query)
 			Assert(top >= 2);
 			stack[top - 2].present = stack[top - 2].present || stack[top - 1].present;
 			stack[top - 2].pos = NULL;
-			stack[top - 2].pos_lossy_prefix = false;
 			stack[top - 2].npos = 0;
 			top--;
 		}

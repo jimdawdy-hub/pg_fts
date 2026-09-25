@@ -204,10 +204,40 @@ Query language
   quick & brown        AND          quick | brown   OR      !slow / -slow  NOT
   (a | b) & c          grouping
   "quick brown fox"    phrase (adjacent)
+  quick p/5 fox        ordered proximity, up to 5 token positions apart
+  quick w/5 fox        either word order, up to 5 token positions apart
+  (dog | canine) w/10 bite   either dog or canine near bite
+  NEAR(quick fox, 5)    ordered proximity (existing syntax)
+  a w/3 b w/5 c        chained proximity (left associative)
+  "summary judgment" w/5 negligence   phrase proximity
+  breach <2> contract  exact two-position gap
   quick*               prefix
   quick~2              fuzzy, edit distance <= 2
   /^qu.*x$/            regex over each term
   title AND fox        keyword operators (AND/OR/NOT, case-insensitive)
+
+`w/N` accepts terms, phrases, OR alternatives, and nested proximity groups.
+It joins nonoverlapping matches whose nearest edges are 1..N token positions
+apart, in either order (adjacent words have distance 1). Chaining is left
+associative; parentheses change grouping. All matching spans are retained.
+For example, `(a w/3 b) w/5 c` puts `c` near either outside edge of the `a`/`b`
+match. `p/N` and `NEAR` retain their historical ordered endpoint semantics.
+AND/NOT directly inside proximity are rejected because they have no span.
+
+Quoted phrases use exact adjacency, with removed stopwords preserving their
+spacing: `to_ftsquery('english','"breach of contract"')` yields
+`'breach' <2> 'contract'`. Exact `<N>` includes `<0>` for the same position.
+Prefix, fuzzy and regex terms work positionally inside phrases. Prefixes may
+also carry weights (`attorn*:A`); fuzzy+weight and regex modifiers error.
+
+Use `WITH (positions=on)` for compound proximity without heap rechecks, also
+when combined with AND and NOT. Weighted/expanded terms still use exact
+rechecks, and so does a document whose positions were not stored or are
+oversized (that document alone).
+The configured analyzer inherits PostgreSQL's position cap of 16,383; matches
+beyond it can be lost. The unconfigured `to_ftsdoc(text)` analyzer stores wider
+positions. This inherited limitation needs resolution before a legal-corpus
+cutover; existing document vectors cannot recover spacing already lost on input.
 
 Example
 -------
@@ -378,9 +408,10 @@ Query execution
     / pg_repack.  It is interruptible: pg_cancel_backend and statement_timeout
     stop it promptly, and a cancelled (or out-of-disk) run leaves the index
     valid and correct, just not fully compacted.
-  * Ranked (<=>/fts_search) results cover merged segments; pending (unflushed)
-    docs are found by @@@ and counted by fts_count, and become ranked after the
-    next flush (fts_merge() forces one immediately).
+  * Ranked (<=>/fts_search) results include pending documents and modifier
+    matches through an exact heap fallback. Plain merged queries keep WAND.
+    Ranking still scores literal query terms: expansion-only matches can score
+    zero. Equal scores use TID order, keeping pagination stable.
 
 Vendored dependencies
 ---------------------
@@ -397,6 +428,10 @@ Backward compatibility
 tsvector, tsquery, @@, ts_rank and the GIN/GiST opclasses are untouched;
 pg_fts is purely additive and opt-in.
 
+New `tsquery` casts preserve exact phrase gaps. Existing stored ordered-query
+values retain their historical maximum-gap interpretation. Text saved by an
+older lossy serializer cannot recover a distance that was already discarded.
+
 Documentation
 -------------
 
@@ -412,6 +447,10 @@ Testing
   * sql/pg_fts.sql + expected/pg_fts.out -- the functional regression suite
     (types, query language, the bm25 index, ranking, maintenance, and the
     MVCC/tombstone/oversized-doc correctness edges).
+  * sql/legal_proximity.sql -- an independent occurrence-span oracle, including
+    nested proximity, exact phrases, expansions, stopwords and query roundtrips.
+  * test/query_binary.py -- 46 valid/malformed binary-query checks; run only in
+    a disposable server (`pg_virtualenv python3 test/query_binary.py --local`).
   * specs/bm25_concurrency.spec, specs/bm25_cic.spec -- isolation tests: MVCC
     snapshot stability, pending-list visibility, VACUUM/merge invisibility to
     an open scan, delete+reuse tombstone correctness, and CREATE/REINDEX INDEX

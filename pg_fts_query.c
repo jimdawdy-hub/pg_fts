@@ -8,7 +8,8 @@
  *
  *	  expr    := or_expr
  *	  or_expr := and_expr ( ('|' | 'OR') and_expr )*
- *	  and_expr:= unary ( ('&' | 'AND')? unary )*        -- implicit AND
+ *	  and_expr:= proximity ( ('&' | 'AND')? proximity )* -- implicit AND
+ *	  proximity := unary ( (('w/' | 'p/') distance | '<->' | '<N>') unary )*
  *	  unary   := ('!' | 'NOT' | '-') unary | primary
  *
  *	  '-' is negation only in PREFIX position; between two word characters it is part
@@ -31,9 +32,12 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "pg_fts.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 
 /* An operand collected during the parse, before flattening to a varlena. */
@@ -59,6 +63,7 @@ typedef enum
 	TOK_RPAREN,
 	TOK_QUOTE,					/* " -- starts/ends a phrase */
 	TOK_NEAR,					/* NEAR keyword (proximity) */
+	TOK_PROX,					/* w/N, p/N, <-> or <N> */
 	TOK_COMMA					/* , inside NEAR(...) */
 } TokKind;
 
@@ -71,7 +76,11 @@ typedef struct Token
 	int			fuzzy_k;		/* TOK_TERM followed by ~k (0 = not fuzzy) */
 	bool		regex;			/* TOK_TERM holds a regex (from /.../ ) */
 	uint32		weightmask;		/* TOK_TERM followed by :ABCD -> label mask (0 = none) */
+	uint32		distance;		/* TOK_PROX distance */
+	uint8		op;				/* TOK_PROX operator */
 } Token;
+
+#define FTS_MAX_PROX_DISTANCE UINT32_MAX
 
 typedef struct ParseState
 {
@@ -89,6 +98,26 @@ typedef struct ParseState
 static void parse_or(ParseState *st);
 static void emit_dist(ParseState *st, uint8 type, uint8 op, char *term,
 					  int termlen, uint16 flags, uint32 distance);
+
+/* Accept a bounded decimal distance without overflowing an intermediate. */
+static bool
+parse_distance(const char *s, int len, uint32 *distance)
+{
+	uint32		n = 0;
+	int			i;
+
+	if (len == 0)
+		return false;
+	for (i = 0; i < len; i++)
+	{
+		if (s[i] < '0' || s[i] > '9' ||
+			n > (FTS_MAX_PROX_DISTANCE - (s[i] - '0')) / 10)
+			return false;
+		n = n * 10 + (s[i] - '0');
+	}
+	*distance = n;
+	return true;
+}
 
 /*
  * May this byte appear INSIDE a term, i.e. between two word characters?
@@ -147,6 +176,88 @@ emit_dist(ParseState *st, uint8 type, uint8 op, char *term, int termlen,
 	st->items[st->nitems].term = term;
 	st->items[st->nitems].termlen = termlen;
 	st->nitems++;
+}
+
+/* Suffixes are valid on both bare terms and quoted output terms. */
+static void
+lex_term_suffix(ParseState *st, Token *tok)
+{
+	while (st->pos < st->len)
+	{
+		char		c = st->buf[st->pos];
+
+		if (c == '*' || c == '~')
+		{
+			if (tok->prefix || tok->fuzzy_k > 0)
+			{
+				st->error = true;
+				return;
+			}
+			st->pos++;
+			if (c == '*')
+				tok->prefix = true;
+			else
+			{
+				int			k = 0;
+				bool		havedigit = false;
+
+				while (st->pos < st->len &&
+					   st->buf[st->pos] >= '0' && st->buf[st->pos] <= '9')
+				{
+					if (k > (INT_MAX - (st->buf[st->pos] - '0')) / 10)
+					{
+						st->error = true;
+						return;
+					}
+					k = k * 10 + (st->buf[st->pos] - '0');
+					havedigit = true;
+					st->pos++;
+				}
+				tok->fuzzy_k = havedigit ? Max(k, 1) : 2;
+			}
+		}
+		else if (c == ':')
+		{
+			int			p = st->pos + 1;
+			uint32		mask = 0;
+			bool		prefix = false;
+
+			/* Also accept PostgreSQL's :*AB spelling. */
+			if (p < st->len && st->buf[p] == '*')
+			{
+				prefix = true;
+				p++;
+			}
+			while (p < st->len)
+			{
+				c = st->buf[p];
+				if (c == 'A' || c == 'a')
+					mask |= 1u << 3;
+				else if (c == 'B' || c == 'b')
+					mask |= 1u << 2;
+				else if (c == 'C' || c == 'c')
+					mask |= 1u << 1;
+				else if (c == 'D' || c == 'd')
+					mask |= 1u << 0;
+				else
+					break;
+				p++;
+			}
+			if (mask == 0 && !prefix)
+				return;
+			if (tok->weightmask != 0 ||
+				(prefix && (tok->prefix || tok->fuzzy_k > 0)))
+			{
+				st->error = true;
+				return;
+			}
+			tok->weightmask = mask;
+			tok->prefix |= prefix;
+			st->pos = p;
+		}
+		else
+			return;
+	}
 }
 
 /*
@@ -222,6 +333,75 @@ lex_raw(ParseState *st)
 				st->pos++;
 				tok.kind = TOK_QUOTE;
 				return tok;
+			case '<':
+				{
+					int			dstart = ++st->pos;
+
+					tok.kind = TOK_PROX;
+					tok.op = FTS_OP_EXACT;
+					if (st->pos + 1 < st->len && st->buf[st->pos] == '-' &&
+						st->buf[st->pos + 1] == '>')
+					{
+						st->pos += 2;
+						tok.distance = 1;
+						return tok;
+					}
+					while (st->pos < st->len &&
+						   st->buf[st->pos] >= '0' && st->buf[st->pos] <= '9')
+						st->pos++;
+					if (st->pos >= st->len || st->buf[st->pos] != '>' ||
+						!parse_distance(st->buf + dstart, st->pos - dstart,
+										&tok.distance))
+						st->error = true;
+					else
+						st->pos++;
+					return tok;
+				}
+			case '\'':
+				{
+					int			qstart = st->pos;
+					char	   *literal;
+					int			n = 0;
+					bool		closed = false;
+
+					/* An apostrophe inside a word remains a separator, as it
+					 * was before display literals became input syntax. */
+					if (qstart > 0 && is_token_byte((unsigned char) st->buf[qstart - 1]))
+					{
+						st->pos++;
+						break;
+					}
+					literal = (char *) palloc(st->len - st->pos);
+					st->pos++;
+					while (st->pos < st->len)
+					{
+						char		ch = st->buf[st->pos++];
+
+						if (ch == '\'')
+						{
+							closed = true;
+							break;
+						}
+						if (ch == '\\' && st->pos < st->len)
+							ch = st->buf[st->pos++];
+						literal[n++] = ch;
+					}
+					if (!closed)
+					{
+						pfree(literal);
+						st->pos = qstart + 1;
+						break;
+					}
+					if (n == 0)
+					{
+						st->error = true;
+						return tok;
+					}
+					tok.kind = TOK_TERM;
+					tok.term = fold_token(literal, n, &tok.termlen);
+					lex_term_suffix(st, &tok);
+					return tok;
+				}
 			case '/':
 				{
 					/* /regex/ : read until the closing slash (not folded) */
@@ -238,6 +418,7 @@ lex_raw(ParseState *st)
 						st->pos++;	/* consume closing slash */
 					else
 					{
+						st->error = true;
 						tok.kind = TOK_EOF;	/* unterminated regex */
 						return tok;
 					}
@@ -247,6 +428,7 @@ lex_raw(ParseState *st)
 					tok.term = rbuf;
 					tok.termlen = rlen;
 					tok.regex = true;
+					lex_term_suffix(st, &tok);
 					return tok;
 				}
 			default:
@@ -287,6 +469,28 @@ lex_raw(ParseState *st)
 	/* fold identically to the document analyzer; folded length may differ from
 	 * the raw run under Unicode lowercasing, so keyword checks use flen after. */
 	folded = fold_token(st->buf + start, flen, &flen);
+	if (flen >= 3 && (folded[0] == 'w' || folded[0] == 'p') &&
+		folded[1] == '/' && folded[2] >= '0' && folded[2] <= '9')
+	{
+		int			k;
+
+		for (k = 3; k < flen && folded[k] >= '0' && folded[k] <= '9'; k++)
+			;
+		if (k == flen)
+		{
+			tok.kind = TOK_PROX;
+			tok.op = (folded[0] == 'w') ? FTS_OP_WITHIN : FTS_OP_PHRASE;
+			tok.term = folded;
+			tok.termlen = flen;
+			return tok;
+		}
+	}
+	tok.kind = TOK_TERM;
+	tok.term = folded;
+	tok.termlen = flen;
+	lex_term_suffix(st, &tok);
+	if (tok.prefix || tok.fuzzy_k > 0 || tok.weightmask != 0)
+		return tok;
 
 	/* keyword recognition (ASCII, case already folded).  Keyword tokens ALSO
 	 * carry their folded text so a phrase/NEAR operand context can treat them as
@@ -315,84 +519,6 @@ lex_raw(ParseState *st)
 		tok.kind = TOK_NEAR;
 		tok.term = folded;
 		tok.termlen = flen;
-	}
-	else
-	{
-		tok.kind = TOK_TERM;
-		tok.term = folded;
-		tok.termlen = flen;
-		/* a trailing '*' marks a prefix term */
-		if (st->pos < st->len && st->buf[st->pos] == '*')
-		{
-			tok.prefix = true;
-			st->pos++;
-		}
-		/* a trailing '~k' marks a fuzzy term (k defaults to 2) */
-		else if (st->pos < st->len && st->buf[st->pos] == '~')
-		{
-			int			k = 0;
-			bool		havedigit = false;
-
-			st->pos++;
-			while (st->pos < st->len &&
-				   st->buf[st->pos] >= '0' && st->buf[st->pos] <= '9')
-			{
-				k = k * 10 + (st->buf[st->pos] - '0');
-				havedigit = true;
-				st->pos++;
-			}
-			tok.fuzzy_k = havedigit ? Max(k, 1) : 2;
-		}
-		/*
-		 * A trailing ':' followed by a run of weight labels A/B/C/D (any case)
-		 * restricts the term to those field zones (tsquery-style term:A).  Sets
-		 * a 4-bit mask (bit L for label L in 0..3 = D,C,B,A).  Applies to plain,
-		 * prefix, and fuzzy terms; a regex term already consumed its slashes.
-		 */
-		if (st->pos < st->len && st->buf[st->pos] == ':')
-		{
-			int			p = st->pos + 1;
-			uint32		mask = 0;
-
-			while (p < st->len)
-			{
-				char		c = st->buf[p];
-
-				if (c == 'A' || c == 'a')
-					mask |= 1u << 3;
-				else if (c == 'B' || c == 'b')
-					mask |= 1u << 2;
-				else if (c == 'C' || c == 'c')
-					mask |= 1u << 1;
-				else if (c == 'D' || c == 'd')
-					mask |= 1u << 0;
-				else
-					break;
-				p++;
-			}
-			/* only consume the ':LABELS' if it was a valid non-empty label run */
-			if (mask != 0)
-			{
-				/* A weight label cannot combine with a prefix/fuzzy suffix in this
-				 * release (those are presence-only, no per-occurrence positions to
-				 * zone-filter).  Reject term:A* / term:A~k as a syntax error rather
-				 * than silently dropping the * / ~k. */
-				if (p < st->len && (st->buf[p] == '*' || st->buf[p] == '~'))
-				{
-					tok.kind = TOK_TERM;
-					tok.term = folded;
-					tok.termlen = flen;
-					tok.weightmask = mask;
-					tok.prefix = (st->buf[p] == '*');
-					tok.fuzzy_k = (st->buf[p] == '~') ? 2 : 0;
-					st->pos = p + 1;
-					/* parser sees weightmask + prefix/fuzzy flag together -> error */
-					return tok;
-				}
-				tok.weightmask = mask;
-				st->pos = p;
-			}
-		}
 	}
 	return tok;
 }
@@ -424,6 +550,37 @@ peek(ParseState *st)
 	return st->peeked;
 }
 
+/* Keep modifiers identical for bare terms, phrase terms and NEAR terms. */
+static void
+emit_term(ParseState *st, const Token *tok)
+{
+	uint16		flags = 0;
+	uint32		distance = 0;
+
+	/* A fuzzy distance and weight mask share the same stored field. */
+	if ((tok->fuzzy_k > 0 && tok->weightmask != 0) ||
+		(tok->regex && (tok->prefix || tok->fuzzy_k > 0 || tok->weightmask != 0)))
+	{
+		st->error = true;
+		return;
+	}
+	if (tok->regex)
+		flags = FTS_QF_REGEX;
+	else if (tok->fuzzy_k > 0)
+	{
+		flags = FTS_QF_FUZZY;
+		distance = (uint32) tok->fuzzy_k;
+	}
+	else if (tok->prefix)
+		flags = FTS_QF_PREFIX;
+	if (tok->weightmask != 0)
+	{
+		flags |= FTS_QF_WEIGHTED;
+		distance = tok->weightmask;
+	}
+	emit_dist(st, FTS_QI_VAL, 0, tok->term, tok->termlen, flags, distance);
+}
+
 /* primary := '(' expr ')' | '"' term+ '"' | term */
 static void
 parse_primary(ParseState *st)
@@ -439,7 +596,7 @@ parse_primary(ParseState *st)
 	}
 	else if (tok.kind == TOK_QUOTE)
 	{
-		/* phrase: emit the terms and join consecutive pairs with PHRASE(1) */
+		/* Quoted phrases require exact adjacency, including stopword gaps. */
 		int			nterms = 0;
 
 		for (;;)
@@ -447,11 +604,17 @@ parse_primary(ParseState *st)
 			Token		p = next_token(st);
 
 			if (p.kind == TOK_QUOTE)
+			{
+				/* Modifiers apply to individual terms, not to a whole phrase. */
+				lex_term_suffix(st, &p);
+				if (p.prefix || p.fuzzy_k > 0 || p.weightmask != 0)
+					st->error = true;
 				break;
+			}
 			/* inside "...", a bare and/or/not/near is a literal word, not an
 			 * operator: accept keyword tokens (they carry their folded text). */
 			if (p.kind != TOK_TERM && p.kind != TOK_AND && p.kind != TOK_OR &&
-				p.kind != TOK_NOT && p.kind != TOK_NEAR)
+				p.kind != TOK_NOT && p.kind != TOK_NEAR && p.kind != TOK_PROX)
 			{
 				st->error = true;
 				break;
@@ -461,10 +624,11 @@ parse_primary(ParseState *st)
 				st->error = true;
 				break;
 			}
-			emit(st, FTS_QI_VAL, 0, p.term, p.termlen,
-				 p.prefix ? FTS_QF_PREFIX : 0);
+			emit_term(st, &p);
+			if (st->error)
+				return;
 			if (nterms > 0)
-				emit_dist(st, FTS_QI_OPR, FTS_OP_PHRASE, NULL, 0, 0, 1);
+				emit_dist(st, FTS_QI_OPR, FTS_OP_EXACT, NULL, 0, 0, 1);
 			nterms++;
 		}
 		if (nterms == 0)
@@ -494,13 +658,15 @@ parse_primary(ParseState *st)
 			/* inside NEAR(...), and/or/not/near are literal words (they carry
 			 * their folded text), not operators. */
 			if ((p.kind != TOK_TERM && p.kind != TOK_AND && p.kind != TOK_OR &&
-				 p.kind != TOK_NOT && p.kind != TOK_NEAR) || p.term == NULL)
+				 p.kind != TOK_NOT && p.kind != TOK_NEAR && p.kind != TOK_PROX) ||
+				p.term == NULL)
 			{
 				st->error = true;
 				return;
 			}
-			emit(st, FTS_QI_VAL, 0, p.term, p.termlen,
-				 p.prefix ? FTS_QF_PREFIX : 0);
+			emit_term(st, &p);
+			if (st->error)
+				return;
 			nterms++;
 		}
 		/* optional ", k" (k defaults to 10 like FTS5 when omitted) */
@@ -508,21 +674,12 @@ parse_primary(ParseState *st)
 		if (p.kind == TOK_COMMA)
 		{
 			Token		kt = next_token(st);
-			int			j;
 
-			if (kt.kind != TOK_TERM)
+			if (kt.kind != TOK_TERM ||
+				!parse_distance(kt.term, kt.termlen, &dist))
 			{
 				st->error = true;
 				return;
-			}
-			for (j = 0; j < kt.termlen; j++)
-			{
-				if (kt.term[j] < '0' || kt.term[j] > '9')
-				{
-					st->error = true;
-					return;
-				}
-				dist = dist * 10 + (kt.term[j] - '0');
 			}
 			p = next_token(st);
 		}
@@ -547,34 +704,7 @@ parse_primary(ParseState *st)
 		}
 	}
 	else if (tok.kind == TOK_TERM)
-	{
-		uint16		f = 0;
-		uint32		dist;
-
-		if (tok.regex)
-			f = FTS_QF_REGEX;
-		else if (tok.fuzzy_k > 0)
-			f = FTS_QF_FUZZY;
-		else if (tok.prefix)
-			f = FTS_QF_PREFIX;
-		dist = (tok.fuzzy_k > 0) ? (uint32) tok.fuzzy_k : 0;
-		if (tok.weightmask != 0)
-		{
-			/* Weight (field-zone) restriction is supported on PLAIN terms only in
-			 * this release: a plain VAL never uses `distance` for a gap, so the
-			 * label mask rides there.  prefix/fuzzy/regex are presence-only in the
-			 * matcher (no per-occurrence positions), so a weight on them cannot be
-			 * enforced -- reject rather than silently ignore the label. */
-			if (f != 0)
-			{
-				st->error = true;
-				return;
-			}
-			f = FTS_QF_WEIGHTED;
-			dist = tok.weightmask;
-		}
-		emit_dist(st, FTS_QI_VAL, 0, tok.term, tok.termlen, f, dist);
-	}
+		emit_term(st, &tok);
 	else
 	{
 		st->error = true;
@@ -587,6 +717,7 @@ parse_unary(ParseState *st)
 {
 	Token		tok = peek(st);
 
+	check_stack_depth();
 	if (tok.kind == TOK_NOT)
 	{
 		(void) next_token(st);
@@ -597,11 +728,48 @@ parse_unary(ParseState *st)
 		parse_primary(st);
 }
 
-/* and_expr := unary ( AND? unary )*  (implicit AND between adjacent terms) */
+/* Proximity binds tighter than AND and accepts grouped Boolean operands. */
+static void
+parse_proximity(ParseState *st)
+{
+	int			start = st->nitems;
+	int			i;
+
+	parse_unary(st);
+	while (peek(st).kind == TOK_PROX)
+	{
+		Token		tok = next_token(st);
+
+		if (tok.op != FTS_OP_EXACT &&
+			(!parse_distance(tok.term + 2, tok.termlen - 2, &tok.distance) ||
+			 tok.distance == 0))
+		{
+			st->error = true;
+			return;
+		}
+
+		parse_unary(st);
+		/* OR and proximity retain matching spans; AND/NOT do not. */
+		for (i = start; i < st->nitems; i++)
+		{
+			if (st->items[i].type != FTS_QI_OPR)
+				continue;
+			if (st->items[i].op == FTS_OP_AND ||
+				st->items[i].op == FTS_OP_NOT)
+				st->error = true;
+		}
+		if (st->error)
+			return;
+		emit_dist(st, FTS_QI_OPR, tok.op, NULL, 0, 0, tok.distance);
+		start = st->nitems;		/* earlier operands have already been checked */
+	}
+}
+
+/* and_expr := proximity ( AND? proximity )* */
 static void
 parse_and(ParseState *st)
 {
-	parse_unary(st);
+	parse_proximity(st);
 	for (;;)
 	{
 		Token		tok = peek(st);
@@ -609,7 +777,7 @@ parse_and(ParseState *st)
 		if (tok.kind == TOK_AND)
 		{
 			(void) next_token(st);
-			parse_unary(st);
+			parse_proximity(st);
 			emit(st, FTS_QI_OPR, FTS_OP_AND, NULL, 0, 0);
 		}
 		else if (tok.kind == TOK_TERM || tok.kind == TOK_NOT ||
@@ -617,7 +785,7 @@ parse_and(ParseState *st)
 				 tok.kind == TOK_NEAR)
 		{
 			/* implicit AND */
-			parse_unary(st);
+			parse_proximity(st);
 			emit(st, FTS_QI_OPR, FTS_OP_AND, NULL, 0, 0);
 		}
 		else
@@ -659,10 +827,12 @@ parse_or(ParseState *st)
  *   X & empty -> X      empty & X -> X       (AND drops the stopword side)
  *   X | empty -> X      empty | X -> X       (OR likewise; matches to_tsquery)
  *   !empty    -> empty                       (nothing to negate)
- *   X <-> empty / empty <-> X -> X           (phrase keeps the real operand;
- *                                             the adjacency gap is lost, but the
- *                                             query never becomes unsatisfiable)
+ *   X <-> empty / empty <-> X -> X           (carry the removed gap outward)
  *   empty (op) empty -> empty
+ *
+ * Exact phrase distances accumulate across removed stopwords, so
+ * (X <-> empty) <-> Y becomes X <2> Y.  As in PostgreSQL, a retained Boolean
+ * operator is a boundary for these adjustments; legacy p/N remains unchanged.
  *
  * A query that reduces entirely to empty yields a 0-item ftsquery, which
  * matches nothing -- consistent with to_tsquery('english','the') = '' @@ ... .
@@ -685,6 +855,7 @@ qnode_build(ParsedItem *items, int *pos)
 {
 	QNode	   *n;
 
+	check_stack_depth();
 	if (*pos < 0)
 		return NULL;
 	n = (QNode *) palloc0(sizeof(QNode));
@@ -710,33 +881,64 @@ qnode_build(ParsedItem *items, int *pos)
 
 /* Simplify a tree in place, folding away empty (stopword) subtrees. */
 static QNode *
-qnode_simplify(QNode *n)
+qnode_simplify(QNode *n, uint64 *leftgap, uint64 *rightgap)
 {
+	uint64		ll,
+				lr,
+				rl,
+				rr;
+
+	check_stack_depth();
+	*leftgap = *rightgap = 0;
 	if (n == NULL)
 		return NULL;
 	if (n->item >= 0)
 		return n;					/* leaf: emptiness marked by the caller */
-	n->left = qnode_simplify(n->left);
-	n->right = qnode_simplify(n->right);
+	n->left = qnode_simplify(n->left, &ll, &lr);
+	n->right = qnode_simplify(n->right, &rl, &rr);
 	if (n->op == FTS_OP_NOT)
 	{
 		if (n->left == NULL || n->left->empty)
 			n->empty = true;
+		*leftgap = ll;
+		*rightgap = lr;
 		return n;
 	}
 	{
 		bool		le = (n->left == NULL || n->left->empty);
 		bool		re = (n->right == NULL || n->right->empty);
+		bool		exact = (n->op == FTS_OP_EXACT);
 
 		if (le && re)
 		{
 			n->empty = true;
+			*leftgap = *rightgap = exact ? ll + n->distance + rl : Max(ll, rl);
 			return n;
 		}
 		if (le)
+		{
+			*leftgap = exact ? ll + n->distance + rl : rl;
+			*rightgap = rr;
 			return n->right;
+		}
 		if (re)
+		{
+			*leftgap = ll;
+			*rightgap = exact ? lr + n->distance + rr : lr;
 			return n->left;
+		}
+		if (exact)
+		{
+			uint64		distance = n->distance + lr + rl;
+
+			if (distance > FTS_MAX_PROX_DISTANCE)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("ftsquery phrase distance exceeds %u", FTS_MAX_PROX_DISTANCE)));
+			n->distance = (uint32) distance;
+			*leftgap = ll;
+			*rightgap = rr;
+		}
 		return n;
 	}
 }
@@ -745,6 +947,7 @@ qnode_simplify(QNode *n)
 static void
 qnode_flatten(QNode *n, ParsedItem *src, ParsedItem *out, int *k)
 {
+	check_stack_depth();
 	if (n == NULL || n->empty)
 		return;
 	if (n->item >= 0)
@@ -852,6 +1055,8 @@ fts_parse_query_cfg(const char *str, int len, Oid cfgId)
 			QNode	   *root = qnode_build(st.items, &pos);
 			QNode	  **stack = (QNode **) palloc(sizeof(QNode *) * st.nitems);
 			int			sp = 0;
+			uint64		leftgap,
+						rightgap;
 
 			if (root)
 				stack[sp++] = root;
@@ -869,7 +1074,7 @@ fts_parse_query_cfg(const char *str, int len, Oid cfgId)
 						stack[sp++] = nd->right;
 				}
 			}
-			root = qnode_simplify(root);
+			root = qnode_simplify(root, &leftgap, &rightgap);
 			{
 				ParsedItem *out = (ParsedItem *) palloc(sizeof(ParsedItem) * st.nitems);
 				int			k = 0;
@@ -966,9 +1171,9 @@ to_ftsquery_byid(PG_FUNCTION_ARGS)
 }
 
 /*
- * Render an ftsquery as fully parenthesised infix for display/debugging.  (Note
- * the phrase operator prints as ` <-> `, which the query lexer does not accept
- * as input -- the rendering is human-readable, not a guaranteed round-trip.)
+ * Render an ftsquery as fully parenthesised infix for display/debugging.
+ * Ordered and unordered proximity print with their exact distances so the
+ * output can be parsed back without changing the query's meaning.
  * Postfix RPN is walked with a small string stack.
  */
 Datum
@@ -1020,7 +1225,7 @@ ftsquery_out(PG_FUNCTION_ARGS)
 				appendStringInfoChar(&s, '*');
 			else if (it->flags & FTS_QF_FUZZY)
 				appendStringInfo(&s, "~%u", it->distance);
-			else if (it->flags & FTS_QF_WEIGHTED)
+			if (it->flags & FTS_QF_WEIGHTED)
 			{
 				/* render the weight mask as :A/B/C/D (high labels first) */
 				appendStringInfoChar(&s, ':');
@@ -1057,8 +1262,14 @@ ftsquery_out(PG_FUNCTION_ARGS)
 					opstr = " | ";
 					break;
 				case FTS_OP_PHRASE:
+					opstr = NULL;
+					break;
+				case FTS_OP_WITHIN:
+				case FTS_OP_EXACT:
+					opstr = NULL;
+					break;
 				default:
-					opstr = " <-> ";
+					opstr = " ? ";
 					break;
 			}
 			Assert(top >= 2);
@@ -1066,7 +1277,16 @@ ftsquery_out(PG_FUNCTION_ARGS)
 			appendStringInfoChar(&s, '(');
 			appendBinaryStringInfo(&s, stack[top - 2].data,
 								   stack[top - 2].len);
-			appendStringInfoString(&s, opstr);
+			if (opstr != NULL)
+				appendStringInfoString(&s, opstr);
+			else if (it->op == FTS_OP_EXACT && it->distance == 1)
+				appendStringInfoString(&s, " <-> ");
+			else if (it->op == FTS_OP_EXACT)
+				appendStringInfo(&s, " <%u> ", it->distance);
+			else
+				appendStringInfo(&s, " %c/%u ",
+								 (it->op == FTS_OP_WITHIN) ? 'w' : 'p',
+								 it->distance);
 			appendBinaryStringInfo(&s, stack[top - 1].data,
 								   stack[top - 1].len);
 			appendStringInfoChar(&s, ')');
@@ -1104,6 +1324,7 @@ ftsquery_recv(PG_FUNCTION_ARGS)
 	Size		textbytes = 0;
 	uint32		off = 0;
 	uint32		i;
+	uint32		depth = 0;
 
 	version = (uint16) pq_getmsgint(buf, 2);
 	if (version != FTS_QUERY_VERSION)
@@ -1140,6 +1361,28 @@ ftsquery_recv(PG_FUNCTION_ARGS)
 		if (types[i] == FTS_QI_VAL)
 		{
 			const char *t;
+			uint16		patterns = flags[i] &
+				(FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX);
+
+			/* Binary input must obey the same modifier rules as emit_term.
+			 * Otherwise candidate generation and the span matcher can give
+			 * different meanings to the same leaf (e.g. PREFIX | FUZZY). */
+			if (ops[i] != 0 ||
+				(flags[i] & ~(FTS_QF_PREFIX | FTS_QF_FUZZY |
+							  FTS_QF_REGEX | FTS_QF_WEIGHTED)) != 0 ||
+				(patterns & (patterns - 1)) != 0 ||
+				((flags[i] & FTS_QF_WEIGHTED) &&
+				 (patterns & (FTS_QF_FUZZY | FTS_QF_REGEX))))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						 errmsg("invalid ftsquery term modifiers")));
+			if ((flags[i] & FTS_QF_WEIGHTED) ?
+				(dists[i] == 0 || dists[i] > 15) :
+				((flags[i] & FTS_QF_FUZZY) ?
+				 (dists[i] == 0 || dists[i] > INT_MAX) : dists[i] != 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						 errmsg("invalid ftsquery term distance or weight mask")));
 
 			lens[i] = pq_getmsgint(buf, 4);
 			if (lens[i] < 0)
@@ -1150,19 +1393,45 @@ ftsquery_recv(PG_FUNCTION_ARGS)
 			terms[i] = (char *) palloc(lens[i]);
 			memcpy(terms[i], t, lens[i]);
 			textbytes += lens[i];
+			depth++;
 		}
 		else
 		{
 			if (types[i] != FTS_QI_OPR ||
 				(ops[i] != FTS_OP_NOT && ops[i] != FTS_OP_AND &&
-				 ops[i] != FTS_OP_OR && ops[i] != FTS_OP_PHRASE))
+				 ops[i] != FTS_OP_OR && ops[i] != FTS_OP_PHRASE &&
+				 ops[i] != FTS_OP_WITHIN && ops[i] != FTS_OP_EXACT))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
 						 errmsg("invalid ftsquery item")));
+			/* Older tsquery casts wrote 1 in the unused AND/OR distance
+			 * field. Accept that valid legacy representation and normalize it. */
+			if ((ops[i] == FTS_OP_AND || ops[i] == FTS_OP_OR) && dists[i] == 1)
+				dists[i] = 0;
+			if (flags[i] != 0 ||
+				((ops[i] == FTS_OP_NOT || ops[i] == FTS_OP_AND ||
+				  ops[i] == FTS_OP_OR) && dists[i] != 0) ||
+				(ops[i] == FTS_OP_WITHIN && dists[i] == 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						 errmsg("invalid ftsquery operator flags or distance")));
+			/* Old tsquery casts of <0> emitted PHRASE(0). Preserve its
+			 * historical always-false result, rather than reinterpret it as
+			 * EXACT(0). The text parser still rejects p/0. */
 			lens[i] = 0;
 			terms[i] = NULL;
+			if (depth < (ops[i] == FTS_OP_NOT ? 1u : 2u))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+						 errmsg("invalid ftsquery operator operands")));
+			if (ops[i] != FTS_OP_NOT)
+				depth--;
 		}
 	}
+	if (depth != (nitems == 0 ? 0u : 1u))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+				 errmsg("invalid ftsquery expression")));
 
 	{
 		Size		total = FTS_QUERY_HDRSIZE +

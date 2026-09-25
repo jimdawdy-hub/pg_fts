@@ -143,7 +143,7 @@
           pkgs.stdenv.mkDerivation {
             name = "pg_fts-installcheck-${pg.version}";
             src = ./.;
-            nativeBuildInputs = [ (pgWith pg) pg.pg_config pkgs.perl pkgs.perlPackages.IPCRun ];
+            nativeBuildInputs = [ (pgWith pg) pg.pg_config pkgs.perl pkgs.perlPackages.IPCRun pkgs.python3 ];
             dontInstall = true;
             buildPhase = ''
               export PGDATA=$TMPDIR/pgdata
@@ -156,6 +156,7 @@
                 PG_CONFIG=${pg.pg_config}/bin/pg_config \
                 PGHOST=$TMPDIR PGUSER=postgres PGPORT=$PGPORT \
                 || { cat regression.diffs 2>/dev/null; cat output_iso/regression.diffs 2>/dev/null; exit 1; }
+              PGUSER=postgres python3 test/query_binary.py --local
               pg_ctl -D "$PGDATA" -w stop
               touch $out
             '';

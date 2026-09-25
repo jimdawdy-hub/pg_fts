@@ -41,6 +41,7 @@
 #include "postgres.h"
 
 #include "pg_fts.h"
+#include "mb/pg_wchar.h"
 #include "pg_fts_docvalid.h"
 #include "catalog/pg_collation.h"
 #include "lib/stringinfo.h"
@@ -754,27 +755,14 @@ fts_doc_has_prefix(FtsDoc doc, const char *prefix, int prefixlen)
 /*
  * fts_doc_has_fuzzy -- does any doc term lie within edit distance k of `term`?
  * Uses core's varstr_levenshtein_less_equal (bounded, so cheap for small k),
- * with two pre-filters to avoid the distance computation on most candidates:
- * a length filter (||cand|-|q|| <= k) and, when the query has more than k
- * trigrams (pigeonhole), a trigram-overlap filter.
+ * with a character-count lower bound to avoid unnecessary computations.
  */
 bool
 fts_doc_has_fuzzy(FtsDoc doc, const char *term, int termlen, int k)
 {
 	FtsTermEntry *entries = FTS_DOC_ENTRIES(doc);
 	uint32		i;
-	uint32		qtrg[FTS_MAX_TRIGRAMS];
-	int			nqtrg;
-	bool		use_trgm;
-
-	/*
-	 * Trigram pre-filter: a term within k edits of the query must share a
-	 * trigram with it, provided the query has more than k trigrams (pigeonhole).
-	 * When it does not, the filter is unsound, so we skip it and scan fully --
-	 * results stay correct, only speed varies.
-	 */
-	nqtrg = fts_trigrams(term, termlen, qtrg, FTS_MAX_TRIGRAMS);
-	use_trgm = (nqtrg > k);
+	int			qchars = pg_mbstrlen_with_len(term, termlen);
 
 	for (i = 0; i < doc->nterms; i++)
 	{
@@ -782,19 +770,10 @@ fts_doc_has_fuzzy(FtsDoc doc, const char *term, int termlen, int k)
 		int			candlen = entries[i].len;
 		int			d;
 
-		/* length difference alone can exceed k -> skip without computing */
-		if (abs(candlen - termlen) > k)
+		/* Character counts are a sound lower bound; byte lengths and the old
+		 * trigram overlap heuristic can discard genuine one-character edits. */
+		if (abs(pg_mbstrlen_with_len(cand, candlen) - qchars) > k)
 			continue;
-
-		/* trigram pre-filter: skip candidates that share no trigram */
-		if (use_trgm)
-		{
-			uint32		ctrg[FTS_MAX_TRIGRAMS];
-			int			nctrg = fts_trigrams(cand, candlen, ctrg, FTS_MAX_TRIGRAMS);
-
-			if (!fts_trigrams_overlap(qtrg, nqtrg, ctrg, nctrg))
-				continue;
-		}
 
 		d = varstr_levenshtein_less_equal(term, termlen, cand, candlen,
 										  1, 1, 1, k, true);
