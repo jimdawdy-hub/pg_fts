@@ -190,6 +190,24 @@ RETURNS float8
 AS 'MODULE_PATHNAME', 'fts_bm25f'
 LANGUAGE C IMMUTABLE PARALLEL SAFE;
 
+-- Zone-weighted BM25 over a single labeled ftsdoc (field boost): weights is
+-- one float8 per zone A,B,C,D (missing zones default to 1.0; at most four).
+-- Per-zone term frequencies sum as zone weight x zone tf before the ordinary
+-- tf-saturation.  This boosts zones within one concatenated labeled ftsdoc;
+-- for multi-document field weighting with per-field length norms use fts_bm25f.
+CREATE FUNCTION fts_bm25(ftsdoc, ftsquery, n_docs float8, avgdl float8,
+                         dfs float8[], weights float8[])
+RETURNS float8
+AS 'MODULE_PATHNAME', 'fts_bm25_w'
+LANGUAGE C IMMUTABLE PARALLEL SAFE;
+
+-- Zone-weighted BM25 distance (1/(1+score)) for ORDER BY, agreeing with
+-- fts_bm25(doc, query, 1.0, doclen, NULL, weights) under the same weights.
+CREATE FUNCTION fts_distance(ftsdoc, ftsquery, weights float8[])
+RETURNS float8
+AS 'MODULE_PATHNAME', 'fts_distance_w'
+LANGUAGE C IMMUTABLE PARALLEL SAFE;
+
 --
 -- Highlighting and snippets.
 --

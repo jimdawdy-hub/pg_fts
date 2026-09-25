@@ -3069,3 +3069,182 @@ SELECT to_ftsdoc('simple', 'only a here')
        @@@ to_ftsquery('simple', 'a ' || chr(45) || 'b') AS neg_matches_when_absent;
 SELECT to_ftsdoc('simple', 'a and b here')
        @@@ to_ftsquery('simple', 'a ' || chr(45) || 'b') AS neg_excludes_when_present;
+
+-- ============================================================================
+-- Ranked-path field exclusion (term:LABEL through the top-k scan).
+-- fts_search and the ORDER BY <=> (amcanorderbyop) path admit candidates via
+-- bm25_topk_visible; its pure-or / pure-boolean gates match on term PRESENCE
+-- and ignored FTS_QF_WEIGHTED, so a body-zone (C) or unlabelled match for
+-- `vacuum:A` was admitted to the ranked top-k even though @@@ excludes it.
+-- These assertions pin exclusion on the ranked path itself (covers AE3's
+-- restriction half).
+-- ============================================================================
+CREATE TABLE zrank (id serial, d ftsdoc);
+INSERT INTO zrank(d) VALUES
+ (to_ftsdoc('english','vacuum tuning','A') || to_ftsdoc('english','locks and contention','C')),
+ (to_ftsdoc('english','lock contention','A') || to_ftsdoc('english','run vacuum often','C')),
+ (to_ftsdoc('english','vacuum and locks','A') || to_ftsdoc('english','vacuum in body too','C')),
+ (to_ftsdoc('english','vacuum in the wild')),
+ (to_ftsdoc('english','boost here','A') || to_ftsdoc('english','vacuum words','B'));
+CREATE INDEX zrank_fts ON zrank USING fts (d) WITH (positions = on);
+SET enable_seqscan = off;
+-- fts_search top-k with term:A returns only A-labelled vacuum docs (1, 3);
+-- body-only (2) and unlabelled (4) must be excluded (pure-or gate branch)
+SELECT (SELECT array_agg(s.id ORDER BY s.id)
+        FROM fts_search('zrank_fts', to_ftsquery('english','vacuum:A'), 10) r
+        JOIN zrank s ON s.ctid = r.ctid) = ARRAY[1,3] AS search_A_excludes_out_of_field;
+-- multi-label term:AB admits the B-labelled vacuum doc too (1, 3, 5)
+SELECT (SELECT array_agg(s.id ORDER BY s.id)
+        FROM fts_search('zrank_fts', to_ftsquery('english','vacuum:AB'), 10) r
+        JOIN zrank s ON s.ctid = r.ctid) = ARRAY[1,3,5] AS search_AB_admits_A_and_B;
+-- the unlabelled doc (4) is absent from term:A top-k even though it carries vacuum
+SELECT NOT EXISTS (
+  SELECT 1 FROM fts_search('zrank_fts', to_ftsquery('english','vacuum:A'), 10) r
+  JOIN zrank s ON s.ctid = r.ctid WHERE s.id = 4) AS unlabeled_excluded;
+-- mixed weighted boolean (vacuum:A & locks) admits 1 and 3 only (bool-gate branch);
+-- presence-only gating would also admit 2 (lock stem present, vacuum out of field)
+SELECT (SELECT array_agg(s.id ORDER BY s.id)
+        FROM fts_search('zrank_fts', to_ftsquery('english','vacuum:A & locks'), 10) r
+        JOIN zrank s ON s.ctid = r.ctid) = ARRAY[1,3] AS search_bool_excludes_out_of_field;
+-- the harness shape (WHERE @@@ ORDER BY <=> LIMIT) returns only A-labelled docs
+SELECT (SELECT array_agg(id ORDER BY id) FROM (
+          SELECT id FROM zrank WHERE d @@@ to_ftsquery('english','vacuum:A')
+          ORDER BY d <=> to_ftsquery('english','vacuum:A') LIMIT 10) z) = ARRAY[1,3]
+       AS ordered_A_excludes_out_of_field;
+-- index and seq scans return the same id set for the ranked term:A query
+SELECT array_agg(id ORDER BY id) AS rank_A_idx FROM (
+  SELECT id FROM zrank WHERE d @@@ to_ftsquery('english','vacuum:A')
+  ORDER BY d <=> to_ftsquery('english','vacuum:A') LIMIT 10) z;
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT array_agg(id ORDER BY id) AS rank_A_seq FROM (
+  SELECT id FROM zrank WHERE d @@@ to_ftsquery('english','vacuum:A')
+  ORDER BY d <=> to_ftsquery('english','vacuum:A') LIMIT 10) z;
+RESET enable_indexscan; RESET enable_bitmapscan; RESET enable_seqscan;
+DROP TABLE zrank;
+
+-- ============================================================================
+-- Field-weighted ranking (weights overloads, KTD2): fts_bm25(..., weights) and
+-- fts_distance(ftsdoc, ftsquery, weights).  Per-zone weighted tf (sum of zone
+-- weight x zone tf) feeds the existing tf-saturation; boost changes order only
+-- and never the match set.  weights is one float8 per zone A-D (index 0 = A);
+-- missing zones default to 1.0.  This is single-labeled-ftsdoc weighting, NOT
+-- multi-document BM25F (fts_bm25f keeps its per-field length normalization).
+-- Covers AE3's boost half.
+-- ============================================================================
+CREATE TABLE zw (id serial, d ftsdoc);
+INSERT INTO zw(d) VALUES
+ (to_ftsdoc('english','vacuum aa bb cc dd','A')),
+ (to_ftsdoc('english','vacuum aa bb cc dd','C')),
+ (to_ftsdoc('english','vacuum vacuum vacuum aa bb','D'));
+-- boost A: the A-zone match (1) ranks above the C-zone match (2) and takes first
+SELECT (SELECT id FROM zw
+        ORDER BY fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[4.0,1.0,1.0,1.0]), id
+        LIMIT 1) = 1 AS boost_a_ranks_first;
+-- boost C: symmetric flip -- the C-zone match (2) takes first
+SELECT (SELECT id FROM zw
+        ORDER BY fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[1.0,1.0,4.0,1.0]), id
+        LIMIT 1) = 2 AS boost_c_ranks_first;
+-- identity: all-1.0 weights score exactly like the unweighted scorers
+SELECT (SELECT bool_and(abs(fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[1.0,1.0,1.0,1.0])
+                           - fts_distance(d, to_ftsquery('english','vacuum'))) < 1e-12)
+        FROM zw) AS weights_one_scores_identity;
+-- identity: the unweighted ranking order is unchanged under all-1.0 weights
+SELECT (SELECT array_agg(id ORDER BY fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[1.0,1.0,1.0,1.0]), id) FROM zw)
+     = (SELECT array_agg(id ORDER BY fts_distance(d, to_ftsquery('english','vacuum')), id) FROM zw)
+       AS weights_one_order_identity;
+-- boost never adds or drops docs: the ranked set is identical across weightings
+SELECT (SELECT array_agg(id ORDER BY id) FROM (
+          SELECT id FROM zw ORDER BY fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[4.0,1.0,1.0,1.0]), id LIMIT 10) a)
+     = (SELECT array_agg(id ORDER BY id) FROM (
+          SELECT id FROM zw ORDER BY fts_distance(d, to_ftsquery('english','vacuum')), id LIMIT 10) b)
+       AS boost_preserves_match_set;
+-- a short weights array defaults the missing zones to 1.0 (ARRAY[4.0] == [4,1,1,1])
+SELECT (SELECT bool_and(abs(fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[4.0])
+                           - fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[4.0,1.0,1.0,1.0])) < 1e-12)
+        FROM zw) AS short_weights_default_one;
+-- weighted distance agrees with 1/(1 + weighted fts_bm25) under matching stats
+SELECT (SELECT bool_and(abs(fts_distance(d, to_ftsquery('english','vacuum'), ARRAY[4.0,1.0,1.0,1.0])
+                           - 1.0 / (1.0 + fts_bm25(d, to_ftsquery('english','vacuum'),
+                                                   1.0, 5.0, NULL::float8[], ARRAY[4.0,1.0,1.0,1.0]))) < 1e-12)
+        FROM zw) AS distance_matches_weighted_score;
+-- more than four weights is a caller error (zones are A-D)
+SELECT fts_distance(to_ftsdoc('english','vacuum'), to_ftsquery('english','vacuum'),
+                    ARRAY[1.0,1.0,1.0,1.0,1.0]) AS too_many_weights;
+DROP TABLE zw;
+
+-- ============================================================================
+-- Mixed-boolean positional phrase evaluation (U6, KTD1): a PHRASE subchain
+-- inside a boolean query must verify adjacency from stored index positions
+-- even when ANDed/ORed/negated with other terms.  The observable is
+-- pg_stat_user_indexes.idx_tup_read: positional evaluation delivers exactly
+-- the match set, while the pre-change presence-AND path over-generated (every
+-- doc holding the words in any order) and relied on a heap recheck to shrink.
+-- --------------------------------------------------------------------------
+CREATE TABLE zmix (id serial, d ftsdoc);
+INSERT INTO zmix(d) VALUES
+ (to_ftsdoc('simple','alpha bravo charlie')),
+ (to_ftsdoc('simple','charlie alpha x bravo')),
+ (to_ftsdoc('simple','alpha bravo delta')),
+ (to_ftsdoc('simple','bravo alpha charlie')),
+ (to_ftsdoc('simple','alpha bravo charlie extra'));
+CREATE INDEX zmix_fts ON zmix USING fts (d) WITH (positions = on);
+SET enable_seqscan = off;
+SET enable_bitmapscan = on;
+SET enable_indexscan = on;
+-- phrase ANDed with a plain term: exact results (identical on every path)
+SELECT array_agg(id ORDER BY id) = ARRAY[1,5] AS mixed_phrase_result
+  FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo" & charlie');
+-- ...and the AM delivers exactly the 2 matches (presence-AND delivers 4)
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset();
+SELECT count(*) FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo" & charlie');
+SELECT pg_stat_force_next_flush();
+SELECT idx_tup_read = 2 AS mixed_phrase_from_positions
+  FROM pg_stat_user_indexes WHERE indexrelname = 'zmix_fts';
+-- phrase ANDed with a disjunction: phrase {1,3,5} x (charlie|delta) = {1,3,5}
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3,5] AS mixed_or_result
+  FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo" & (charlie | delta)');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset();
+SELECT count(*) FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo" & (charlie | delta)');
+SELECT pg_stat_force_next_flush();
+SELECT idx_tup_read = 3 AS mixed_or_from_positions
+  FROM pg_stat_user_indexes WHERE indexrelname = 'zmix_fts';
+-- three-term phrase AND NOT: the chain is positional, the boolean structure holds
+SELECT array_agg(id ORDER BY id) = ARRAY[1,5] AS mixed_not_result
+  FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo charlie" & !delta');
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_reset();
+SELECT count(*) FROM zmix WHERE d @@@ to_ftsquery('simple','"alpha bravo charlie" & !delta');
+SELECT pg_stat_force_next_flush();
+SELECT idx_tup_read = 2 AS mixed_not_from_positions
+  FROM pg_stat_user_indexes WHERE indexrelname = 'zmix_fts';
+-- positions-off twin: identical results via the AND + heap-recheck fallback
+CREATE TABLE zmix_off (id serial, d ftsdoc);
+INSERT INTO zmix_off(d) SELECT d FROM zmix ORDER BY id;
+CREATE INDEX zmix_off_fts ON zmix_off USING fts (d);
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+SELECT (SELECT array_agg(id ORDER BY id) FROM zmix_off WHERE d @@@ to_ftsquery('simple','"alpha bravo" & charlie'))
+     = (SELECT array_agg(id ORDER BY id) FROM zmix    WHERE d @@@ to_ftsquery('simple','"alpha bravo" & charlie'))
+       AS off_twin_phrase_eq;
+SELECT (SELECT array_agg(id ORDER BY id) FROM zmix_off WHERE d @@@ to_ftsquery('simple','"alpha bravo" & (charlie | delta)'))
+     = (SELECT array_agg(id ORDER BY id) FROM zmix    WHERE d @@@ to_ftsquery('simple','"alpha bravo" & (charlie | delta)'))
+       AS off_twin_or_eq;
+SELECT (SELECT array_agg(id ORDER BY id) FROM zmix_off WHERE d @@@ to_ftsquery('simple','"alpha bravo charlie" & !delta'))
+     = (SELECT array_agg(id ORDER BY id) FROM zmix    WHERE d @@@ to_ftsquery('simple','"alpha bravo charlie" & !delta'))
+       AS off_twin_not_eq;
+RESET enable_indexscan; RESET enable_bitmapscan;
+-- position-fallback guard: a term whose positions overflow the posting block
+-- (4000 occurrences x 4 bytes > the default 8KB page) must fall back to the
+-- recheck path with the result set unchanged (non-adjacent doc 2 still out).
+CREATE TABLE zbig (id serial, d ftsdoc);
+INSERT INTO zbig(d) VALUES
+ (to_ftsdoc('simple', repeat('alpha ', 4000) || 'bravo charlie')),
+ (to_ftsdoc('simple','charlie alpha x bravo')),
+ (to_ftsdoc('simple','alpha bravo charlie'));
+CREATE INDEX zbig_fts ON zbig USING fts (d) WITH (positions = on);
+SET enable_seqscan = off;
+SELECT array_agg(id ORDER BY id) = ARRAY[1,3] AS overflow_fallback_ok
+  FROM zbig WHERE d @@@ to_ftsquery('simple','"alpha bravo" & charlie');
+RESET enable_seqscan;
+DROP TABLE zmix, zmix_off, zbig;

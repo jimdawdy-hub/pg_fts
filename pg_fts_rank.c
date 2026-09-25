@@ -109,16 +109,41 @@ fts_query_terms(FtsQuery q, const char ***terms_out, int **lens_out)
 }
 
 /*
+ * fts_weighted_tf -- per-zone weighted term frequency.
+ *
+ * wl is indexed by the in-position label 0..3 (D,C,B,A).  KTD contract: the
+ * weighted tf is the plain sum of zone weight x zone tf, fed into the ordinary
+ * tf-saturation afterwards -- this is single-labeled-ftsdoc field boosting,
+ * NOT multi-document BM25F (see fts_bm25f for per-field length norms).  A
+ * positionless (v3) doc reads as all-zone D.
+ */
+static double
+fts_weighted_tf(FtsDoc doc, const FtsTermEntry *e, const double *wl)
+{
+	double		tf = 0.0;
+	uint32		j;
+
+	if (!FTS_DOC_HAS_POS(doc))
+		return wl[0] * (double) e->tf;
+
+	for (j = 0; j < e->tf; j++)
+		tf += wl[FTS_POS_LABEL(FTS_DOC_TERMPOS(doc, e)[j])];
+	return tf;
+}
+
+/*
  * fts_bm25_score -- core scorer.
  *
  * dfs may be NULL, in which case every term is treated as having df = 1 (as if
  * it were rare); this yields a usable ranking when true df is unavailable.
  * When dfs is provided it must have one entry per distinct query term, in the
- * order fts_query_terms() returns them.
+ * order fts_query_terms() returns them.  wl, when non-NULL, replaces each raw
+ * tf with fts_weighted_tf() (field boost); NULL scores plain tf.
  */
 static double
 fts_bm25_score(FtsDoc doc, FtsQuery q, double N, double avgdl,
-			   const double *dfs, double k1, double b, BM25Variant variant)
+			   const double *dfs, double k1, double b, BM25Variant variant,
+			   const double *wl)
 {
 	const char **terms;
 	int		   *lens;
@@ -144,7 +169,7 @@ fts_bm25_score(FtsDoc doc, FtsQuery q, double N, double avgdl,
 		if (e == NULL)
 			continue;			/* term absent: contributes nothing */
 
-		tf = (double) e->tf;
+		tf = (wl != NULL) ? fts_weighted_tf(doc, e, wl) : (double) e->tf;
 		df = (dfs != NULL) ? dfs[i] : 1.0;
 		idf = bm25_idf(variant, N, df);
 
@@ -231,7 +256,7 @@ fts_bm25(PG_FUNCTION_ARGS)
 		N = 1.0;
 
 	score = fts_bm25_score(doc, q, N, avgdl, dfs,
-						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE);
+						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE, NULL);
 
 	PG_FREE_IF_COPY(doc, 0);
 	PG_FREE_IF_COPY(q, 1);
@@ -317,7 +342,7 @@ fts_bm25_opts(PG_FUNCTION_ARGS)
 	if (N < 1.0)
 		N = 1.0;
 
-	score = fts_bm25_score(doc, q, N, avgdl, dfs, k1, b, variant);
+	score = fts_bm25_score(doc, q, N, avgdl, dfs, k1, b, variant, NULL);
 
 	PG_FREE_IF_COPY(doc, 0);
 	PG_FREE_IF_COPY(q, 1);
@@ -480,7 +505,7 @@ fts_distance(PG_FUNCTION_ARGS)
 
 	/* N and avgdl unknown here; use N=1, avgdl=|D| so length term is neutral */
 	score = fts_bm25_score(doc, q, 1.0, (double) doc->doclen, NULL,
-						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE);
+						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE, NULL);
 
 	PG_FREE_IF_COPY(doc, 0);
 	PG_FREE_IF_COPY(q, 1);
@@ -503,9 +528,137 @@ fts_distance_commutator(PG_FUNCTION_ARGS)
 	doc = PG_GETARG_FTSDOC(1);
 
 	score = fts_bm25_score(doc, q, 1.0, (double) doc->doclen, NULL,
-						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE);
+						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE, NULL);
 
 	PG_FREE_IF_COPY(q, 0);
 	PG_FREE_IF_COPY(doc, 1);
+	PG_RETURN_FLOAT8(1.0 / (1.0 + score));
+}
+
+/*
+ * parse_zone_weights -- float8[] of per-zone weights -> wl[4] by label.
+ *
+ * Users order the array A,B,C,D (index 0 boosts zone A); wl is indexed by the
+ * in-position label 0..3 (D,C,B,A), so user index i lands at wl[3 - i].  Fewer
+ * than four entries leave the missing zones at 1.0; more than four is a caller
+ * error (zones are A-D).  A NULL weights array means all-1.0 (identity).
+ */
+static void
+parse_zone_weights(ArrayType *arr, double wl[4])
+{
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int			i;
+
+	wl[0] = wl[1] = wl[2] = wl[3] = 1.0;
+	if (arr == NULL)
+		return;
+	if (ARR_ELEMTYPE(arr) != FLOAT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("weights array must be float8[]")));
+	deconstruct_array(arr, FLOAT8OID, 8, true, 'd', &elems, &nulls, &n);
+	if (n > 4)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("weights must have at most 4 entries (zones A-D)")));
+	for (i = 0; i < n; i++)
+	{
+		if (!nulls[i])
+			wl[3 - i] = DatumGetFloat8(elems[i]);
+	}
+}
+
+/*
+ * SQL: fts_bm25(doc, query, n_docs float8, avgdl float8, dfs float8[],
+ *               weights float8[])
+ * Zone-weighted BM25 over a single labeled ftsdoc (field boost).  Identical to
+ * fts_bm25 except each term's tf becomes the per-zone weighted sum; all-1.0
+ * weights reproduce fts_bm25 exactly.
+ */
+PG_FUNCTION_INFO_V1(fts_bm25_w);
+
+Datum
+fts_bm25_w(PG_FUNCTION_ARGS)
+{
+	FtsDoc		doc;
+	FtsQuery	q;
+	double		N;
+	double		avgdl;
+	double	   *dfs = NULL;
+	int			ndfs = 0;
+	double		wl[4];
+	double		score;
+
+	/* non-STRICT: dfs and weights accept NULL; guard the required args */
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) ||
+		PG_ARGISNULL(2) || PG_ARGISNULL(3))
+		PG_RETURN_NULL();
+
+	doc = PG_GETARG_FTSDOC(0);
+	q = PG_GETARG_FTSQUERY(1);
+	N = PG_GETARG_FLOAT8(2);
+	avgdl = PG_GETARG_FLOAT8(3);
+
+	if (!PG_ARGISNULL(4))
+	{
+		ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(4);
+		Datum	   *elems;
+		bool	   *nulls;
+		int			i;
+
+		if (ARR_ELEMTYPE(arr) != FLOAT8OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("dfs array must be float8[]")));
+		deconstruct_array(arr, FLOAT8OID, 8, true, 'd',
+						  &elems, &nulls, &ndfs);
+		dfs = (double *) palloc(ndfs * sizeof(double));
+		for (i = 0; i < ndfs; i++)
+			dfs[i] = nulls[i] ? 1.0 : DatumGetFloat8(elems[i]);
+	}
+
+	parse_zone_weights(PG_ARGISNULL(5) ? NULL : PG_GETARG_ARRAYTYPE_P(5), wl);
+
+	if (N < 1.0)
+		N = 1.0;
+
+	score = fts_bm25_score(doc, q, N, avgdl, dfs,
+						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE, wl);
+
+	PG_FREE_IF_COPY(doc, 0);
+	PG_FREE_IF_COPY(q, 1);
+	PG_RETURN_FLOAT8(score);
+}
+
+/*
+ * SQL: fts_distance(doc, query, weights float8[]) -> float8
+ * Zone-weighted BM25 distance (1/(1+score)) for ORDER BY, matching
+ * fts_distance's N=1, avgdl=|D| convention so it agrees with
+ * fts_bm25(doc, query, 1.0, doclen, NULL, weights).
+ */
+PG_FUNCTION_INFO_V1(fts_distance_w);
+
+Datum
+fts_distance_w(PG_FUNCTION_ARGS)
+{
+	FtsDoc		doc;
+	FtsQuery	q;
+	double		wl[4];
+	double		score;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		PG_RETURN_NULL();
+	doc = PG_GETARG_FTSDOC(0);
+	q = PG_GETARG_FTSQUERY(1);
+
+	parse_zone_weights(PG_ARGISNULL(2) ? NULL : PG_GETARG_ARRAYTYPE_P(2), wl);
+
+	score = fts_bm25_score(doc, q, 1.0, (double) doc->doclen, NULL,
+						   BM25_DEFAULT_K1, BM25_DEFAULT_B, BM25_LUCENE, wl);
+
+	PG_FREE_IF_COPY(doc, 0);
+	PG_FREE_IF_COPY(q, 1);
 	PG_RETURN_FLOAT8(1.0 / (1.0 + score));
 }

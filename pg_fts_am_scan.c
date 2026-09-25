@@ -763,6 +763,96 @@ bm25_lookup_prefix(Relation index, const BM25SegMeta *seg,
 }
 
 /*
+ * Maximal PHRASE subchains for mixed-boolean positional evaluation (KTD1).
+ * A chain is the canonical left-deep phrase shape (v1 v2 PHRASE v3 PHRASE ...)
+ * appearing anywhere in the RPN stream -- not just as the whole query -- so
+ * `"a b" & c` verifies adjacency from stored index positions instead of
+ * presence-AND + heap recheck.  chain_of maps every item of a chain (its VALs
+ * and PHRASEs alike) to the chain's ordinal.  Shapes the positional engine
+ * cannot answer (flagged terms, non-VAL phrase operands, right-nested
+ * phrases, chains over FTS_QUERY_MAX_PHRASE_TERMS) keep chain_of = -1 and the
+ * evaluator falls back to presence-AND for them.
+ */
+typedef struct PhraseChain
+{
+	int			nterms;
+	int			termidx[FTS_QUERY_MAX_PHRASE_TERMS];
+	uint32		stepdist[FTS_QUERY_MAX_PHRASE_TERMS];
+	TidSet		set;			/* per-segment exact matches (scratch) */
+	bool		available;		/* false -> evaluator uses presence-AND */
+}			PhraseChain;
+
+static inline bool
+bm25_is_plain_val(FtsQueryItem *it)
+{
+	return it->type == FTS_QI_VAL &&
+		(it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX |
+					  FTS_QF_WEIGHTED)) == 0;
+}
+
+/*
+ * bm25_phrase_chains -- find every maximal left-deep PHRASE chain of plain
+ * VAL terms in the RPN stream.  chain_of must hold q->nitems ints.  Sets
+ * *all_chained false when any PHRASE operator lands outside a chain (such a
+ * query keeps the heap recheck).
+ */
+static int
+bm25_phrase_chains(FtsQuery q, int *chain_of, PhraseChain *chains,
+				   int maxchains, bool *all_chained)
+{
+	int			n = 0;
+	uint32		i;
+
+	for (i = 0; i < q->nitems; i++)
+		chain_of[i] = -1;
+
+	i = 0;
+	while (i + 2 < q->nitems)
+	{
+		int			nt = 0;
+
+		if (!bm25_is_plain_val(&q->items[i]) ||
+			!bm25_is_plain_val(&q->items[i + 1]) ||
+			q->items[i + 2].type != FTS_QI_OPR ||
+			q->items[i + 2].op != FTS_OP_PHRASE)
+		{
+			i++;
+			continue;
+		}
+		if (n >= maxchains)
+			break;				/* rest stays unmapped -> presence-AND + recheck */
+		chains[n].termidx[nt++] = (int) i;
+		chains[n].termidx[nt++] = (int) i + 1;
+		chains[n].stepdist[0] = q->items[i + 2].distance;
+		chain_of[i] = chain_of[i + 1] = chain_of[i + 2] = n;
+		i += 3;
+		while (nt < FTS_QUERY_MAX_PHRASE_TERMS && i + 1 < q->nitems &&
+			   bm25_is_plain_val(&q->items[i]) &&
+			   q->items[i + 1].type == FTS_QI_OPR &&
+			   q->items[i + 1].op == FTS_OP_PHRASE)
+		{
+			chains[n].termidx[nt] = (int) i;
+			chains[n].stepdist[nt - 1] = q->items[i + 1].distance;
+			chain_of[i] = chain_of[i + 1] = n;
+			nt++;
+			i += 2;
+		}
+		chains[n].nterms = nt;
+		chains[n].set.tids = NULL;
+		chains[n].set.n = 0;
+		chains[n].available = false;
+		n++;
+	}
+
+	*all_chained = true;
+	for (i = 0; i < q->nitems; i++)
+		if (q->items[i].type == FTS_QI_OPR && q->items[i].op == FTS_OP_PHRASE &&
+			chain_of[i] < 0)
+			*all_chained = false;
+	return n;
+}
+
+/*
  * Evaluate the query into a TidSet via a stack machine over the RPN items.
  * NOT is handled specially: a bare NOT is only meaningful as "a AND NOT b", so
  * we track whether each stack entry is "positive" (a TID set) or "negative"
@@ -778,7 +868,7 @@ typedef struct EvalVal
 
 static TidSet
 bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
-				TidSet universe)
+				TidSet universe, const int *chain_of, const PhraseChain *chains)
 {
 	EvalVal    *stack;
 	int			top = 0;
@@ -802,7 +892,15 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 		{
 			TidSet		s;
 
-			if (it->flags & FTS_QF_PREFIX)
+			if (chain_of != NULL && chain_of[i] >= 0 &&
+				chains[chain_of[i]].available)
+			{
+				/* positional chain placeholder: the chain's PHRASE op
+				 * supplies the exact set, so no postings lookup is needed */
+				s.tids = NULL;
+				s.n = 0;
+			}
+			else if (it->flags & FTS_QF_PREFIX)
 				bm25_lookup_prefix(index, seg,
 								   FTS_QUERY_ITEMTEXT(q, it), it->termlen, &s);
 			else if (!bm25_lookup_term(index, seg,
@@ -830,16 +928,25 @@ bm25_eval_query(Relation index, const BM25SegMeta *seg, FtsQuery q,
 			Assert(top >= 1);
 			stack[top - 1].negated = !stack[top - 1].negated;
 		}
-		else					/* AND / OR */
+		else					/* AND / OR / PHRASE */
 		{
 			EvalVal		b = stack[--top];
 			EvalVal		a = stack[--top];
 			EvalVal		res;
 
-			if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE)
+			if (it->op == FTS_OP_PHRASE && chain_of != NULL &&
+				chain_of[i] >= 0 && chains[chain_of[i]].available)
 			{
-				/* PHRASE is treated as AND for candidate generation; the
-				 * bitmap heap recheck (@@@) enforces adjacency exactly. */
+				/* maximal chain answered positionally: its exact set
+				 * replaces whatever the chain's intermediate ops pushed */
+				res.set = chains[chain_of[i]].set;
+				res.negated = false;
+			}
+			else if (it->op == FTS_OP_AND || it->op == FTS_OP_PHRASE)
+			{
+				/* PHRASE without a positional answer is treated as AND for
+				 * candidate generation; the heap recheck (@@@) enforces
+				 * adjacency exactly. */
 				if (!a.negated && !b.negated)
 				{
 					res.set = tidset_and(a.set, b.set);
@@ -1812,6 +1919,15 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 	uint32	   *acc = (uint32 *) palloc(BM25_PHRASE_POSBUF * sizeof(uint32));
 	uint32	   *tmp = (uint32 *) palloc(BM25_PHRASE_POSBUF * sizeof(uint32));
 
+	if (nterms < 1)
+	{
+		/* nothing positional to evaluate (callers always pass >= 2) */
+		pfree(tl);
+		pfree(acc);
+		pfree(tmp);
+		return false;
+	}
+
 	for (t = 0; t < nterms; t++)
 	{
 		FtsQueryItem *it = &q->items[termidx[t]];
@@ -1918,6 +2034,11 @@ typedef struct BM25CollectCtx
 	ItemPointerData *ptids;
 	int			nptids;
 	int			captids;
+	/* mixed-boolean positional chains (query map, per-segment sets) */
+	int		   *chain_of;
+	PhraseChain *chains;
+	int			nchains;
+	bool		phrase_all_chained;
 	/* accumulators */
 	TidSet		acc;
 	bool		need_recheck;
@@ -2077,17 +2198,58 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
 	}
 
 	{
-		TidSet		result = bm25_eval_query(index, sg, query, universe);
+		TidSet		result;
+		bool		phrase_exact = ctx->phrase_all_chained;
+		int			c;
+
+		/*
+		 * Mixed-boolean positional phrase evaluation (KTD1): answer each
+		 * maximal PHRASE subchain from this segment's stored positions so
+		 * adjacency is enforced from the index.  A chain whose positions are
+		 * missing (page-overflow block) or too long for the bounded buffer
+		 * falls back to presence-AND in the evaluator and forces the recheck
+		 * below -- correct, just slower.
+		 */
+		for (c = 0; c < ctx->nchains; c++)
+		{
+			PhraseChain *pc = &ctx->chains[c];
+			ItemPointerData *tids = NULL;
+			int			ntids = 0;
+			int			captids = 0;
+
+			pc->available = false;
+			pc->set.tids = NULL;
+			pc->set.n = 0;
+			captids = 16;
+			tids = (ItemPointerData *) palloc(captids * sizeof(ItemPointerData));
+			if (bm25_phrase_eval_seg(index, sg, query, pc->termidx,
+									 pc->stepdist, pc->nterms,
+									 &tids, &ntids, &captids))
+			{
+				pc->set.tids = tids;
+				pc->set.n = ntids;
+				pc->available = true;
+			}
+			else
+			{
+				pfree(tids);
+				phrase_exact = false;
+			}
+		}
+
+		result = bm25_eval_query(index, sg, query, universe,
+								 ctx->chain_of, ctx->chains);
 
 		if (result.n > 0)
 		{
 			bm25_filter_tombstoned_seg(ctx->seg_tombs, s, &result);
 			if (result.n > 0)
 			{
-				/* PHRASE/NEAR is evaluated as AND here (positions=off or a
-				 * non-pure-phrase query); the heap ftsdoc carries positions,
-				 * so a heap recheck of @@@ enforces adjacency exactly. */
-				if (ctx->has_phrase)
+				/* some PHRASE could not be answered positionally (positions
+				 * off, dropped, or an unmapped shape): presence-AND
+				 * over-generates, so the heap recheck of @@@ must enforce
+				 * adjacency exactly. */
+				if (ctx->has_phrase && !phrase_exact)
 					ctx->need_recheck = true;
 				ctx->acc = tidset_or(ctx->acc, result);
 			}
@@ -2203,6 +2365,10 @@ bm25_collect_matches(Relation index, FtsQuery query, TidSet *out, bool *recheck)
 	ItemPointerData *ptids = NULL;
 	int			nptids = 0;
 	int			captids = 0;
+	int		   *chain_of = NULL;
+	PhraseChain *chains = NULL;
+	int			nchains = 0;
+	bool		phrase_all_chained = false;
 	uint32		i;
 	uint32		s;
 	uint32		gen0;			/* directory generation at the metapage snapshot */
@@ -2283,6 +2449,25 @@ collect_retry:
 		bm25_phrase_chain(query, pterm, pstep, &npterm))
 		use_pos_phrase = true;
 
+	/* maximal PHRASE subchains for the mixed-boolean positional path (the
+	 * pure-chain fast path above may SEG_RESTART into the general evaluator,
+	 * which consumes these; when positions are off every chain stays
+	 * unmapped/unevaluable and behaviour is the historical AND + recheck) */
+	if (has_phrase && bm25_index_wants_positions(index) && query->nitems > 0)
+	{
+		chain_of = (int *) palloc(query->nitems * sizeof(int));
+		chains = (PhraseChain *) palloc(query->nitems * sizeof(PhraseChain));
+		nchains = bm25_phrase_chains(query, chain_of, chains,
+									 (int) query->nitems, &phrase_all_chained);
+	}
+	else
+	{
+		chain_of = NULL;
+		chains = NULL;
+		nchains = 0;
+		phrase_all_chained = false;
+	}
+
 	/*
 	 * Load per-segment tombstones once.  Each segment's match contribution is
 	 * filtered against THAT segment's own tombstone map before being unioned,
@@ -2306,6 +2491,10 @@ collect_retry:
 		ctx.ptids = ptids;
 		ctx.nptids = nptids;
 		ctx.captids = captids;
+		ctx.chain_of = chain_of;
+		ctx.chains = chains;
+		ctx.nchains = nchains;
+		ctx.phrase_all_chained = phrase_all_chained;
 		ctx.acc = acc;
 		ctx.need_recheck = need_recheck;
 
@@ -3308,7 +3497,7 @@ docid_admitted(const DocidFilter *f, uint64 docid)
 /*
  * fts_query_is_pure_or: true iff the query's boolean structure is a plain
  * disjunction of plain terms -- only OR operators, and every operand is an
- * exact term (no PREFIX/FUZZY/REGEX flag, no AND/NOT/PHRASE).  For such a
+ * exact term (no PREFIX/FUZZY/REGEX/WEIGHTED flag, no AND/NOT/PHRASE).  For
  * query the WAND term-disjunction == the @@@ match set, so the ranked scan
  * needs no membership filter.  Any other shape (AND/NOT/PHRASE, or a
  * prefix/fuzzy/regex operand, whose contribution the scorer flattens but @@@
@@ -3327,8 +3516,10 @@ fts_query_is_pure_or(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX))
-				return false;
+			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX |
+							 FTS_QF_WEIGHTED))
+				return false;	/* WEIGHTED: the index masks labels at build, so
+								 * term presence cannot enforce term:LABEL */
 		}
 		else					/* operator */
 		{
@@ -3341,7 +3532,8 @@ fts_query_is_pure_or(FtsQuery q)
 
 /*
  * fts_query_is_pure_boolean: true iff the query is a boolean combination
- * (AND/OR/NOT, no PHRASE/NEAR) of PLAIN term operands (no PREFIX/FUZZY/REGEX).
+ * (AND/OR/NOT, no PHRASE/NEAR) of PLAIN term operands (no PREFIX/FUZZY/REGEX/
+ * WEIGHTED).
  * For such a query, a doc's @@@ membership is a pure function of WHICH query
  * terms are present in the doc -- exactly what the WAND scan knows at each
  * pivot (which cursors sit at the pivot docid).  So membership can be decided
@@ -3366,8 +3558,10 @@ fts_query_is_pure_boolean(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX))
-				return false;
+			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX |
+							 FTS_QF_WEIGHTED))
+				return false;	/* WEIGHTED: the index masks labels at build, so
+								 * term presence cannot enforce term:LABEL */
 		}
 		else					/* operator */
 		{

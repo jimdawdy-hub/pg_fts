@@ -2,6 +2,44 @@
 
 All notable changes to pg_fts are documented here.
 
+## Unreleased
+
+**Legal phrase speed and field queries.** A query mixing a quoted phrase with other
+terms (`"motion to dismiss" & affidavit`) verified word order by re-reading every
+candidate document.
+Phrase subchains are now answered from the index's stored positions inside any boolean
+query. No on-disk format change; **no REINDEX required**.
+
+### Added
+
+- **Zone-weighted scoring overloads** for field boost on ranked queries:
+  `fts_bm25(ftsdoc, ftsquery, n_docs, avgdl, dfs[], weights[])` and
+  `fts_distance(ftsdoc, ftsquery, weights[])`. Per-zone weighted tf (weights ordered
+  A,B,C,D; missing zones default to 1.0) feeds the ordinary saturation; all-1.0 weights
+  reproduce the unweighted scores exactly, and boost changes order only. Single labeled
+  `ftsdoc` boosting; multi-document field weighting remains `fts_bm25f`. Experimental
+  until a real consumer exercises it.
+
+### Fixed
+
+- **Mixed-boolean positional phrase evaluation.** `bm25_phrase_chains` finds each
+  maximal phrase chain in a query's RPN and `bm25_eval_query` substitutes its exact
+  match set (evaluated per segment from stored positions) at the chain's PHRASE nodes,
+  so `"a b" & c` and `"a b" & (c | d)` verify adjacency from the index instead of a
+  heap recheck. `make installcheck` green.
+- **Ranked top-k admitted out-of-field matches for `term:A` queries.** The
+  pure-or/pure-boolean admission gates did not treat weight-restricted terms as
+  non-plain (the index masks zone labels at build), so index and seq scans could
+  disagree on the same query. Weighted terms now route through the exact
+  collect+recheck path.
+
+### Known issues
+
+- Token ordinals clamp at 16,383 (the tsvector position limit leaks into `to_ftsdoc`);
+  long documents get non-ascending per-term positions and `ftsdoc || ftsdoc` refuses
+  them. Tail phrase matching on long documents is degraded on every path. Tracked for
+  an analyzer fix (emit true ordinals; ftsdoc position words have 30 bits).
+
 ## 1.8.3 - 2026-09-18
 
 **Correctness release: two deadlocks that shipped in every prior version, found while
