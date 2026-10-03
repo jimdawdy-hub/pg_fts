@@ -42,11 +42,26 @@ Releases are **tag-triggered**. The version lives in `META.json` and
 4. **Known issues ship as known issues** -- a CHANGELOG entry with a reproduction
    and the measured size of the problem -- never silently carried, and never
    "fixed" by a design change rushed into a correctness release.
-5. Tag and push (Codeberg is `origin`; it auto-mirrors to the GitHub mirror):
+5. Tag, then push **main before the tag, and to GitHub directly -- never via the
+   mirror**:
    ```sh
-   git tag -a vX.Y.Z -m "pg_fts X.Y.Z — <summary>"
-   git push origin vX.Y.Z
+   git tag -a vX.Y.Z -m "pg_fts X.Y.Z -- <summary>"
+   git push origin main   && git push github main      # commit exists everywhere first
+   git push origin vX.Y.Z && git push github vX.Y.Z    # then the tag that points at it
+   git ls-remote github 'refs/tags/vX.Y.Z^{}'          # MUST print the release commit
    ```
+   (`github` = `git@github.com:gburd/pg_fts.git`; add it with `git remote add`.)
+
+   **Why the mirror is off the release path (2026-09-27, twice in one day).** The
+   Codeberg->GitHub mirror is not a race that resolves in seconds; on v1.8.5 it pushed
+   the tag and then stalled on `main` for over two hours. GitHub therefore had a
+   `v1.8.5` tag pointing at v1.8.4's commit, the release job ran **that commit's
+   workflow** (which predates the checkout guard, so the guard could not fire), built
+   `pg_fts-1.8.4.zip`, and only a filename mismatch stopped it publishing 1.8.4's code
+   as 1.8.5. **No in-workflow check can defend against this**, because a stale tag
+   selects a stale workflow. Pushing `main` then the tag directly makes "GitHub has
+   the commit before it sees the tag" true by construction. The in-workflow guard
+   stays as defence in depth.
 
 ## Storage / WAL / crash-recovery review checklist (per release)
 
@@ -176,6 +191,29 @@ out of the zip.
 `PGXN_USER`/`PGXN_PASSWORD` are set on the GitHub repo and verified working
 (2026-09-17: `v1.8.2` re-published via `workflow_dispatch`, HTTP 303, PGXN now
 at 1.8.2).  `PGORG_*` is not set; the announce step skips cleanly without it.
+
+**The mirror race, and why the workflow checks the checkout.** Codeberg mirrors `main`
+and a new tag to GitHub as separate ref updates, and GitHub's tag-push event can fire
+while `refs/tags/vX.Y.Z` there still resolves to the *previous* release's commit. On
+v1.8.4 the job checked out 1.8.3, built `pg_fts-1.8.3.zip`, and failed only because the
+filename did not match the tag -- had it matched, 1.8.3's code would have been published
+as 1.8.4. The workflow now refetches the tag until the checked-out `META.json` version
+equals the tag's version (bounded, 2 min) and **refuses to build** otherwise. The mirror also
+**double-fires** the tag-push event -- once at the racy resolution, once when it corrects
+the tag -- so a failed first run is normally followed by a successful second one within
+~10 minutes, and a manual re-dispatch then gets a benign `409 already published`. Read
+each run's own log; do not grep across runs. If a release fails at "Verify checkout
+matches the tag" and no second run appears, use the manual trigger below; do not touch
+the tag. Confirm on `api.pgxn.org` and diff the PGXN zip against the GitHub asset -- the
+1.8.4 artifacts were verified byte-identical (`sha256 dd836069...`).
+
+**If GitHub already has a WRONG tag** (points at a commit whose `META.json` is not the
+tag's version): this is the one case where deleting and re-pushing a tag is correct --
+it never pointed at what it claimed, and the annotated object on Codeberg is
+authoritative. Delete the empty Release the failed run created, then
+`git push github :refs/tags/vX.Y.Z && git push github vX.Y.Z`, then verify with
+`ls-remote ... '^{}'`. Done for v1.8.5; PGXN then received the right bytes
+(sha256 verified identical to the GitHub asset).
 
 **To re-publish an existing tag** (e.g. after a workflow fix), do not re-tag --
 that rewrites published history.  Use the manual trigger:

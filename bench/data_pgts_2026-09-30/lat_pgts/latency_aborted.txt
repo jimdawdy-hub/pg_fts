@@ -1,0 +1,4 @@
+pass=1 band=rare_k10 rows=10, median_last5=0.929 raw=[3.456 1.055 0.988 0.928 0.941 0.937 0.908 0.929 ]
+pass=1 band=mid_k10 rows=10, median_last5=1.148 raw=[3.559 1.207 1.138 1.218 1.206 1.099 1.148 1.144 ]
+pass=1 band=common_k10 rows=10, median_last5=11.258 raw=[14.542 11.364 11.329 11.258 11.234 11.281 11.250 11.261 ]
+pass=1 band=common_k100 rows=100, median_last5=13.682 raw=[17.662 13.770 13.691 13.682 13.689 13.706 13.603 13.639 ]

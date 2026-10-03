@@ -1,0 +1,17 @@
+== rare_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia'::bm25query)
+== common_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:year'::bm25query)
+== count_common
+Finalize Aggregate  (cost=461609.93..461609.94 rows=1 width=8)
+  ->  Gather  (cost=461609.72..461609.93 rows=2 width=8)
+        Workers Planned: 2
+        ->  Partial Aggregate  (cost=460609.72..460609.73 rows=1 width=8)
+              ->  Parallel Seq Scan on docs  (cost=0.00..460333.45 rows=110507 width=0)
+                    Filter: (content @@ '''year'''::tsquery)

@@ -170,11 +170,58 @@ static void bm25_collect_filter_split(Relation index, BM25ScanOpaque so,
 static int bm25_rank_filter(Relation index, FtsQuery rankq, TidSet *rows,
 							ScoredTid **hits_out);
 
-static int
-cmp_tid(const void *a, const void *b)
+/* last <=> distance returned by an ordering scan in this backend (see
+ * fts_reuse_distance in pg_fts_customscan.c) */
+double		fts_current_distance_value = 0.0;
+
+/*
+ * IDF for index-side scoring: the SAME formula and clamping as the heap-side
+ * scorer bm25_idf(BM25_LUCENE) in pg_fts_rank.c.  N is the LIVE corpus size
+ * (metapage ndocs, tombstones subtracted) but df is the dictionary df, which
+ * still counts tombstoned postings until a merge rewrites the segment.  After
+ * enough deletes df > N, the unclamped formula goes NEGATIVE, every score flips
+ * sign, and block-max WAND -- whose bounds assume non-negative contributions --
+ * returned the WORST documents as the top-k (found by the dense_score test,
+ * 2026-10-01; present in every release).  Clamping df to [1, N] keeps idf >= 0
+ * and makes index scores equal fts_bm25's.  See CHANGELOG 1.9.0.
+ */
+static inline double
+bm25_index_idf(double N, double df)
 {
-	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
+	if (df < 1.0)
+		df = 1.0;
+	if (df > N)
+		df = N;
+	return log(1.0 + (N - df + 0.5) / (df + 0.5));
 }
+
+/* GUC (1.9.0, C2): a single-term, single-segment ranked query whose df is at
+ * least this many postings is scored exhaustively (fts_search_dense1) instead of
+ * via WAND.  0 disables.  Registered in pg_fts_customscan.c. */
+int			pg_fts_dense_score_min_df = 32768;
+
+/*
+ * Inlined TID sort for tidset_sort_uniq (every collect path funnels through it).
+ * qsort + a function-pointer ItemPointerCompare was 75% of a ranked prefix
+ * query (perf, 2026-10-01): 52k TIDs, ~800k out-of-line compares.  Comparing
+ * the 48-bit (block, offset) key inline gives the same order.
+ */
+static inline int
+tid_key_cmp(const ItemPointerData *a, const ItemPointerData *b)
+{
+	uint64		ka = ((uint64) ItemPointerGetBlockNumberNoCheck(a) << 16) |
+		ItemPointerGetOffsetNumberNoCheck(a);
+	uint64		kb = ((uint64) ItemPointerGetBlockNumberNoCheck(b) << 16) |
+		ItemPointerGetOffsetNumberNoCheck(b);
+
+	return (ka > kb) - (ka < kb);
+}
+#define ST_SORT sort_tids_inline
+#define ST_ELEMENT_TYPE ItemPointerData
+#define ST_COMPARE(a, b) tid_key_cmp(a, b)
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
 
 static void
 tidset_sort_uniq(TidSet *s)
@@ -193,9 +240,9 @@ tidset_sort_uniq(TidSet *s)
 	}
 	if (s->n <= 1)
 		return;
-	qsort(s->tids, s->n, sizeof(ItemPointerData), cmp_tid);
+	sort_tids_inline(s->tids, s->n);
 	for (i = 0, j = 1; j < s->n; j++)
-		if (ItemPointerCompare(&s->tids[i], &s->tids[j]) != 0)
+		if (!ItemPointerEquals(&s->tids[i], &s->tids[j]))
 			s->tids[++i] = s->tids[j];
 	s->n = i + 1;
 }
@@ -253,7 +300,8 @@ bm25_tombstones_load(Relation index, const BM25MetaPageData *meta, BM25Tombstone
 		if (sg->livedocs != InvalidBlockNumber && sg->livedocslen > 0)
 		{
 			t->blobs[s] = bm25_read_blob(index, sg->livedocs, sg->livedocslen);
-			sm_open(&t->maps[s], (uint8_t *) t->blobs[s], sg->livedocslen);
+			bm25_sm_open_checked(index, sg->livedocs, "tombstone",
+								 &t->maps[s], t->blobs[s], sg->livedocslen);
 			t->present[s] = true;
 		}
 	}
@@ -1927,8 +1975,14 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 		 * WAND pass instead of a pass-then-recompute (which for a common-term
 		 * query is ~35ms vs ~12ms) -- a net reduction for typical "first page of
 		 * results" pagination.  Beyond 100, grow x4 (capped).
+		 *
+		 * 1.9.0: when the planner hook attached the query's LIMIT(+OFFSET) to the
+		 * ORDER BY Const (FtsQueryData.flags), start at exactly that k.  A deep k
+		 * keeps WAND's threshold low enough that no block can be skipped; the
+		 * hinted k is what lets block-max WAND prune.  Growth below is unchanged,
+		 * so pulling past the hint still returns every row in exact order.
 		 */
-		so->curk = 100;
+		so->curk = so->query->flags > 0 ? (int) so->query->flags : 100;
 		if ((double) so->curk > so->maxhits)
 			so->curk = Max((int) so->maxhits, 1);
 		so->nordered = bm25_topk_visible(scan->indexRelation, so->query,
@@ -1984,6 +2038,9 @@ bm25_gettuple(IndexScanDesc scan, ScanDirection dir)
 		dist.value = so->ordered[so->ordpos].score;
 		dist.isnull = false;
 		index_store_float8_orderby_distances(scan, &typ, &dist, false);
+		/* the planner may have replaced the target-list copy of this same
+		 * <=> expression with fts_current_distance(); see pg_fts_customscan.c */
+		fts_current_distance_value = dist.value;
 	}
 	so->ordpos++;
 	return true;
@@ -2325,6 +2382,51 @@ bm25_pospost_find(PosTermList *pl, uint64 docid)
 	return NULL;
 }
 
+/*
+ * Find the PosPosting for docid (NULL if absent), for an ASCENDING sequence of
+ * docids: gallop forward from *hint
+ * (the previous hit or insertion point) instead of binary-searching the whole
+ * list each time.  The phrase intersection drives docids in increasing order,
+ * so this makes the per-term probe O(log gap) rather than O(log n) -- the
+ * full-list binary search it replaced was ~18% of a positions=on ranked
+ * phrase query (perf, 2026-10-01).  Requires docid >= the previous call's
+ * docid; *hint only ever moves forward.
+ */
+static PosPosting *
+bm25_pospost_find_fwd(PosTermList *pl, uint64 docid, int *hint)
+{
+	int			lo = *hint,
+				step = 1,
+				hi;
+
+	if (lo >= pl->nposts)
+		return NULL;
+	/* gallop: find hi with posts[hi].docid >= docid */
+	hi = lo;
+	while (hi < pl->nposts && pl->posts[hi].docid < docid)
+	{
+		lo = hi + 1;
+		hi += step;
+		step <<= 1;
+	}
+	if (hi >= pl->nposts)
+		hi = pl->nposts - 1;
+	/* binary search in [lo, hi] for the first docid >= target */
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (pl->posts[mid].docid < docid)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	*hint = lo;
+	if (lo < pl->nposts && pl->posts[lo].docid == docid)
+		return &pl->posts[lo];
+	return NULL;
+}
+
 /* append one TID to a growable array (NULL when empty) */
 static void
 bm25_tidbuf_push(ItemPointerData **tids, int *ntids, int *captids,
@@ -2382,6 +2484,10 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 
 	/* For OR drive C; otherwise intersect from the smallest posting list. */
 	driver = tl[base].posts;
+	{
+		int			fwd[FTS_QUERY_MAX_PHRASE_TERMS];
+
+		memset(fwd, 0, sizeof(fwd));
 	for (di = 0; di < tl[base].nposts; di++)
 	{
 		uint64		docid = driver[di].docid;
@@ -2394,7 +2500,7 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 
 		for (t = 0; t < nterms; t++)
 		{
-			pp[t] = (t == base) ? &driver[di] : bm25_pospost_find(&tl[t], docid);
+			pp[t] = (t == base) ? &driver[di] : bm25_pospost_find_fwd(&tl[t], docid, &fwd[t]);
 			if (pp[t] == NULL && (or_anchor < 0 || t == or_anchor))
 			{
 				allpresent = false;
@@ -2464,6 +2570,7 @@ bm25_phrase_eval_seg(Relation index, const BM25SegMeta *seg, FtsQuery q,
 			bm25_tidbuf_push(tids, ntids, captids, tid);
 		}
 	}
+	}							/* fwd[] scope */
 
 done:
 	for (t = 0; t < nterms; t++)
@@ -3492,6 +3599,21 @@ fts_index_df(PG_FUNCTION_ARGS)
  */
 /* ----- document-at-a-time block-max WAND top-k (item 2) ----- */
 
+/*
+ * scored_worse(a, b): a ranks strictly below b under the final result order
+ * (score descending, then TID ascending -- cmp_scored_desc).  The top-k heaps
+ * evict the WORST entry by this order, so among equal-scored docs at the
+ * cut-off the lowest TIDs survive.  That makes every top-k batch a prefix of
+ * any larger batch, which the ordering scan's grow-and-resume depends on.
+ */
+static inline bool
+scored_worse(const ScoredTid *a, const ScoredTid *b)
+{
+	if (a->score != b->score)
+		return a->score < b->score;
+	return ItemPointerCompare((ItemPointer) &a->tid, (ItemPointer) &b->tid) > 0;
+}
+
 static int
 cmp_scored_desc(const void *a, const void *b)
 {
@@ -3502,6 +3624,14 @@ cmp_scored_desc(const void *a, const void *b)
 		return 1;
 	if (sa > sb)
 		return -1;
+	/*
+	 * Ties: ascending TID.  WAND admits a doc only when it STRICTLY beats the
+	 * threshold and walks docids ascending, so among equal scores the lowest
+	 * docids are the ones kept.  Ordering ties the same way makes a top-k batch a
+	 * prefix of every larger batch, which the ordering scan's grow-and-resume
+	 * (ordpos = prev) relies on; an unstable tie order could repeat or skip a
+	 * row across a recompute.  More recomputes happen since 1.9.0's LIMIT hint.
+	 */
 	return ItemPointerCompare((ItemPointer) &((const ScoredTid *) a)->tid,
 							  (ItemPointer) &((const ScoredTid *) b)->tid);
 }
@@ -3898,13 +4028,24 @@ wand_skip_blocks(WandCursor *c, uint64 target)
 				break;
 			}
 			nextp = (char *) MAXALIGN((char *) (bh + 1) + bh->bytelen + bh->posbytelen);
+			/*
+			 * The term's LAST block is never prove-skipped: posting chains of
+			 * consecutive terms share pages, so the header after this term's
+			 * last block belongs to the NEXT term and its first_docid says
+			 * nothing about this one.  Reading it as "our next block" skipped a
+			 * whole live block whenever the next term started at a lower docid
+			 * -- the final postings of the term were never scored.  Stop and
+			 * let the caller decode it (the same rule wand_load_block uses to
+			 * end the chain: nread + count reaching df).  See CHANGELOG 1.9.0.
+			 */
+			if (c->nread + (int) bh->count >= (int) c->df)
+			{
+				stopped = true;
+				break;
+			}
 			/* can we prove this whole block is < target? need the next block's
 			 * first_docid (on this page) to be <= target. */
-			/* The following header may belong to a different term when this is
-			 * the final block in this term's posting list.  Its first_docid cannot
-			 * prove this block is below target. */
-			if (c->nread + (int) bh->count < (int) c->df &&
-				nextp + sizeof(BM25BlockHdr) <= pend)
+			if (nextp + sizeof(BM25BlockHdr) <= pend)
 			{
 				BM25BlockHdr *nb = (BM25BlockHdr *) nextp;
 				uint64		nbfirst = ((uint64) nb->first_docid_hi << 32) | nb->first_docid_lo;
@@ -4381,7 +4522,7 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				int			minpos = 0;
 
 				for (i = 1; i < nheap; i++)
-					if (cmp_scored_desc(&heap[i], &heap[minpos]) > 0)
+					if (scored_worse(&heap[i], &heap[minpos]))
 						minpos = i;
 				heap[minpos].tid = tid;
 				heap[minpos].score = score;
@@ -4563,7 +4704,7 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 
 				bm25_docid_to_tid(cand, &tid);
 				for (i = 1; i < nheap; i++)
-					if (cmp_scored_desc(&heap[i], &heap[minpos]) > 0)
+					if (scored_worse(&heap[i], &heap[minpos]))
 						minpos = i;
 				heap[minpos].tid = tid;
 				heap[minpos].score = score;
@@ -4599,10 +4740,114 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
  * progressively less work as terms become non-essential, winning on long
  * queries / large k.  Both return the identical exact top-k.
  */
+/*
+ * fts_search_dense1 (1.9.0, C2): exact top-k for ONE cursor (a single plain term
+ * in a single segment) by scoring EVERY posting, without WAND.
+ *
+ * For a common term block-max WAND skips ~9% of blocks on real text (the bound
+ * and the threshold sit ~12% apart on a flat impact plateau), so per posting it
+ * pays a cursor sort, a pivot accumulation and a block-max bound check before
+ * it scores -- control overhead that was the largest single cost of a
+ * common-term ranked query after C1 (perf, 2026-10-01).  This loop instead
+ * decodes each block's tf column once (bm25_for_unpack), reads each doclen
+ * through the cursor's normal lookup (C1's slot array when resident), and keeps
+ * a top-k min-heap.
+ *
+ * Exactness: every live posting is scored with the same arithmetic as
+ * wand_contrib_cur, tombstoned docids are skipped exactly as wand_next does, and
+ * the heap evicts by scored_worse (score, then TID), the order WAND uses -- so
+ * the result is the same top-k, ties included.  It is the reference algorithm
+ * WAND approximates.  Gated by pg_fts.dense_score_min_df (fts_search_wand).
+ */
+static int
+fts_search_dense1(WandCursor *c, int k, ScoredTid **out)
+{
+	ScoredTid  *heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+	int			nheap = 0;
+	int			minpos = 0;
+	double		threshold = -1.0;
+	uint64		tfs[BM25_BLOCK_SIZE];
+
+	wand_prime(c);
+	while (c->docid != UINT64_MAX)
+	{
+		int			i;
+
+		CHECK_FOR_INTERRUPTS();	/* per 128-posting block; block is a palloc'd copy, no lock held */
+		bm25_for_unpack(c->blkbuf + c->tfoff, c->blkcount, tfs);
+		for (i = c->cur; i < c->blkcount; i++)
+		{
+			uint64		docid = c->docids[i];
+			double		tf,
+						dl,
+						score;
+			ScoredTid	st;
+
+			if (docid >= c->docid_hi)
+				break;
+			if (c->tombs != NULL && c->tombs->hasany)
+			{
+				c->cur = i;
+				c->docid = docid;
+				if (wand_cur_own_tombstoned(c))
+					continue;
+			}
+			tf = (double) tfs[i];
+			dl = c->has_doclen_col
+				? (double) bm25_for_get(c->blkbuf + c->dloff, i)
+				: (double) bm25_doclen_cursor_lookup(&c->doclenc, docid);
+			score = c->idf_k1p1 * tf / (tf + c->k1_1mb + c->k1b_inv_avgdl * dl);
+			if (nheap == k && score < threshold)
+				continue;		/* cannot enter: strictly below the k-th score */
+			bm25_docid_to_tid(docid, &st.tid);
+			st.score = score;
+			if (nheap < k)
+			{
+				heap[nheap++] = st;
+				if (nheap == k)
+				{
+					int			j;
+
+					minpos = 0;
+					for (j = 1; j < nheap; j++)
+						if (scored_worse(&heap[j], &heap[minpos]))
+							minpos = j;
+					threshold = heap[minpos].score;
+				}
+			}
+			else if (scored_worse(&heap[minpos], &st))
+			{
+				int			j;
+
+				heap[minpos] = st;
+				minpos = 0;
+				for (j = 1; j < nheap; j++)
+					if (scored_worse(&heap[j], &heap[minpos]))
+						minpos = j;
+				threshold = heap[minpos].score;
+			}
+		}
+		if (c->blkcount > 0 && c->docids[c->blkcount - 1] >= c->docid_hi)
+			break;
+		wand_load_block(c);
+	}
+	if (c->blkbuf)
+		pfree(c->blkbuf);
+	c->blkbuf = NULL;
+	bm25_doclen_cursor_free(&c->doclenc);
+	qsort(heap, nheap, sizeof(ScoredTid), cmp_scored_desc);
+	*out = heap;
+	return nheap;
+}
+
 static int
 fts_search_wand(WandCursor *cursors, int nterms, int k,
 				const DocidFilter *filter, BoolGate *gate, ScoredTid **out)
 {
+	if (nterms == 1 && filter == NULL && gate == NULL &&
+		pg_fts_dense_score_min_df > 0 &&
+		cursors[0].df >= (uint32) pg_fts_dense_score_min_df)
+		return fts_search_dense1(&cursors[0], k, out);
 	if (nterms >= 4)
 		return fts_search_maxscore(cursors, nterms, k, filter, gate, out);
 	return fts_search_bmw(cursors, nterms, k, filter, gate, out);
@@ -4891,7 +5136,7 @@ bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
 		}
 		if (gdf == 0)
 			continue;			/* term absent in every segment */
-		idf = log(1.0 + (N - (double) gdf + 0.5) / ((double) gdf + 0.5));
+		idf = bm25_index_idf(N, (double) gdf);
 
 		/* one cursor per segment that contains the term */
 		for (s = 0; s < meta->nsegments; s++)
@@ -5291,6 +5536,22 @@ bm25_topk_visible(Relation index, FtsQuery q, int k, bool as_distance,
 		k = 1;
 	wantk_cap = Max(k * 64, 4096);
 
+	/*
+	 * Over-fetch only where visibility is uncertain (1.9.0).  The x4 margin (and
+	 * the 64 floor) exist purely to avoid the retry below when some top
+	 * candidates turn out invisible; correctness never depended on them, because
+	 * a short result with a full batch always retries with a doubled wantk.  But
+	 * a deep wantk keeps WAND's threshold low and defeats block skipping, so a
+	 * LIMIT 10 ran as a top-400.  When pg_class says the heap is (almost) all-
+	 * visible -- the normal state after VACUUM -- ask for exactly k.  relallvisible
+	 * is a statistic and may be stale: that can only cost a retry, never a row.
+	 */
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	if (heap->rd_rel->relpages > 0 &&
+		(double) heap->rd_rel->relallvisible >= 0.99 * (double) heap->rd_rel->relpages)
+		wantk = k;
+	table_close(heap, AccessShareLock);
+
 	for (;;)
 	{
 		int			gen_retries = 0;
@@ -5424,8 +5685,6 @@ bm25_count_dictdf_fastpath(Relation index, FtsQuery q)
 	uint32		s;
 	Relation	heap;
 	BlockNumber nblocks;
-	BlockNumber blk;
-	Buffer		vmbuf = InvalidBuffer;
 	bool		all_visible = true;
 
 	/* Gate (1): exactly one plain positive term. */
@@ -5475,16 +5734,24 @@ bm25_count_dictdf_fastpath(Relation index, FtsQuery q)
 	 */
 	heap = table_open(index->rd_index->indrelid, AccessShareLock);
 	nblocks = RelationGetNumberOfBlocks(heap);
-	for (blk = 0; blk < nblocks; blk++)
+	/*
+	 * One visibilitymap_count() -- a popcount over the VM pages -- instead of a
+	 * VM_ALL_VISIBLE() call per heap block, which was ~90% of this path on a
+	 * 501k-block heap (perf, 2026-10-01).  Every heap block is all-visible iff
+	 * the number of all-visible bits equals nblocks: the count cannot exceed
+	 * the blocks that exist (the VM's tail bits past nblocks are zero -- the VM
+	 * is extended zero-filled and truncated with the heap), and a block the VM
+	 * does not cover is simply not counted, so count < nblocks -> bail.  The
+	 * count is read without the VM page lock, exactly like the per-block loop
+	 * it replaces (VM_ALL_VISIBLE reads the bit unlocked too); the generation
+	 * re-check below still guards the index side.
+	 */
 	{
-		if (!VM_ALL_VISIBLE(heap, blk, &vmbuf))
-		{
-			all_visible = false;
-			break;
-		}
+		BlockNumber nvis = 0;
+
+		visibilitymap_count(heap, &nvis, NULL);
+		all_visible = (nvis >= nblocks);	/* nblocks == 0: vacuously true, as before */
 	}
-	if (vmbuf != InvalidBuffer)
-		ReleaseBuffer(vmbuf);
 	table_close(heap, AccessShareLock);
 	if (!all_visible)
 		return -1;
@@ -5572,7 +5839,7 @@ bm25_count_visible(Relation index, FtsQuery q)
 	 * heap-probing only pages the map does not mark all-visible.
 	 *
 	 * ONE VM LOOKUP PER BLOCK RUN, not per TID.  tidset_sort_uniq() has sorted
-	 * these with cmp_tid and de-duplicated them, and a docid is
+	 * these by (block, offset) and de-duplicated them, and a docid is
 	 * block * MaxHeapTuplesPerPage + offset -- monotonic in (block, offset) -- so
 	 * every match on a given heap page forms a strictly contiguous run.  The
 	 * previous loop asked the VM about the same block once for every matching
@@ -6008,8 +6275,7 @@ fts_anomalous_docs(PG_FUNCTION_ARGS)
 						continue;
 					}
 
-					idf = log(1.0 + (N - (double) gdf + 0.5) /
-							  ((double) gdf + 0.5));
+					idf = bm25_index_idf(N, (double) gdf);
 
 					np = bm25_decode_term(index, de->firstposting,
 										  de->firstoffset, de->df,

@@ -420,7 +420,7 @@ bm25_trgm_candidates(Relation index, BlockNumber trgmstart,
 				sm_cursor_t cur = SM_CURSOR_INIT;
 				uint64_t	v;
 
-				sm_open(&sm, smbuf, smlen);
+				bm25_sm_open_checked(index, firstdata, "trigram", &sm, smbuf, smlen);
 				for (v = sm_next_member(&sm, (uint64_t) -1, &cur);
 					 v != SM_IDX_MAX;
 					 v = sm_next_member(&sm, v, &cur))

@@ -1,0 +1,57 @@
+== rare_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia'::bm25query)
+== mid_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:hungary'::bm25query)
+== common_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:year'::bm25query)
+== common_k100
+Aggregate  (cost=282.70..282.71 rows=1 width=8)
+  ->  Limit  (cost=0.01..281.45 rows=100 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_pgts:year'::bm25query)
+== count_common
+Finalize Aggregate  (cost=461540.87..461540.88 rows=1 width=8)
+  ->  Gather  (cost=461540.65..461540.86 rows=2 width=8)
+        Workers Planned: 2
+        ->  Partial Aggregate  (cost=460540.65..460540.66 rows=1 width=8)
+              ->  Parallel Seq Scan on docs  (cost=0.00..460333.45 rows=82880 width=0)
+                    Filter: (content @@ '''year'''::tsquery)
+== and2_k10
+Aggregate  (cost=33931.42..33931.43 rows=1 width=8)
+  ->  Limit  (cost=0.01..33931.30 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..743095.17 rows=219 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia hungary'::bm25query)
+              Filter: (content @@ '''slovakia'' & ''hungari'''::tsquery)
+== or2_k10
+Aggregate  (cost=33931.42..33931.43 rows=1 width=8)
+  ->  Limit  (cost=0.01..33931.30 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..743095.17 rows=219 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia hungary'::bm25query)
+              Filter: (content @@ '''slovakia'' | ''hungari'''::tsquery)
+== or3_k10
+Aggregate  (cost=92.33..92.34 rows=1 width=8)
+  ->  Limit  (cost=0.01..92.20 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..1018815.17 rows=110507 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia hungary poland'::bm25query)
+              Filter: (content @@ '''slovakia'' | ''hungari'' | ''poland'''::tsquery)
+== prefix_k10
+Aggregate  (cost=33931.42..33931.43 rows=1 width=8)
+  ->  Limit  (cost=0.01..33931.30 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..743095.17 rows=219 width=16)
+              Order By: (content <@> 'docs_pgts:hung'::bm25query)
+              Filter: (content @@ '''hung'':*'::tsquery)
+== phrase_k10
+Aggregate  (cost=53.13..53.14 rows=1 width=8)
+  ->  Limit  (cost=0.01..53.01 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..1405590.17 rows=265217 width=16)
+              Order By: (content <@> 'docs_pgts:united states'::bm25query)
+              Filter: (content @@ '''unit'' <-> ''state'''::tsquery)

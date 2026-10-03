@@ -191,6 +191,241 @@ All notable changes to pg_fts are documented here.
   its pending row is ranked by the exact pending fallback), a deep pull across segments with deletes, VACUUM
   and heap-slot reuse (every filter row exactly once, in exact order), and NULL `WHERE` and
   `ORDER BY` values.
+## 1.9.0 - 2026-10-01
+
+Ranked-retrieval performance release, and two exactness fixes that affect every prior
+release. **No on-disk format change** (`BM25_VERSION` unchanged); **no REINDEX required**.
+An index built by 1.8.6 was qualified in place under 1.9.0: counts equal seqscan and
+ranked top-20 scores equal the heap-side `fts_bm25` reference before and after
+`ALTER EXTENSION pg_fts UPDATE`, and after further writes on 1.9.0. The only SQL change is
+one internal function (`pg_fts--1.8.6--1.9.0.sql`).
+
+### Fixed
+
+- **Ranked queries could return the WORST documents after deletes (every prior release).**
+  Index-side idf used N = live documents but df = the dictionary df, which still counts
+  tombstoned postings until a merge rewrites the segment. Once deletes push df above N,
+  the idf goes negative, every score flips sign, and block-max WAND -- whose bounds assume
+  non-negative contributions -- returns the lowest-scoring documents as the top-k.
+  Repro (`sql/dense_score.sql`): 6,000 docs, 1/7 deleted, a term in every doc; 1.8.6's
+  top-3 was (0,15),(0,33),(1,6), and the correct top-3 is (0,17),(1,8),(2,51). df is now
+  clamped to [1, N] at both index idf sites, exactly as the heap-side `bm25_idf` already
+  did, so index scores equal `fts_bm25`'s.
+- **Ranked queries could miss true top-k documents (every prior release).** A WAND/BMW
+  seek proved a posting block entirely below its target by reading the next block's
+  header on the same page. For a term's last block that header belongs to the next term
+  in the shared chain, so the live last block was skipped whenever that term began at a
+  lower docid. Ranked OR at small k dropped real results (`sql/wand_last_block.sql`; on
+  2.19M docs 1.8.6 was exact on 26/28 OR (query, k) pairs, now 28/28).
+
+### Changed (performance; bench/RESULTS_190_2026-10-01.md)
+
+- The planner passes `LIMIT`+`OFFSET` to the ordering scan, so the first WAND batch is k
+  rather than a fixed 100 with x4 over-fetch; over-fetch is skipped on an all-visible heap.
+- New GUC `pg_fts.doclen_cache_mb` (default 64, 0 = off): a resident per-backend document
+  length array; a length is two array reads instead of a sidecar page decode.
+- New GUC `pg_fts.dense_score_min_df` (default 32768, 0 = off): a single-term,
+  single-segment ranked query on a high-df term is scored exhaustively instead of with
+  block-max WAND, which prunes almost nothing for common terms. Same top-k, ties included.
+- FOR unpack: one load per value for widths <= 56 (identical output to the old decoder on
+  335,400 width/length cases under ASan/UBSan).
+- `count(*)` fast path: one `visibilitymap_count` instead of a per-heap-block loop.
+- The sort-key copy of an ordering scan's own `<=>` reuses the scan's exact distance
+  (internal `fts_current_distance()`) instead of detoasting and re-scoring each returned
+  row. Visible `<=>` values are unchanged.
+- Inlined TID sort in the collect path; galloping probe in the positional phrase
+  intersection.
+- 2.19M Wikipedia, vs 1.8.6 / vs pg_textsearch 1.4.0 (ms): rare 10.21 -> 0.67 (0.84),
+  mid 15.99 -> 0.79 (1.07), common k10 49.2 -> 7.19 (11.40), common k100 50.1 -> 7.37
+  (13.87), count 2.50 -> 0.19 (seqscan), AND 9.03 -> 1.51 (25.0), OR 10.7 -> 1.46 (24.9),
+  prefix 18.4 -> 6.21 (10.5), phrase 239 -> 138 (42.9). Throughput at 16 clients: rare
+  12,412 tps (8,115), common 968 (650), count 45,694 (n/a).
+
+### Known issues
+
+- **Phrase.** pg_textsearch 1.4.0 is 3.2x faster on a ranked phrase (42.9 vs 138 ms with
+  `positions=on`). pg_fts materializes the whole phrase match set before ranking; the lazy
+  phrase gate is the planned fix.
+- **Rare-term throughput falls with oversubscription.** 12,412 tps at 16 clients, 8,590 at
+  64; pg_textsearch is flat (~8,200). Measured: not lock waits, not slot-array rebuilds
+  (built once per backend, 28 ms), and not the thread count; it scales with the number of
+  concurrent backends (12.4k at 16, 10.5k at 32, 8.4k at 64 for the same total work). Cause
+  not identified; per-backend copies of the length array competing for cache is the leading
+  unconfirmed hypothesis. Still ahead of pg_textsearch at every client count measured.
+
+### Release note
+
+- GitHub CI's coverage job failed on the `v1.9.0` commit: branch coverage 72.8% against a
+  73% gate (the new code added 243 branches and the suite took 172 of them). The published
+  1.9.0 artifact was built and its installcheck and TAP passed, so no code changed. Tests
+  for the new paths landed on `main` afterwards (`dabc30e`, branch coverage 73.1%), and CI
+  is green there. A gate that failed on a release tag is recorded here, not hidden.
+
+### Retracted
+
+- The 2026-09-30 note that pg_textsearch 1.4.0 "leads on every single-term ranked query
+  4-14x" is true of 1.8.6 only; 1.9.0 leads on all of them.
+- `parity_check.sh` passing was cited throughout 1.x as proof of exact top-k. It did not
+  detect either bug above: its 1% tolerance, its five default query shapes and its
+  delete-free corpus left both invisible.
+
+## 1.8.6 - 2026-09-30
+
+Vendored sparsemap **5.7.0 -> 5.8.0**. No on-disk format change on either side
+(`BM25_VERSION` unchanged; sparsemap wire format still version 2); **no REINDEX required**.
+
+### Changed
+
+- **sparsemap 5.8.0.** Same vendoring contract: `vendor/sm.h` byte-identical to upstream,
+  `vendor/sm.c` upstream plus the 9-line `SPARSEMAP_PREFIX` block. Upstream's suite (21
+  tests) passes against the vendored copy under ASan+UBSan with the prefix defined empty.
+
+  What reaches pg_fts: `sm_add_many_grow` -- the only bulk-build call, used by the trigram
+  term-set build, `bm25_segment_docids` and the bulkdelete tombstone set -- now
+  sort+coalesce+merges in one pass instead of inserting bit by bit. Measured standalone
+  (5.7.0 vs 5.8.0, same inputs, 3 runs each, serialized bytes compared first and
+  identical in every case), 20M ids: dense ascending docids 6.3-9.9 s -> 1.7-2.3 s;
+  unsorted with duplicates (the `bm25_segment_docids` shape) 36-54 s -> 11-12 s; sparse
+  ascending (trigram shape) 5.3-5.4 s -> 3.8-4.5 s. **Not measured inside pg_fts at
+  scale**; whether it moves the open superlinear trigram-build item is unmeasured.
+  Cost: the new path holds two extra `n`-sized run arrays plus a result copy, so peak
+  transient memory is higher on sparse input (909 MB vs 434 MB for the 20M sparse case
+  above; unchanged for the dense cases). This is libc malloc outside
+  `FTS_ALLOC_MAYBE_HUGE`, as before.
+
+  Also in: a `__sm_coalesce_map` heap over-read fix (UB, results were correct) on a path
+  pg_fts reaches only through the new `sm_add_many_grow`; `sizeof(sm_t)` 24 -> 32 (a
+  runtime-only cardinality cache, never serialized; pg_fts embeds `sm_t` by value but
+  always via `sm_open`/`sm_create`, and recompiles against the new header). The O(1)
+  `sm_cardinality` and O(runs) `sm_add_range` are in functions pg_fts does not call.
+
+### Retracted
+
+- **"pg_fts rare-term ranked beats pg_textsearch (5.89 vs 7.36 ms)"** -- published in
+  `bench/BENCHMARK_SUMMARY.md`, `README.md` and `doc/COMPARISON_MATRIX.md` from the
+  2026-09-06 5-way run -- **compared different query forms.** The pg_fts column was timed
+  with `fts_search(idx, q, k)`; the competitors were timed with their `ORDER BY ... LIMIT`
+  forms. On the same `WHERE d @@@ q ORDER BY d <=> q LIMIT k` form, pg_fts rare/mid/common
+  k10 is ~10.2 / 16.0 / 48 ms. That is measured on two identical hosts, on 1.6.1 and
+  1.8.6, both forms against the same index, 3 passes each
+  (`bench/data_pgts_2026-09-30/form_*`). 1.6.1 and 1.8.6 agree within noise, so this is
+  not a regression: the published figure was the fast form. The September concurrency run
+  (C1X) used the `ORDER BY` form and is unaffected. Separately, pg_textsearch v1.4.0 is now
+  0.92 ms on rare, so pg_fts trails it on every single-term ranked band whichever form is
+  used (`bench/RESULTS_PGTS_2026-09-30.md`).
+
+### Qualified, not assumed
+
+- **Local delete-heavy scale run, 1.8.5 vs 1.8.6 side by side** (PG 17.10, 2.2M synthetic
+  rows, 40 Zipf-ish terms each, one segment): build, then three rounds of
+  `DELETE ... id % {7,4,3}` + `VACUUM`, then `fts_merge`/`fts_vacuum`. Index counts equal
+  seqscan counts, all non-zero, after every step on both arms, and the two arms agree with
+  each other. Build 1681 s vs 1682 s (no build-time change: this corpus's build is not
+  dominated by `sm_add_many_grow`). VACUUM 137/31/28 s vs 130/24/22 s -- one run with both
+  arms sharing the host, so **not claimed as a speedup**. EC2 at-scale run follows
+  the release; see `bench/INDEX.md`.
+
+## 1.8.5 - 2026-09-27
+
+Vendored sparsemap **5.6.0 -> 5.7.0**. No on-disk format change on either side
+(`BM25_VERSION` unchanged; sparsemap wire format still version 2 and mutually readable, so
+every tombstone blob already on disk opens unchanged); **no REINDEX required**.
+
+### Changed
+
+- **sparsemap 5.7.0.** Same vendoring contract as every prior bump: `vendor/sm.h`
+  byte-identical to upstream, `vendor/sm.c` upstream plus the 9-line `SPARSEMAP_PREFIX`
+  block (diff confirms exactly 9 added lines), all 95 public symbols still namespaced.
+  Upstream's own suite -- now 20 tests -- passes against the vendored copy with the prefix
+  defined empty.
+
+  What reaches pg_fts: a **small-set encoding** for maps whose largest index is below 1,024
+  -- a bare `uint64` word array behind the same 8-byte header (the header's top bit selects
+  the mode). A segment's tombstone map takes this form whenever its deleted docids are all
+  small, which is common; a two-tombstone map is now 16 bytes instead of the ~32+ of the
+  chunk form. The four 5.7.0 correctness fixes (`sm_equals`/`sm_hash`/`sm_compare` on
+  equal-but-differently-built maps, `sm_split` emitting an invalid map, `sm_offset` signed
+  overflow, a length-1 RLE edge) are all in functions pg_fts does not call. `sm.c`/`sm.h`
+  are now warning-clean under `-Wall -Wextra -Wpedantic -Wconversion -Wshadow` and friends,
+  with declarations hoisted to block scope -- which is also friendlier to this project's
+  `-Wdeclaration-after-statement`.
+
+### Release-process defect found and fixed while shipping this
+
+- **The Codeberg->GitHub mirror delivered the `v1.8.5` tag two hours before the commits
+  it pointed at.** GitHub's tag therefore resolved to v1.8.4's commit; the release job ran
+  *that* commit's workflow (predating the checkout guard added the same morning, so the
+  guard could not run), built `pg_fts-1.8.4.zip`, and only the filename mismatch stopped
+  it publishing 1.8.4's code as 1.8.5. Recovered by pushing `main` then the annotated tag
+  to GitHub directly and re-running; the published 1.8.5 is sha256-identical on PGXN and
+  GitHub and contains sparsemap 5.7.0. `RELEASING.md` now pushes to GitHub directly, main
+  before tag, and verifies the peeled tag before trusting a run. The mirror is no longer
+  on the release path.
+
+### Qualified, not assumed
+
+- **The new encoding is exercised by pg_fts, and the 1.8.4 guard holds for it.**
+  `bm25_sm_open_checked()` requires the reopened size to equal the stored length; in
+  small-set mode `sm_get_size()` returns the stored `m_data_used` directly and `sm_open()`
+  validates the header word count against it, so the invariant is exact in both encodings.
+  Verified end to end through the real path: an index with two low-docid tombstones,
+  VACUUMed, read via `pageinspect` -- the blob's header top bit is **set** (small mode) and
+  the query returns the correct 48 of 50 rows.
+- **New fuzz target `test/fuzz/fuzz_smblob.c`**, in the sanitizer gate: 20,000 random docid
+  sets straddling the small/chunk boundary, written the way bulkdelete and merge write
+  (`sm_get_data`/`sm_get_size`) and reopened the way every reader does, asserting size
+  round-trip, `sm_validate`, bit-exact membership including the 1,020..1,030 boundary,
+  ascending enumeration equal to the set, and that a toggled mode bit cannot open as a
+  valid map of the same size. Compiles the vendored `sm.c` directly, unprefixed --
+  single source of truth. Two authoring errors caught while writing it: `sm_add` returns
+  `uint64_t` (`SM_IDX_MAX` on failure), not `bool`; and an O(span) membership sweep over a
+  200k span made 20k cases take minutes -- the property is kept, the cost made proportional
+  to the set.
+
+## 1.8.4 - 2026-09-27
+
+Vendored sparsemap **5.5.1 -> 5.6.0** (upstream's security-hardening release), and a guard
+that its one behaviour change made necessary. No on-disk format change on either side
+(`BM25_VERSION` unchanged; sparsemap wire format still version 2); **no REINDEX required**.
+
+### Changed
+
+- **sparsemap 5.6.0.** `vendor/sm.h` is byte-identical to upstream; `vendor/sm.c` is
+  upstream plus the same 9-line `SPARSEMAP_PREFIX` block as before, and nothing else.
+  Upstream's own 14-test suite passes against the vendored copy with the prefix defined
+  empty. What reaches pg_fts from the release: `sm_validate` now rejects an RLE chunk whose
+  length exceeds its capacity, misaligned chunk starts, `start + capacity` overflow,
+  overlapping chunks, and a stored chunk count that disagrees with the walk; several
+  memory-safety fixes on valid-but-adversarial maps (a source over-read in `sm_split`, a
+  non-terminating per-bit loop, a destination over-write, an out-of-range shift); and the
+  set-comparison family now completes in microseconds rather than O(set bits) on a
+  two-billion-bit run. A NULL map is now a defined empty read-only map for all public
+  functions (nineteen previously segfaulted).
+
+### Fixed
+
+- **A corrupt tombstone bitmap is now a loud error, not a silent resurrection of deleted
+  rows.** 5.6.0's `sm_open()` hardening replaces a buffer that fails validation with an
+  **empty map** -- void return, no `errno`. That is the right contract for a library taking
+  untrusted bytes. It is the wrong outcome for a *tombstone* map, where "empty" means
+  "nothing is deleted": with a plain library swap, a corrupt livedocs blob would make every
+  vacuumed document reappear in query results with no error. (A collapsed trigram blob would
+  silently drop fuzzy/regex candidates instead.) Every `sm_open` in pg_fts now goes through
+  `bm25_sm_open_checked()`, which requires the reopened size to equal the stored length --
+  exact for any blob pg_fts wrote, since `livedocslen` *is* `sm_get_size()` at write time --
+  and `sm_validate()` to pass, and otherwise raises `ERRCODE_DATA_CORRUPTED` naming the index
+  and block, with a REINDEX hint. Same contract as the `pd_lower` guards.
+
+### Tests
+
+- `t/003_corruption.pl` gains a tombstone-corruption phase: delete half the rows, VACUUM
+  (2,000 tombstones), smash the blob's contents on disk, and assert the scan **errors**
+  rather than returning 4,000. **Verified to discriminate**: with the guard disabled the test
+  fails exactly as predicted -- `got: '0'` (a successful scan) where an error was required,
+  i.e. the resurrected-deletes answer. Two test-authoring corrections on the way, both
+  recorded in the test: REINDEX changes the relfilenode so the on-disk path must be
+  re-resolved, and the tombstone blob is stamped `BM25_TRGM_DATA` (1<<5) by the shared blob
+  writer -- `BM25_LIVEDOCS` (1<<6) is a dead define nothing writes.
 
 ## 1.8.3 - 2026-09-18
 

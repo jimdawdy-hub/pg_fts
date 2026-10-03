@@ -339,6 +339,15 @@ CREATE OPERATOR <=> (
     COMMUTATOR = <=>
 );
 
+-- Internal (1.9.0): the exact <=> distance the bm25 ordering scan computed for
+-- the tuple it just returned.  The planner substitutes it for the target-list
+-- copy of the scan's own ORDER BY expression, so a ranked query does not re-read
+-- and re-score every returned document.  Not for direct use.
+CREATE FUNCTION fts_current_distance()
+RETURNS float8
+AS 'MODULE_PATHNAME', 'fts_current_distance'
+LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+
 -- Add the ORDER BY operator (strategy 2) to the fts operator class so
 -- "ORDER BY col <=> query LIMIT k" uses an index ordering scan.
 ALTER OPERATOR FAMILY ftsdoc_fts_ops USING fts ADD

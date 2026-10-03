@@ -8,7 +8,8 @@
 # Exit !0 = a fuzzer detected an overflow/UB, OR the planted-bug check failed
 #           to detect a reverted 0.3.4 clamp (i.e. the harness is toothless).
 #
-# No CMake required: this compiles the three self-contained fuzzers directly.
+# No CMake required: this compiles the four self-contained fuzzers directly
+# (fuzz_smblob compiles the vendored sparsemap in, unprefixed).
 # The CI-wiring agent can invoke this as-is (see test/fuzz/README.md).
 set -euo pipefail
 
@@ -25,7 +26,7 @@ export ASAN_OPTIONS="abort_on_error=1:detect_leaks=1"
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
 echo "== building fuzzers ($CC, ASan+UBSan) =="
-for f in fuzz_for fuzz_docvalid fuzz_block; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_smblob; do
     $CC $CFLAGS "$here/$f.c" -o "$out/$f"
 done
 # planted-bug binaries: fuzz_block with (a) the count clamp reverted, (b) the
@@ -39,7 +40,7 @@ $CC $CFLAGS -DFUZZ_NO_SUMTF_GUARD=1 "$here/fuzz_block.c" -o "$out/fuzz_block_nos
 
 echo "== running fuzzers =="
 rc=0
-for f in fuzz_for fuzz_docvalid fuzz_block; do
+for f in fuzz_for fuzz_docvalid fuzz_block fuzz_smblob; do
     if "$out/$f"; then
         echo "PASS: $f"
     else

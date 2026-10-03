@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
+ * Copyright (c) 2014 Christoph Rupp <chris@crupp.de>.
  * Copyright (c) 2024 Gregory Burd <greg@burd.me>.  All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -88,7 +89,25 @@
  * sm_owned_copy(), sm_wrap()) return `NULL` on allocation
  * failure.
  *
- * ## Allocation lineage and disposal
+ * ## The NULL-map contract
+ *
+ * A `NULL` map pointer is treated as an **empty, read-only map**.  Every
+ * public `sm_*` function accepts `NULL` for its map argument without
+ * crashing:
+ *
+ * - Read/query functions return the value an empty map would return
+ *   (`sm_cardinality` -> 0, `sm_minimum`/`sm_maximum` -> 0,
+ *   `sm_is_empty` -> true, `sm_contains` -> false, `sm_get_data` ->
+ *   `NULL`, `sm_get_size`/`sm_get_capacity` -> 0, and so on).
+ * - Mutating functions cannot change a `NULL` map, so they perform no
+ *   action and return their documented failure value -- `SM_IDX_MAX`,
+ *   `false`, or `NULL` as the signature dictates -- and set `errno` to
+ *   `EINVAL`.
+ *
+ * This makes it safe to pass the result of an operation that can
+ * legitimately return `NULL` (an empty `sm_intersection` / `sm_xor` /
+ * `sm_difference`) straight into another call without a guard.
+ * * ## Allocation lineage and disposal
  *
  * Every sm_t has an internal allocation lineage tag that determines
  * which functions may safely realloc its data buffer and how it must be
@@ -195,9 +214,32 @@ typedef SSIZE_T ssize_t;
  * one address space without colliding at link time.  Only C
  * identifiers that become linker symbols (the public functions) and
  * the public type names are renamed; compile-time macros
- * (SM_IDX_MAX, the SM_VERSION_* values, enum constants) are
- * unaffected because they never reach the linker.  The serialized
- * wire format does not change.
+ * (SM_IDX_MAX, SM_FOUND, SM_NOT_FOUND, SM_CURSOR_INIT,
+ * SM_CURSOR_CACHED_INIT, SM_CACHE_WAYS, the SM_VERSION_* values, and
+ * the enum constants) are NOT renamed and keep their canonical
+ * spelling.  This is a hard limitation of the C preprocessor, not a
+ * policy choice: functions are prefixed by rewriting the reference at
+ * the call site (#define sm_add SM__P(sm_add)) because the definition
+ * emits the prefixed name as an actual linker symbol.  A value macro
+ * has no such definition site -- reaching it under a prefixed spelling
+ * would require a #define whose NAME is <PREFIX>SM_IDX_MAX, and the
+ * preprocessor cannot form a macro name by token-pasting in a #define
+ * name position (only the replacement list is pasted).  A prefixed
+ * value macro therefore has to be spelled out literally, which needs
+ * the prefix token known when this header is authored -- impossible
+ * for an arbitrary caller-chosen SPARSEMAP_PREFIX.  A consumer that
+ * wants prefixed macro spellings can add them itself, since it knows
+ * its own prefix literally, e.g.:
+ *
+ *	#define myapp_SM_IDX_MAX  SM_IDX_MAX
+ *	#define myapp_SM_FOUND(x) SM_FOUND(x)
+ *
+ * The compile toggles SM_EXPOSE_STRUCT and SM_INTERNAL are likewise
+ * not prefixed: they are read by this header's own #ifdefs, so a
+ * prefixed spelling would only work if the header also tested the
+ * prefixed name -- which again requires a literal, not-arbitrary
+ * prefix.  Keep defining them under their canonical names.  The
+ * serialized wire format does not change.
  */
 #ifdef SPARSEMAP_PREFIX
 #define SM__CAT2(a, b) a##b
@@ -308,10 +350,10 @@ extern "C" {
 #endif
 
 /** Library version (kept in sync with meson.build's project(version: ...)). */
-#define SM_VERSION_STRING "5.5.1"
+#define SM_VERSION_STRING "5.8.0"
 #define SM_VERSION_MAJOR  5
-#define SM_VERSION_MINOR  5
-#define SM_VERSION_PATCH  1
+#define SM_VERSION_MINOR  8
+#define SM_VERSION_PATCH  0
 
 /** Handle to a sparsemap instance.
  *
@@ -381,19 +423,33 @@ void sm_set_allocator(sm_allocator_t a);
  * one place so the embedded-copy use case cannot drift from the
  * library's own definition.
  *
- * sm_t is three machine words.  The allocation-lineage tag (how
+ * sm_t is four machine words.  The allocation-lineage tag (how
  * m_data was provisioned) is folded into the low bits of m_capacity:
  * capacity is always rounded up to an 8-byte boundary, so its low 3
  * bits are free.  Use the internal __sm_cap() / __sm_kind() accessors
  * rather than touching m_capacity directly.  There is no per-map
  * allocator and no stored cursor; reads accelerate through a
- * caller-owned sm_cursor_t (see below).  Nothing here is serialized.
+ * caller-owned sm_cursor_t (see below).
+ *
+ * m_card_plus1 is a RUNTIME-ONLY lazy cache of sm_cardinality(): it is
+ * NOT serialized and NOT copied to the wire.  It is stored biased by
+ * one so that the all-zero state (a calloc'd or zeroed struct) reads as
+ * "unknown": 0 == cache invalid, otherwise the cached count is
+ * (m_card_plus1 - 1).  Every membership-changing operation invalidates
+ * it (sets it to 0); sm_cardinality recomputes it via the chunk walk on
+ * the first query after a mutation and caches the result.  Because the
+ * value is derived purely from m_data, a fresh map with an invalid
+ * cache is always correct.  This is the ONLY field that is not part of
+ * the serialized state; sizeof(sm_t) grows from 24 to 32 bytes.
  */
 #if defined(SM_INTERNAL) || defined(SM_EXPOSE_STRUCT)
 struct SM_ALIGNED(8) sparsemap {
-	size_t m_capacity;  /* (capacity & ~7) bytes; low 3 bits = lineage */
-	size_t m_data_used; /* used size of m_data, in bytes */
-	uint8_t *m_data;    /* the serialized bitmap data */
+	size_t m_capacity;   /* (capacity & ~7) bytes; low 3 bits = lineage */
+	size_t m_data_used;  /* used size of m_data, in bytes */
+	uint8_t *m_data;     /* the serialized bitmap data */
+	size_t m_card_plus1; /* runtime-only lazy cardinality cache, biased
+	                      * by one: 0 = unknown, else count + 1.  Never
+	                      * serialized. */
 };
 #endif
 
@@ -1199,7 +1255,7 @@ bool sm_overlap(const sm_t *a, const sm_t *b);
 typedef enum {
 	SM_EMPTY = 0,     /**< no bits set */
 	SM_SINGLETON = 1, /**< exactly one bit set */
-	SM_MULTIPLE = 2,  /**< two or more bits set */
+	SM_MULTIPLE = 2   /**< two or more bits set */
 } sm_membership_t;
 
 /** @brief Classify a sparsemap as empty, singleton, or multi-element.
@@ -1335,6 +1391,15 @@ bool sm_add_many_grow(sm_t **map, const uint64_t *arr, size_t n);
  * buffer.  Or pass a buffer of `*n_out` capacity; on return, `*n_out`
  * is the number actually written.
  *
+ * Cost is O(cardinality) by nature -- it emits one uint64_t per set
+ * bit -- and it is intentionally the one operation that stays that way
+ * (the set-algebra, hashing and range helpers were rewritten to track
+ * the encoded size instead).  A map decoded from untrusted bytes can
+ * legitimately declare a run of up to 2^31 bits per chunk, so a caller
+ * that hands `sm_to_array` such a map, or sizes an output buffer from
+ * `sm_cardinality`, must be prepared for a proportionally large result;
+ * bound it with `sm_extract_range` first if that is a concern.
+ *
  * @param[in]     map    Source.
  * @param[out]    out    Caller-allocated buffer (or NULL to query size).
  * @param[in,out] n_out  In: capacity of `out`.  Out: number written.
@@ -1466,7 +1531,7 @@ typedef enum {
 	SM_REL_EQUAL = 0,     /**< a == b */
 	SM_REL_SUBSET_A = 1,  /**< a is a strict subset of b */
 	SM_REL_SUBSET_B = 2,  /**< b is a strict subset of a */
-	SM_REL_DIFFERENT = 3, /**< neither is a subset of the other */
+	SM_REL_DIFFERENT = 3  /**< neither is a subset of the other */
 } sm_subset_relation_t;
 
 /** @brief Classify the subset relationship between \a a and \a b.
@@ -1610,15 +1675,19 @@ sm_t *sm_shrink_to_fit(sm_t *map);
  *
  * Format (16 bytes header + body):
  *
- *   uint32_t magic     = 0x736d3130 ("sm10")  -- versions <2
- *   uint8_t  version   = 1
+ *   uint32_t magic     = 0x30316d73 ("sm10", stored in host byte order)
+ *   uint8_t  version   = 2
  *   uint8_t  flags     = 0x01 if little-endian, 0x00 if big-endian
  *   uint16_t reserved  = 0 (must be ignored on read)
  *   uint64_t cardinality           -- size hint for callers
  *   <body: existing internal m_data layout, in source endian>
  *
- * Cross-endian deserialization is not yet supported; sm_deserialize
- * returns NULL if the source endian doesn't match the host.
+ * The magic and body are written with native memcpy, so the stream is
+ * host-endian: a little-endian writer emits the magic bytes 73 6d 31 30
+ * and a big-endian writer 30 31 6d 73.  Cross-endian deserialization is
+ * not yet supported; sm_deserialize returns NULL if the source endian
+ * flag doesn't match the host.  Serialized maps are therefore portable
+ * only between hosts of the same byte order.
  * ------------------------------------------------------------------- */
 
 /** @brief Compute the buffer size needed to serialize \a map.

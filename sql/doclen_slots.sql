@@ -1,0 +1,66 @@
+-- doclen_slots: the resident slot-indexed doclen array (1.9.0, C1) must give
+-- byte-identical scores to the page-directory cursor it short-circuits, for
+-- every doc, including after deletes (tombstones), a second segment, and when a
+-- segment does not fit the budget.  Scores are compared to 12 decimal places.
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+
+-- varied lengths so quantization buckets differ; a filler table interleaved so
+-- heap blocks have gaps (offsets that are not ours) -- the sparse-slot case
+CREATE TABLE ds (id int PRIMARY KEY, d ftsdoc);
+INSERT INTO ds SELECT g, to_ftsdoc('simple', 'alpha ' || repeat('w' || (g % 13) || ' ', 1 + (g % 97)) ||
+                                   CASE WHEN g % 3 = 0 THEN 'beta' ELSE 'gamma' END)
+FROM generate_series(1, 4000) g;
+CREATE INDEX ds_fts ON ds USING fts (d);
+VACUUM ANALYZE ds;
+
+CREATE FUNCTION ds_scores(q text, mb int) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text;
+BEGIN
+  EXECUTE format('SET LOCAL pg_fts.doclen_cache_mb = %s', mb);
+  EXECUTE format('SELECT string_agg(id::text || '':'' || round((1/(d <=> to_ftsquery(''simple'',%L)) - 1)::numeric, 12), '','')
+                  FROM (SELECT id, d FROM ds WHERE d @@@ to_ftsquery(''simple'',%L)
+                        ORDER BY d <=> to_ftsquery(''simple'',%L) LIMIT 4000) s', q, q, q) INTO r;
+  RETURN r;
+END $$;
+
+-- one segment, all docs, slots on vs off
+SELECT ds_scores('alpha', 64) = ds_scores('alpha', 0) AS one_seg_all,
+       ds_scores('beta | w5', 64) = ds_scores('beta | w5', 0) AS one_seg_or,
+       length(ds_scores('alpha', 64)) > 0 AS nonempty;
+
+-- deletes -> tombstones; ranked results must still agree
+DELETE FROM ds WHERE id % 7 = 0;
+VACUUM ds;
+SELECT ds_scores('alpha', 64) = ds_scores('alpha', 0) AS after_delete;
+
+-- a second segment (pending flush via fts_merge) with new docs
+INSERT INTO ds SELECT g, to_ftsdoc('simple', 'alpha delta ' || repeat('z ', g % 50)) FROM generate_series(4001, 5000) g;
+SELECT fts_merge('ds_fts') IS NOT NULL AS merged;
+SELECT ds_scores('alpha', 64) = ds_scores('alpha', 0) AS two_segments,
+       ds_scores('delta', 64) = ds_scores('delta', 0) AS new_docs;
+
+-- budget of 1 MB still fits this small index; the 0 path is the cursor; both must
+-- agree with each other and with a full compaction
+SELECT fts_vacuum('ds_fts') IS NOT NULL AS vacuumed;
+SELECT ds_scores('alpha', 1) = ds_scores('alpha', 0) AS after_vacuum;
+
+-- a budget too small for any segment: every segment keeps the cursor path, and
+-- scores are still identical (exercises the over-budget skip in the builder)
+SELECT fts_merge('ds_fts') IS NOT NULL AS merged2;
+SELECT ds_scores('alpha', 1) = ds_scores('alpha', 0) AS tiny_budget_same;
+-- docids outside the resident array (rows inserted after the array was built
+-- land on new heap blocks) must read as absent and fall through correctly
+BEGIN;
+SET LOCAL pg_fts.doclen_cache_mb = 64;
+SELECT count(*) > 0 AS warm FROM (SELECT id FROM ds WHERE d @@@ to_ftsquery('simple','alpha')
+  ORDER BY d <=> to_ftsquery('simple','alpha') LIMIT 5) s;
+COMMIT;
+INSERT INTO ds SELECT g, to_ftsdoc('simple', 'alpha omega ' || repeat('q ', g % 30)) FROM generate_series(9001, 9400) g;
+SELECT fts_merge('ds_fts') IS NOT NULL AS merged3;
+SELECT ds_scores('omega', 64) = ds_scores('omega', 0) AS new_blocks_same,
+       length(ds_scores('omega', 64)) > 0 AS omega_nonempty;
+
+DROP FUNCTION ds_scores(text, int);
+DROP TABLE ds;

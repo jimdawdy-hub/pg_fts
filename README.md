@@ -267,25 +267,25 @@ of the last 5, every row parity-checked against regex ground truth).  This parag
 is regenerated from that file whenever it changes -- if they ever disagree, the
 summary is right and this is stale.
 
-  * **Where pg_fts wins.**  Exact `count(*)` is index-native: **2.20 ms** on a
-    common term vs 13.63 ms for pg_search; pg_textsearch and VectorChord-bm25
-    cannot answer the query at all.  Under load it is 2,923 tps vs 513
-    (**5.7x**).  Smallest index of the five engines measured (**1,421 MB** vs
-    1,887-2,902 MB).  The full query language -- phrase, NEAR, prefix, fuzzy,
-    regex, field zones -- through one operator; none of the specialist engines
-    offer all of it.  Exact top-k (no early termination), MVCC-correct results,
-    crash/replication/corruption tested, and an index that stays bounded under
-    unattended autovacuum (measured flat over churn at 1M docs).
-  * **Where pg_fts loses.**  Common-term ranked top-k: `year` (df 734,896) is
-    **36.16 ms** vs pg_search 2.12, VectorChord 3.49, pg_textsearch 20.71 -- ~17x
-    behind pg_search single-client and ~20x under load.  Rare and mid terms are
-    competitive but not leading (rare: 5.89 vs pg_search 2.13, pg_textsearch
-    7.36).  The gap is architectural: 45% of a common-term query is per-posting
-    doclen work and 37% candidate iteration, which bitmap+SIMD engines elide.
-    Closing it is a posting-format change tracked as item D in ROADMAP.md, not a
-    tuning matter.  Build time (381 s) trails pg_search (127 s) and VectorChord
-    (56 s).  Bulk-loading very long documents grows the index until an
-    `fts_vacuum` (see the known issue in the CHANGELOG).
+  * **Where pg_fts wins.**  Against pg_textsearch 1.4.0 (1.9.0, 2026-10-01, identical
+    query forms): every ranked band -- rare **0.67 ms vs 0.84**, mid 0.79 vs 1.07,
+    common `year` (df 734,896) **7.19 vs 11.40**, top-100 7.37 vs 13.87 -- and
+    boolean ranked AND/OR **11-17x**, prefix 1.7x.  Under load at 16 clients: rare
+    12,412 vs 8,115 tps, common 968 vs 650.  Exact `count(*)` is index-native:
+    **0.19 ms** on a common term; pg_textsearch answers it only by sequential scan
+    (251 s) and VectorChord-bm25 cannot answer it; vs pg_search (September) 2.20 vs
+    13.63 ms.  Smallest index of the five engines measured (**1,421 MB** vs
+    1,887-2,902 MB).  The full query language -- phrase, NEAR, prefix, fuzzy, regex,
+    field zones -- through one operator.  Exact top-k (no early termination),
+    MVCC-correct results, crash/replication/corruption tested.
+  * **Where pg_fts loses.**  Ranked phrase: 138 ms vs pg_textsearch's 42.9 (3.2x;
+    `positions=on`), because pg_fts materializes the whole phrase match set before
+    ranking.  Rare-term throughput falls from 12.4k to 8.6k tps between 16 and 64
+    clients, while pg_textsearch stays flat at ~8.2k (cause not yet identified; see
+    the CHANGELOG known issues).  Against pg_search (Tantivy, September, 1.6-era
+    numbers, not re-measured) the common-term gap was ~17x single-client and has not
+    been re-measured since 1.9.0.  Build time (272 s + `fts_vacuum`) trails pg_search
+    (127 s) and VectorChord (56 s).
   * **A caveat on pg_search's speed.**  Tantivy does not stem: for `year` it
     returns 495,580 matches where the correct stemmed count is 734,896.  Part of
     its advantage is a smaller unit of work.

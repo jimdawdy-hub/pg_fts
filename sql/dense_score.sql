@@ -1,0 +1,87 @@
+-- dense_score: a single-term, single-segment ranked query on a high-df term is
+-- scored exhaustively (fts_search_dense1, 1.9.0) instead of with WAND.  It must
+-- return exactly what WAND returns -- ids, order and distances -- for every k,
+-- with ties, after deletes (tombstones), and through fts_search().
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+CREATE TABLE dsc (id int PRIMARY KEY, d ftsdoc);
+-- 'com' in every doc; lengths vary so scores vary; many exact ties
+INSERT INTO dsc SELECT g, to_ftsdoc('simple', 'com ' || repeat('com ', g % 3) || repeat('f' || (g % 5) || ' ', g % 17))
+FROM generate_series(1, 6000) g;
+CREATE INDEX dsc_fts ON dsc USING fts (d);
+VACUUM ANALYZE dsc;
+
+CREATE FUNCTION dsc_same(k int) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE w text; dn text; f1 text; f2 text;
+BEGIN
+  SET LOCAL pg_fts.dense_score_min_df = 0;
+  SELECT string_agg(id || ':' || (d <=> to_ftsquery('simple','com'))::text, ',') INTO w
+    FROM (SELECT id, d FROM dsc WHERE d @@@ to_ftsquery('simple','com') ORDER BY d <=> to_ftsquery('simple','com') LIMIT k) s;
+  SELECT string_agg(ctid::text || ':' || score::text, ',') INTO f1 FROM fts_search('dsc_fts', to_ftsquery('simple','com'), k);
+  SET LOCAL pg_fts.dense_score_min_df = 1;
+  SELECT string_agg(id || ':' || (d <=> to_ftsquery('simple','com'))::text, ',') INTO dn
+    FROM (SELECT id, d FROM dsc WHERE d @@@ to_ftsquery('simple','com') ORDER BY d <=> to_ftsquery('simple','com') LIMIT k) s;
+  SELECT string_agg(ctid::text || ':' || score::text, ',') INTO f2 FROM fts_search('dsc_fts', to_ftsquery('simple','com'), k);
+  RETURN w IS NOT NULL AND w = dn AND f1 = f2;
+END $$;
+
+SELECT bool_and(dsc_same(k)) AS dense_equals_wand
+FROM (VALUES (1), (2), (10), (100), (999), (6000)) ks(k);
+
+-- tombstones: deleted docs must be skipped by the dense loop exactly as by WAND
+DELETE FROM dsc WHERE id % 7 = 0;
+VACUUM dsc;
+SELECT bool_and(dsc_same(k)) AS dense_equals_wand_after_delete
+FROM (VALUES (1), (10), (100), (5000)) ks(k);
+SELECT count(*) AS live_ranked FROM (SELECT id FROM dsc WHERE d @@@ to_ftsquery('simple','com')
+  ORDER BY d <=> to_ftsquery('simple','com')) s;
+
+-- a second segment: dense scoring needs ONE cursor, so a multi-segment index
+-- must fall back to WAND and still agree (pending rows folded by fts_merge)
+INSERT INTO dsc SELECT g, to_ftsdoc('simple', 'com ' || repeat('f' || (g % 5) || ' ', g % 11))
+FROM generate_series(6001, 9000) g;
+SET maintenance_work_mem = '1MB';
+SELECT fts_merge('dsc_fts') IS NOT NULL AS merged;
+RESET maintenance_work_mem;
+SELECT bool_and(dsc_same(k)) AS dense_equals_wand_multiseg
+FROM (VALUES (1), (10), (500)) ks(k);
+-- dense threshold above the term's df: WAND path, same answer
+SET pg_fts.dense_score_min_df = 100000000;
+SELECT count(*) AS above_threshold_rows FROM (SELECT id FROM dsc WHERE d @@@ to_ftsquery('simple','com')
+  ORDER BY d <=> to_ftsquery('simple','com') LIMIT 10) s;
+RESET pg_fts.dense_score_min_df;
+-- the dense path through fts_search with a 'k' larger than the match set
+SELECT count(*) = (SELECT count(*) FROM dsc) AS k_exceeds_df
+FROM fts_search('dsc_fts', to_ftsquery('simple','com'), 100000);
+
+-- the positional phrase intersection (galloping forward probe, 1.9.0): phrase
+-- matches from a positions=on index must equal a seqscan @@@, including docs
+-- where the second term appears only BEFORE the first, gaps of every size in
+-- the non-driving term's posting list, and a term that is absent
+CREATE TABLE ph (id int, d ftsdoc);
+INSERT INTO ph SELECT g, to_ftsdoc('simple',
+    CASE WHEN g % 3 = 0 THEN 'alpha beta gamma'
+         WHEN g % 3 = 1 THEN 'beta alpha gamma'
+         ELSE 'alpha gamma beta' END || repeat(' alpha', g % 4) || CASE WHEN g % 97 = 0 THEN ' beta' ELSE '' END)
+FROM generate_series(1, 5000) g;
+CREATE INDEX ph_fts ON ph USING fts (d) WITH (positions = on);
+VACUUM ANALYZE ph;
+CREATE FUNCTION ph_same(q text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE i bigint; s bigint;
+BEGIN
+  SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = on; SET LOCAL enable_indexscan = on;
+  EXECUTE format('SELECT count(*) FROM ph WHERE d @@@ to_ftsquery(''simple'', %L)', q) INTO i;
+  SET LOCAL enable_seqscan = on; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
+  EXECUTE format('SELECT count(*) FROM ph WHERE d @@@ to_ftsquery(''simple'', %L)', q) INTO s;
+  RETURN i = s;
+END $$;
+SELECT ph_same('"alpha beta"') AS p1, ph_same('"beta alpha"') AS p2, ph_same('"alpha gamma"') AS p3,
+       ph_same('"gamma beta"') AS p4, ph_same('"alpha beta gamma"') AS p5, ph_same('"alpha zzz"') AS p6;
+SELECT count(*) AS ranked_phrase_rows FROM (SELECT id FROM ph WHERE d @@@ to_ftsquery('simple','"alpha beta"')
+  ORDER BY d <=> to_ftsquery('simple','"alpha beta"') LIMIT 10) s;
+DROP FUNCTION ph_same(text);
+DROP TABLE ph;
+
+DROP FUNCTION dsc_same(int);
+DROP TABLE dsc;

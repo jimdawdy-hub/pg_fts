@@ -880,6 +880,44 @@ SELECT * FROM messages
   </formalpara>
  </sect2>
 
+ <sect2 id="pgfts-ranked-tuning">
+  <title>Ranked-query tuning parameters</title>
+
+  <para>
+   Both settings change only how fast a ranked query runs, never which rows it
+   returns or in what order.
+  </para>
+
+  <variablelist>
+   <varlistentry>
+    <term><varname>pg_fts.doclen_cache_mb</varname> (<type>integer</type>, default 64)</term>
+    <listitem>
+     <para>
+      Per-backend memory, in megabytes, for a resident copy of each index's
+      document lengths (about 2.6 bytes per document), built on the first
+      ranked query after the index's segments change.  With it a document's
+      length is read with two array lookups instead of a page decode.  A
+      segment that does not fit keeps the page-based lookup.  <literal>0</literal>
+      disables it.  Note that every backend holds its own copy; with many
+      concurrent backends this adds up.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><varname>pg_fts.dense_score_min_df</varname> (<type>integer</type>, default 32768)</term>
+    <listitem>
+     <para>
+      A ranked query on a single plain term whose postings live in one segment
+      and number at least this many is scored exhaustively instead of with
+      block-max WAND, which prunes almost nothing for very common terms.
+      <literal>0</literal> disables it.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
  <sect2 id="pgfts-limitations">
   <title>Limitations</title>
 

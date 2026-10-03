@@ -119,7 +119,50 @@ bm25_for_unpack(const unsigned char *buf, int n, uint64 *out)
 	bits = buf + 1;
 	mask = (width >= 64) ? ~UINT64CONST(0) : (((uint64) 1 << width) - 1);
 	bitpos = 0;
-	for (i = 0; i < n; i++)
+
+	/*
+	 * Fast path (1.9.0): for width <= 56 every value fits in one 8-byte window
+	 * starting at its first byte (shift <= 7, so shift + width <= 63), so one
+	 * unaligned little-endian load replaces the byte-assembly loop below, which
+	 * was ~30% of a common-term ranked query (perf, 2026-10-01).  The window may
+	 * extend past this column's last byte, so take it only while 8 bytes remain
+	 * inside the column's own extent [bits, bits + colbytes) -- never reading
+	 * past what the encoder wrote -- and finish with the exact loop.  Same bits,
+	 * same result, on any architecture: memcpy into a uint64, byte-swapped on a
+	 * big-endian host (the stream is little-endian by definition).
+	 */
+	if (width <= 56)
+	{
+		int			colbytes = (n * width + 7) / 8;
+
+		for (i = 0; i < n; i++)
+		{
+			int			byte = bitpos >> 3;
+			uint64		w;
+
+			if (byte + 8 > colbytes)
+				break;
+			memcpy(&w, bits + byte, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+			w = __builtin_bswap64(w);
+#elif !defined(__BYTE_ORDER__)
+			/* byte order unknown at compile time (non-GCC/Clang): assemble
+			 * little-endian explicitly -- correct everywhere, just slower */
+			{
+				int			kk;
+
+				w = 0;
+				for (kk = 0; kk < 8; kk++)
+					w |= (uint64) bits[byte + kk] << (kk * 8);
+			}
+#endif
+			out[i] = (w >> (bitpos & 7)) & mask;
+			bitpos += width;
+		}
+	}
+	else
+		i = 0;
+	for (; i < n; i++)
 	{
 		int			byte = bitpos >> 3;
 		int			shift = bitpos & 7;

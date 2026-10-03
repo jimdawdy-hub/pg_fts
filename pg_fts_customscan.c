@@ -47,6 +47,8 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_language.h"
 
 #include "pg_fts.h"
 #include "pg_fts_am.h"			/* bm25_init_reloptions */
@@ -63,9 +65,256 @@ pg_fts_customscan_dummy(PG_FUNCTION_ARGS)
 
 /* ---- saved previous hooks (chain, do not clobber) ---- */
 static create_upper_paths_hook_type prev_upper_paths_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 /* cached OID of the @@@ (ftsdoc, ftsquery) operator; resolved lazily */
 static Oid	fts_match_op = InvalidOid;
+
+/*
+ * ===== LIMIT hint for the ORDER BY <=> ordering scan (1.9.0) =====
+ *
+ * An index AM is never told the query's LIMIT, so bm25_gettuple used to compute
+ * a fixed top-100 (and bm25_topk_visible over-fetched x4 on top: WAND top-400
+ * for a LIMIT 10).  A deep k keeps WAND's threshold low and disables block
+ * skipping.  After planning, walk the plan: for every  Limit -> IndexScan  on a
+ * bm25 index whose single ORDER BY is  <expr> <=> <ftsquery Const>  and whose
+ * LIMIT/OFFSET are constants, replace that Const with a COPY carrying
+ * k = limit + offset in FtsQueryData.flags.
+ *
+ * Safety: the hint only sizes the FIRST batch.  bm25_gettuple's grow-and-
+ * recompute path is unchanged, so an executor that pulls past k (a cursor, a
+ * changed plan) still gets every row in exact order -- the hint can cost a
+ * recompute, never a wrong or missing row.  The original Const is never written
+ * (it may be shared with the plan cache); a fresh one replaces it.  Same
+ * approach as pg_textsearch's tp_attach_seed_hint.
+ */
+static bool
+fts_limit_const(Node *n, int64 *v)
+{
+	Const	   *c;
+
+	if (n == NULL || !IsA(n, Const))
+		return false;
+	c = (Const *) n;
+	if (c->constisnull || c->consttype != INT8OID)
+		return false;
+	*v = DatumGetInt64(c->constvalue);
+	return true;
+}
+
+/*
+ * The OID of pg_fts's own fts_current_distance(), resolved in the same schema
+ * as the ftsquery type, and only if its C symbol is the one in this module
+ * (pg_proc.prosrc = 'fts_current_distance', language C).  InvalidOid if the
+ * installed SQL predates it -- score reuse is then simply off.
+ */
+static Oid
+fts_lookup_current_distance_fn(void)
+{
+	Oid			typoid = TypenameGetTypid("ftsquery");
+	Oid			nsp;
+	Oid			fn;
+	HeapTuple	tup;
+	bool		ok = false;
+
+	if (!OidIsValid(typoid))
+		return InvalidOid;
+	tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
+	if (!HeapTupleIsValid(tup))
+		return InvalidOid;
+	nsp = ((Form_pg_type) GETSTRUCT(tup))->typnamespace;
+	ReleaseSysCache(tup);
+	fn = GetSysCacheOid3(PROCNAMEARGSNSP, Anum_pg_proc_oid,
+						 CStringGetDatum("fts_current_distance"),
+						 PointerGetDatum(buildoidvector(NULL, 0)),
+						 ObjectIdGetDatum(nsp));
+	if (!OidIsValid(fn))
+		return InvalidOid;
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn));
+	if (HeapTupleIsValid(tup))
+	{
+		Form_pg_proc p = (Form_pg_proc) GETSTRUCT(tup);
+		bool		isnull;
+		Datum		src = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosrc, &isnull);
+
+		ok = (p->prolang == ClanguageId && p->prorettype == FLOAT8OID && !isnull &&
+			  strcmp(TextDatumGetCString(src), "fts_current_distance") == 0);
+		ReleaseSysCache(tup);
+	}
+	return ok ? fn : InvalidOid;
+}
+
+static bool
+fts_is_bm25_indexscan(IndexScan *scan)
+{
+	Relation	irel;
+	bool		isfts;
+
+	irel = index_open(scan->indexid, NoLock);
+	isfts = (irel->rd_indam != NULL && irel->rd_indam->amgettuple == bm25_gettuple);
+	index_close(irel, NoLock);
+	return isfts;
+}
+
+/*
+ * Score reuse (1.9.0).  An ORDER BY <=> ordering scan computes each row's exact
+ * distance from the index, but the planner also places the same `d <=> q`
+ * expression in the scan's target list (it feeds the sort key / Limit), so the
+ * executor RE-EVALUATED fts_distance per returned row: a heap detoast of the
+ * whole ftsdoc plus a fresh BM25.  That was 28% of a rare-term ranked query
+ * (perf, 2026-10-01).  Replace each target-list entry that is equal() to the
+ * scan's own indexorderbyorig with fts_current_distance(), which returns the
+ * distance bm25_gettuple stored for the current tuple.
+ *
+ * Exactness: only RESJUNK entries are replaced -- the copy the planner carries
+ * purely as the sort key, never shown to the user.  A visible `d <=> q` keeps
+ * fts_distance() (its N=1/avgdl=|D| neutral score), so no user-visible value
+ * changes with the plan.  equal() to indexorderbyorig means it is the SAME
+ * expression the index is ordering by, and bm25_gettuple sets
+ * xs_recheckorderby = false, so the substituted value is the very Datum the
+ * scan ordered on.  Only bm25 index scans are touched.
+ */
+static void
+fts_reuse_distance(IndexScan *scan, Oid distfn)
+{
+	ListCell   *lc;
+	Node	   *orig;
+
+	if (list_length(scan->indexorderbyorig) != 1)
+		return;
+	orig = (Node *) linitial(scan->indexorderbyorig);
+	foreach(lc, scan->scan.plan.targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (tle->resjunk && equal(tle->expr, orig))
+			tle->expr = (Expr *) makeFuncExpr(distfn, FLOAT8OID, NIL,
+											  InvalidOid, InvalidOid,
+											  COERCE_EXPLICIT_CALL);
+	}
+}
+
+static void
+fts_hint_indexscan(IndexScan *scan, Limit *limit, Oid ftsqueryoid)
+{
+	int64		count,
+				offset = 0,
+				k;
+	Node	   *expr;
+	OpExpr	   *op;
+	Const	   *orig,
+			   *repl;
+	FtsQuery	q;
+
+	if (list_length(scan->indexorderby) != 1)
+		return;
+	if (!fts_limit_const(limit->limitCount, &count) || count <= 0)
+		return;
+	if (limit->limitOffset != NULL &&
+		(!fts_limit_const(limit->limitOffset, &offset) || offset < 0))
+		return;
+	k = count + offset;
+	if (k <= 0 || k > PG_UINT16_MAX)
+		return;					/* deep page: leave the default batching alone */
+
+	expr = (Node *) linitial(scan->indexorderby);
+	if (!IsA(expr, OpExpr) || list_length(((OpExpr *) expr)->args) != 2)
+		return;
+	op = (OpExpr *) expr;
+	if (!IsA(lsecond(op->args), Const))
+		return;
+	orig = (Const *) lsecond(op->args);
+	if (orig->constisnull || orig->consttype != ftsqueryoid)
+		return;
+
+	q = (FtsQuery) DatumGetPointer(datumCopy(
+		PointerGetDatum(PG_DETOAST_DATUM(orig->constvalue)), false, -1));
+	q->flags = (uint16) k;
+	repl = makeConst(orig->consttype, orig->consttypmod, orig->constcollid,
+					 -1, PointerGetDatum(q), false, false);
+	repl->location = orig->location;
+	lsecond(op->args) = repl;
+}
+
+static void
+fts_hint_walk(Plan *plan, Oid ftsqueryoid, Oid distfn)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+	if (IsA(plan, IndexScan) && ((IndexScan *) plan)->indexorderbyorig != NIL &&
+		fts_is_bm25_indexscan((IndexScan *) plan) && OidIsValid(distfn))
+		fts_reuse_distance((IndexScan *) plan, distfn);
+	if (IsA(plan, Limit) && plan->lefttree != NULL && IsA(plan->lefttree, IndexScan) &&
+		fts_is_bm25_indexscan((IndexScan *) plan->lefttree))
+		fts_hint_indexscan((IndexScan *) plan->lefttree, (Limit *) plan, ftsqueryoid);
+	fts_hint_walk(plan->lefttree, ftsqueryoid, distfn);
+	fts_hint_walk(plan->righttree, ftsqueryoid, distfn);
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				fts_hint_walk(lfirst(lc), ftsqueryoid, distfn);
+			break;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				fts_hint_walk(lfirst(lc), ftsqueryoid, distfn);
+			break;
+		case T_SubqueryScan:
+			fts_hint_walk(((SubqueryScan *) plan)->subplan, ftsqueryoid, distfn);
+			break;
+		case T_CustomScan:
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+				fts_hint_walk(lfirst(lc), ftsqueryoid, distfn);
+			break;
+		default:
+			break;
+	}
+}
+
+static PlannedStmt *
+fts_planner(Query *parse, const char *query_string, int cursorOptions,
+			ParamListInfo boundParams)
+{
+	PlannedStmt *stmt;
+	Oid			ftsqueryoid;
+	ListCell   *lc;
+
+	stmt = prev_planner_hook
+		? prev_planner_hook(parse, query_string, cursorOptions, boundParams)
+		: standard_planner(parse, query_string, cursorOptions, boundParams);
+
+	/* pg_fts not installed in this database / not visible: nothing to hint */
+	ftsqueryoid = TypenameGetTypid("ftsquery");
+	if (!OidIsValid(ftsqueryoid))
+		return stmt;
+	{
+		/* fts_current_distance() exists from 1.9.0's SQL; on an older installed
+		 * extension version it is absent and score reuse is simply skipped */
+		Oid			distfn = fts_lookup_current_distance_fn();
+
+		fts_hint_walk(stmt->planTree, ftsqueryoid, distfn);
+		foreach(lc, stmt->subplans)
+			fts_hint_walk((Plan *) lfirst(lc), ftsqueryoid, distfn);
+	}
+	return stmt;
+}
+
+/*
+ * fts_current_distance() -> float8: the exact <=> distance the bm25 ordering scan
+ * stored for the tuple it most recently returned in this backend.  Only ever
+ * placed in a plan by fts_reuse_distance(), directly in the target list of the
+ * bm25 IndexScan that sets it, so it is read for the same tuple it was set for.
+ * Not meant to be called by users (it is not exposed with a useful meaning
+ * outside that position).
+ */
+PG_FUNCTION_INFO_V1(fts_current_distance);
+Datum
+fts_current_distance(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(fts_current_distance_value);
+}
 
 /* ===== count-pushdown CustomScan: path/plan/exec ===== */
 
@@ -431,6 +680,20 @@ _PG_init(void)
 							4096, 0, INT_MAX,
 							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
+	DefineCustomIntVariable("pg_fts.dense_score_min_df",
+							"Single-term ranked queries on a term with at least this many postings (in one segment) are scored exhaustively instead of with block-max WAND; 0 disables.",
+							"WAND prunes almost nothing for a very common term, so scoring every posting in a tight loop is faster; results are identical.",
+							&pg_fts_dense_score_min_df,
+							32768, 0, INT_MAX,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_fts.doclen_cache_mb",
+							"Per-backend memory budget (MB) for the resident slot-indexed document-length arrays used by ranked scans; 0 disables.",
+							"Each backend decodes an index's doclen sidecar once per segment-directory generation into a dense array (about 2.6 bytes per document) so scoring reads a document's length with two array reads. A segment that does not fit keeps the page-directory lookup.",
+							&pg_fts_doclen_cache_mb,
+							64, 0, 1024,
+							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_fts.build_mem_ceiling_mb",
 							"Per-participant build flush-budget growth ceiling (MB); 0 = 2*maintenance_work_mem.",
 							"Raise to trade RAM for fewer, larger segments on a very large build so its segment count stays under the cap. Peak build memory is about (max_parallel_maintenance_workers + 1) * this. 0 keeps the memory-safe default ceiling.",
@@ -457,4 +720,6 @@ _PG_init(void)
 
 	prev_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = fts_create_upper_paths;
+	prev_planner_hook = planner_hook;
+	planner_hook = fts_planner;
 }

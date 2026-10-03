@@ -136,6 +136,15 @@ style preferences.
     never rush a design change into a correctness release.
 31. **When a published claim turns out wrong, the CHANGELOG says so under "Retracted".**
     The project's credibility rests on this more than on any benchmark.
+32. **Push `main` to GitHub directly, then the tag, then verify `ls-remote ... '^{}'`
+    before trusting a release run.** The Codeberg->GitHub mirror is NOT a short race: on
+    v1.8.5 it delivered the tag and stalled on `main` for 2+ hours, so GitHub's tag
+    pointed at the previous release and the job ran THAT commit's workflow -- the
+    in-workflow guard cannot protect against a stale tag because a stale tag selects a
+    stale workflow. The guard stays as defence in depth; the direct push is the fix.
+    Verify a release by downloading the PGXN and GitHub artifacts and comparing sha256
+    -- not by reading a log line, and never by grepping across runs (I read a previous
+    release's "accepted" as the current one's).
 
 ## Build / test
 
@@ -148,3 +157,5 @@ Local syntax check (note the `.c` files `#include`d into `pg_fts_am.c`):
 
 Benchmarks and scale validation run on EC2 (`/tmp/launch.sh`, `/tmp/teardown.sh`); local
 green means nothing for the delete/merge path. Terminate the instance when done.
+
+See .agent-steering-domains.md for domain-specific steering (local).

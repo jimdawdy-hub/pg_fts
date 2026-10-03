@@ -2229,6 +2229,11 @@ typedef struct BM25DoclenCursor
 	BM25DoclenResident *res;	/* SHARED resident block for this segment (borrowed
 								 * from the scan's per-segment slot; never freed
 								 * by the cursor) */
+	/* C1 resident slot array (borrowed from the relcache chunk), or NULL */
+	const uint32 *slot_base;
+	const uint8 *slot_byte;
+	BlockNumber slot_minblk;
+	uint32		slot_nblk;
 } BM25DoclenCursor;
 
 /*
@@ -2247,6 +2252,21 @@ typedef struct BM25DoclenDir
 	int			n;				/* number of pages (entries) */
 	int			docid_off;		/* uint64 index into the packed docid[] region */
 	int			blk_off;		/* BlockNumber index into the packed blk[] region */
+	/*
+	 * C1 (1.9.0): resident SLOT-indexed doclen array, or slot_nblk == 0 when this
+	 * segment did not fit pg_fts.doclen_cache_mb.  A docid is heap_block * F +
+	 * offset (bm25_tid_to_docid), so for heap blocks [slot_minblk, +slot_nblk)
+	 * base[i]..base[i+1] is block i's run of per-offset bytes: the doc at offset
+	 * o (1-based) has byte bytes[base[i] + o - 1], and 0 means "no doc there"
+	 * (fts_doclen_to_byte maps every len >= 1 to a byte >= 1, and a doc with no
+	 * terms has no postings, so it is never looked up).  Byte-identical to the
+	 * sidecar it was decoded from; lookup is two array reads.  Offsets are bytes
+	 * from the start of the cache chunk.
+	 */
+	BlockNumber slot_minblk;
+	uint32		slot_nblk;
+	Size		slot_base_off;	/* uint32 base[slot_nblk + 1] */
+	Size		slot_byte_off;	/* uint8 bytes[base[slot_nblk]] */
 } BM25DoclenDir;
 
 typedef struct BM25DoclenDirCache
@@ -2356,6 +2376,8 @@ bm25_doclendir_count_seg(Relation index, BlockNumber start)
  * the live segment doclenstarts + generation.  Returns NULL if no v4 segment
  * has a sidecar (nothing to cache).
  */
+static BM25DoclenDirCache *bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc);
+
 static BM25DoclenDirCache *
 bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 {
@@ -2420,8 +2442,157 @@ bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 			dc->nsegs++;
 		}
 	}
+	dc = bm25_doclendir_add_slots(index, dc);
 	index->rd_amcache = (void *) dc;
 	return dc;
+}
+
+/* GUC (1.9.0, C1): budget in MB for the resident slot-indexed doclen arrays a
+ * backend keeps per index in its relcache entry.  0 disables (every lookup goes
+ * through the page-directory cursor, the 1.8 behaviour).  Defined here,
+ * registered in _PG_init (pg_fts_customscan.c). */
+int			pg_fts_doclen_cache_mb = 64;
+
+/*
+ * C1: append a resident SLOT-indexed doclen array for each sidecar segment to
+ * the directory chunk, and return the (re-allocated) chunk.
+ *
+ * Why: the per-posting doclen lookup was 59% of a rare-term ranked query and 44%
+ * of a common one (perf, 2026-10-01).  The sidecar is gap-encoded by docid, so
+ * every lookup is a directory search, a page read + header walk, an FOR unpack
+ * of a 128-doc block, and an in-block search.  A docid is heap_block * F +
+ * offset, and a heap block holds only a handful of tuples, so a per-heap-block
+ * offset base plus one byte per offset slot is DENSE: 2.19M docs over 501k heap
+ * blocks is 3.9M slots + 2.0M bases = ~5.7 MB, decoded once per backend per
+ * directory generation, after which a lookup is base[blk - min] + off.
+ *
+ * Built from bm25_doclens_load(), the decoder merge already uses, so the bytes
+ * are identical to what the cursor would have returned.  Each segment is kept
+ * only if the running total stays under pg_fts.doclen_cache_mb; a segment that
+ * does not fit simply keeps the cursor path.  Everything ends up in ONE chunk
+ * (rd_amcache's contract), never above MaxAllocSize.  No on-disk change.
+ *
+ * ponytail: the rebuild is a full sidecar decode (~tens of ms on 2.19M docs) paid
+ * by the first ranked scan in each backend after ANY directory-generation bump
+ * (flush/merge/vacuum).  Fine for read-mostly; under constant small flushes, an
+ * incremental rebuild (reuse unchanged segments' arrays) is the upgrade path.
+ */
+static BM25DoclenDirCache *
+bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc)
+{
+	MemoryContext tmp,
+				old;
+	Size		budget = (Size) pg_fts_doclen_cache_mb * 1024 * 1024;
+	Size		basesz = offsetof(BM25DoclenDirCache, data) +
+		(Size) dc->ndocid * 2 * sizeof(uint64);
+	Size		extra = 0;
+	uint32	   *bases[BM25_MAX_SEGMENTS];
+	uint8	   *bytes[BM25_MAX_SEGMENTS];
+	Size		nbytes[BM25_MAX_SEGMENTS];
+	BM25DoclenDirCache *out;
+	int			i;
+
+	if (budget == 0 || dc->nsegs == 0)
+		return dc;
+	tmp = AllocSetContextCreate(CurrentMemoryContext, "pg_fts doclen slots",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(tmp);
+	for (i = 0; i < dc->nsegs; i++)
+	{
+		BM25DoclenDir *sd = &dc->segs[i];
+		BM25Doclens d;
+		BlockNumber minblk,
+					maxblk;
+		uint32		nblk,
+					b;
+		Size		segsz,
+					nslot;
+		uint32	   *base;
+		uint8	   *byt;
+		int			j;
+
+		bases[i] = NULL;
+		bytes[i] = NULL;
+		sd->slot_nblk = 0;
+		CHECK_FOR_INTERRUPTS();
+		bm25_doclens_load(index, sd->start, &d);
+		if (d.n == 0)
+			continue;
+		minblk = (BlockNumber) (d.docids[0] / BM25_OFFSET_FACTOR);
+		maxblk = (BlockNumber) (d.docids[d.n - 1] / BM25_OFFSET_FACTOR);
+		nblk = maxblk - minblk + 1;
+		/* pass 1: max offset per heap block -> base[] prefix sums */
+		base = (uint32 *) FTS_ALLOC_MAYBE_HUGE((Size) (nblk + 1) * sizeof(uint32));
+		memset(base, 0, (Size) (nblk + 1) * sizeof(uint32));
+		for (j = 0; j < d.n; j++)
+		{
+			uint32		bi = (uint32) (d.docids[j] / BM25_OFFSET_FACTOR) - minblk;
+			uint32		off = (uint32) (d.docids[j] % BM25_OFFSET_FACTOR);
+
+			if (off > base[bi + 1])
+				base[bi + 1] = off;	/* temporarily: max offset of block bi */
+		}
+		for (b = 0; b < nblk; b++)
+			base[b + 1] += base[b];
+		nslot = base[nblk];
+		segsz = MAXALIGN((Size) (nblk + 1) * sizeof(uint32)) + MAXALIGN(nslot);
+		if (nslot > PG_UINT32_MAX || basesz + extra + segsz > budget ||
+			basesz + extra + segsz > MaxAllocSize)
+		{
+			bm25_doclens_free(&d);
+			continue;			/* over budget: this segment keeps the cursor path */
+		}
+		/* pass 2: scatter the bytes into their slots */
+		byt = (uint8 *) FTS_ALLOC_MAYBE_HUGE(Max(nslot, 1));
+		memset(byt, 0, Max(nslot, 1));
+		for (j = 0; j < d.n; j++)
+		{
+			uint32		bi = (uint32) (d.docids[j] / BM25_OFFSET_FACTOR) - minblk;
+			uint32		off = (uint32) (d.docids[j] % BM25_OFFSET_FACTOR);
+
+			if (off >= 1)
+				byt[base[bi] + off - 1] = d.bytes[j];
+		}
+		bm25_doclens_free(&d);
+		bases[i] = base;
+		bytes[i] = byt;
+		nbytes[i] = nslot;
+		sd->slot_minblk = minblk;
+		sd->slot_nblk = nblk;
+		extra += segsz;
+	}
+	MemoryContextSwitchTo(old);
+
+	if (extra == 0)
+	{
+		MemoryContextDelete(tmp);
+		return dc;
+	}
+	/* one chunk: the existing header + directory, then each segment's arrays */
+	old = MemoryContextSwitchTo(CacheMemoryContext);
+	out = (BM25DoclenDirCache *) palloc(MAXALIGN(basesz) + extra);
+	MemoryContextSwitchTo(old);
+	memcpy(out, dc, basesz);
+	{
+		Size		pos = MAXALIGN(basesz);
+
+		for (i = 0; i < out->nsegs; i++)
+		{
+			BM25DoclenDir *sd = &out->segs[i];
+
+			if (sd->slot_nblk == 0)
+				continue;
+			sd->slot_base_off = pos;
+			memcpy((char *) out + pos, bases[i], (Size) (sd->slot_nblk + 1) * sizeof(uint32));
+			pos += MAXALIGN((Size) (sd->slot_nblk + 1) * sizeof(uint32));
+			sd->slot_byte_off = pos;
+			memcpy((char *) out + pos, bytes[i], nbytes[i]);
+			pos += MAXALIGN(nbytes[i]);
+		}
+	}
+	MemoryContextDelete(tmp);
+	pfree(dc);
+	return out;
 }
 
 static void
@@ -2435,6 +2606,10 @@ bm25_doclen_cursor_init(BM25DoclenCursor *c, Relation index, BlockNumber start,
 	c->dir_n = 0;
 	c->dir_hint = 0;
 	c->res = NULL;
+	c->slot_base = NULL;
+	c->slot_byte = NULL;
+	c->slot_minblk = 0;
+	c->slot_nblk = 0;
 
 	if (start == InvalidBlockNumber || dc == NULL)
 		return;					/* v3 segment (inline doclen) or no cache */
@@ -2448,6 +2623,13 @@ bm25_doclen_cursor_init(BM25DoclenCursor *c, Relation index, BlockNumber start,
 				c->dir_docid = BM25_DOCLENDIR_DOCIDS(dc) + dc->segs[i].docid_off;
 				c->dir_blk = BM25_DOCLENDIR_BLKS(dc) + dc->segs[i].blk_off;
 				c->dir_n = dc->segs[i].n;
+				if (dc->segs[i].slot_nblk > 0)
+				{
+					c->slot_base = (const uint32 *) ((const char *) dc + dc->segs[i].slot_base_off);
+					c->slot_byte = (const uint8 *) ((const char *) dc + dc->segs[i].slot_byte_off);
+					c->slot_minblk = dc->segs[i].slot_minblk;
+					c->slot_nblk = dc->segs[i].slot_nblk;
+				}
 				break;
 			}
 	}
@@ -2480,6 +2662,9 @@ bm25_doclen_cursor_free(BM25DoclenCursor *c)
 	c->dir_blk = NULL;
 	c->dir_n = 0;
 	c->res = NULL;
+	c->slot_base = NULL;
+	c->slot_byte = NULL;
+	c->slot_nblk = 0;
 }
 
 /* Decode the ONE sidecar block on page `blkno` whose docid range covers `docid`
@@ -2585,6 +2770,26 @@ bm25_doclen_cursor_lookup(BM25DoclenCursor *c, uint64 docid)
 	int			lo,
 				hi,
 				pg;
+
+	/* C1 fast path: resident slot array, two array reads.  A block outside the
+	 * array, or an empty slot, means "not in this segment's sidecar" -- exactly
+	 * what the cursor path returns for an absent docid.  Gated on the GUC at
+	 * lookup time too (not only at cache build), so SET pg_fts.doclen_cache_mb
+	 * = 0 takes effect immediately in a session whose cache is already built. */
+	if (c->slot_nblk > 0 && pg_fts_doclen_cache_mb > 0)
+	{
+		uint64		bi = docid / BM25_OFFSET_FACTOR;
+		uint32		off = (uint32) (docid % BM25_OFFSET_FACTOR);
+		uint32		idx;
+
+		if (bi < c->slot_minblk || bi - c->slot_minblk >= c->slot_nblk || off == 0)
+			return 0;
+		bi -= c->slot_minblk;
+		idx = c->slot_base[bi] + off - 1;
+		if (idx >= c->slot_base[bi + 1])
+			return 0;
+		return fts_byte_to_doclen(c->slot_byte[idx]);
+	}
 
 	if (c->dir_n == 0 || c->dir_docid == NULL || r == NULL)
 		return 0;
@@ -2937,6 +3142,8 @@ static BlockNumber bm25_write_trigrams_iter(Relation index, DictNextFn next,
 /* forward decls: blob read/write live in pg_fts_trgm_index.c (included below) */
 static BlockNumber bm25_write_blob(Relation index, const uint8 *data, Size len);
 static uint8 *bm25_read_blob(Relation index, BlockNumber blk, Size len);
+static void bm25_sm_open_checked(Relation index, BlockNumber blk, const char *what,
+								 sm_t *map, uint8 *buf, Size len);
 
 /*
  * Write one immutable segment (dictionary + postings + trigram index) from a
@@ -3368,7 +3575,8 @@ merge_source_open(Relation index, const BM25SegMeta *seg, MergeSource *src,
 	if (seg->livedocs != InvalidBlockNumber && seg->livedocslen > 0)
 	{
 		src->tombbuf = bm25_read_blob(index, seg->livedocs, seg->livedocslen);
-		sm_open(&src->tomb, (uint8_t *) src->tombbuf, seg->livedocslen);
+		bm25_sm_open_checked(index, seg->livedocs, "tombstone",
+							 &src->tomb, src->tombbuf, seg->livedocslen);
 		src->hastomb = true;
 
 		/*
@@ -3840,6 +4048,42 @@ bm25_page_recyclable(Relation index, Page page)
 	 * heap-scoped horizon would, never shorter -- so it is always safe here.
 	 */
 	return GlobalVisCheckRemovableXid(NULL, (TransactionId) op->nextblk);
+}
+
+/*
+ * bm25_sm_open_checked -- open a sparsemap blob WE wrote, and refuse a corrupt one.
+ *
+ * sparsemap 5.6.0 hardened sm_open: a buffer that fails sm_validate is silently
+ * REPLACED WITH AN EMPTY MAP (the caller's copy is zeroed; sm_open is void and sets
+ * no errno).  That is the right contract for a general library taking untrusted
+ * bytes.  It is the wrong outcome for us: an empty TOMBSTONE map means "nothing is
+ * deleted", so a corrupt livedocs blob would silently resurrect every vacuumed
+ * document in query results -- a plausible wrong answer, the failure mode this
+ * project refuses everywhere else.  (A collapsed TRIGRAM map drops fuzzy/regex
+ * candidates instead: also wrong, quieter.)
+ *
+ * We can detect it without library support because every blob here was produced
+ * by us: livedocslen / smlen is exactly sm_get_size() at write time, so a valid
+ * blob reopens to that size and a rejected one reopens to the bare header.  A
+ * legitimately empty set is never stored (callers require len > 0), so a size
+ * collapse is unambiguous.  sm_validate() is checked too, which is what catches
+ * structural damage on a library that does NOT rewrite on open.
+ *
+ * Raises ERRCODE_DATA_CORRUPTED naming the index and block, same as the pd_lower
+ * guards: loud and attributable, never silent.
+ */
+static void
+bm25_sm_open_checked(Relation index, BlockNumber blk, const char *what,
+					 sm_t *map, uint8 *buf, Size len)
+{
+	sm_open(map, (uint8_t *) buf, len);
+	if (unlikely(!sm_validate(map) || sm_get_size(map) != len))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pg_fts: corrupt %s bitmap in index \"%s\" at block %u (stored %zu bytes, reopened as %zu)",
+						what, RelationGetRelationName(index), blk,
+						(size_t) len, (size_t) sm_get_size(map)),
+				 errhint("REINDEX the index to rebuild it from the heap.")));
 }
 
 /* Recycle a chained page list (dict/trigram/posting/data) to the FSM. */
@@ -6337,7 +6581,8 @@ bm25_bulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			int			ncarry = 0,
 						carrycap = 0;
 
-			sm_open(&old, (uint8_t *) buf, sg->livedocslen);
+			bm25_sm_open_checked(index, sg->livedocs, "tombstone",
+								 &old, buf, sg->livedocslen);
 			for (dv = sm_next_member(&old, (uint64_t) -1, &oc);
 				 dv != SM_IDX_MAX;
 				 dv = sm_next_member(&old, dv, &oc))

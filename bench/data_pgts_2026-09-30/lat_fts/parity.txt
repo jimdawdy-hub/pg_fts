@@ -1,0 +1,1 @@
+/tmp/parity_check.sh: line 37: psql: command not found

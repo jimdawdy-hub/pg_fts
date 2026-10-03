@@ -1,0 +1,11 @@
+PASS  term='slovakia' k=10  genuine_misses=0
+PASS  term='slovakia' k=100  genuine_misses=0
+PASS  term='hungary' k=10  genuine_misses=0
+PASS  term='hungary' k=100  genuine_misses=0
+PASS  term='year' k=10  genuine_misses=0
+PASS  term='year' k=100  genuine_misses=0
+PASS  term='slovakia & hungary' k=10  genuine_misses=0
+PASS  term='slovakia & hungary' k=100  genuine_misses=0
+PASS  term='slovakia | hungary' k=10  genuine_misses=0
+PASS  term='slovakia | hungary' k=100  genuine_misses=0
+== PARITY PASS ==

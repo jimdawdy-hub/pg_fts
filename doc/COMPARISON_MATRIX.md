@@ -8,7 +8,7 @@ Competitor rows reflect **what we exercised in our own benchmark runs** (see
 `bench/BENCHMARK_SUMMARY.md` and `bench/data_5way_159b/`), not vendor claims. Where
 a capability was not exercised, it is marked *untested* rather than guessed.
 
-Versions measured: pg_textsearch `f940210`; pg_search (ParadeDB) 0.25.6 /
+Versions measured: pg_textsearch **v1.4.0** (head-to-head 2026-09-30, `bench/RESULTS_PGTS_2026-09-30.md`; earlier columns `f940210`); pg_search (ParadeDB) 0.25.6 /
 paradedb `c807ede`; VectorChord-bm25 `14fc2a3`.
 
 Legend: **Yes** = exercised and working · **No** = absent · *n/t* = not tested by us
@@ -38,11 +38,11 @@ engine is a genuine advantage over our scalar delta-packed postings.
 | Capability | pg_fts | pg_textsearch | pg_search | vchord | tsvector/GIN |
 |---|---|---|---|---|---|
 | BM25 ranked top-k | **Yes** | Yes | Yes | Yes | No (ts_rank is not BM25) |
-| Boolean match predicate (AND/OR/NOT) | **Yes** | No | Yes | **No** (ranking only) | Yes |
-| Exact `count(*)` of a match set | **Yes** (index-native) | **No** | Yes | **No** | Yes (heap/bitmap) |
-| Phrase queries | **Yes** | No | Yes (`###`) | No | Yes (`<->`) |
+| Boolean match predicate (AND/OR/NOT) | **Yes** | Yes (1.x: `@@ tsquery` filter, then sort) | Yes | **No** (ranking only) | Yes |
+| Exact `count(*)` of a match set | **Yes** (index-native) | Yes, but seqscan (`@@`; 251 s on 2.19M rows) | Yes | **No** | Yes (heap/bitmap) |
+| Phrase queries | **Yes** | Yes (1.x: `<->` filter + recheck) | Yes (`###`) | No | Yes (`<->`) |
 | NEAR / proximity with distance | **Yes** | No | *n/t* | No | Yes (`<N>`) |
-| Prefix terms (`term*`) | **Yes** | No | Yes | No | Yes |
+| Prefix terms (`term*`) | **Yes** | Yes (1.x: `:*` filter) | Yes | No | Yes |
 | Fuzzy terms (Levenshtein) | **Yes** (`term~k`, DFA) | No | *n/t* | No | No |
 | Regex terms | **Yes** (`/re/`) | No | *n/t* | No | No |
 | BM25 variants (lucene/robertson/atire/bm25+/bm25l) | **Yes** | No | No | No | n/a |
@@ -53,8 +53,9 @@ engine is a genuine advantage over our scalar delta-packed postings.
 | Lexical anomaly detection | **Yes** | No | No | No | No |
 | `tsquery` migration path | **Yes** (cast + helper) | n/a | No | No | n/a |
 
-**Read:** query-language breadth is pg_fts's widest margin. pg_textsearch is ranked
-retrieval only; vchord is ranking-only by design (no boolean or count support at
+**Read:** query-language breadth is pg_fts's widest margin. pg_textsearch 1.x added
+boolean/phrase/prefix as a `@@ tsquery` filter over its ranked scan (not index-native,
+per its own README), and still has no NEAR, fuzzy or regex; vchord is ranking-only by design (no boolean or count support at
 all); pg_search is the only competitor with comparable breadth.
 
 ## Correctness and semantics
@@ -81,15 +82,31 @@ on the raw text.
 |---|---|---|---|---|
 | **Index size** | **1,421 MB** | 1,887 MB | 2,734 MB | 2,902 MB |
 | Build time | 381 s | 496 s | **127 s** | **56 s** |
-| rare k10 | **5.89 ms** | 7.36 | 2.13 | 2.48 |
-| mid k10 | 10.64 | **7.96** | 2.04 | 2.40 |
+| rare k10 | 5.89 ms (`fts_search`) | 7.36 | 2.13 | 2.48 |
+| mid k10 | 10.64 | 7.96 | 2.04 | 2.40 |
 | common k10 | 36.16 | 20.71 | **2.12** | 3.49 |
 | common k100 | 46.01 | 50.71 | **3.72** | 24.52 |
 | exact `count(*)` | **2.20 ms** | — | 13.63 | — |
 | phrase (tuned) | 229 ms | — | **22.9** | — |
 
-**Read:** pg_fts wins size and `count(*)`, is competitive on rare/mid against the
-like-for-like comparator, and clearly trails on common-term ranked and phrase.
+**Caution: the pg_fts column above used `fts_search()`; the competitors used `ORDER BY`
+forms** (see the retraction in CHANGELOG 1.8.6). And pg_textsearch has since moved.
+Head-to-head on 2026-09-30, both engines using `ORDER BY` forms (pg_fts 1.8.6 vs
+pg_textsearch v1.4.0, same hardware and corpus):
+
+| Measure | pg_fts 1.8.6 | pg_textsearch 1.4.0 |
+|---|---|---|
+| rare / mid k10 | 10.21 / 15.99 ms | **0.92 / 1.17** |
+| common k10 / k100 | 49.16 / 50.14 | **11.41 / 13.75** |
+| AND / OR2 / OR3 k10 | **9.03 / 10.69 / 15.40** | 37.69 / 36.94 / 31.79 |
+| prefix / phrase k10 | 18.38 / 239 (`positions=on`) | **13.41 / 41.8** |
+| exact `count(*)` | **2.50 ms** | 251 s (seqscan) |
+| saturated tps, rare / common / count | 1,050 / 205 / **2,645** | **8,130 / 640** / -- |
+| index size | **1,421 MB** | 1,887 MB |
+
+**Read:** pg_fts wins size, `count(*)` and multi-term boolean ranked. pg_textsearch 1.4.0
+now leads on every single-term ranked query (4-14x) and on prefix and phrase. Both trail
+pg_search on common-term ranked.
 
 ## Operational surface
 
@@ -100,7 +117,7 @@ like-for-like comparator, and clearly trails on common-term ranked and phrase.
 | Extra build dependencies | none | none | openblas, pgvector, pgrx | pgrx |
 | Incremental maintenance (no REINDEX to add rows) | **Yes** (pending list) | *n/t* | *n/t* | *n/t* |
 | `CREATE INDEX CONCURRENTLY` | **Yes** (verified) | *n/t* | *n/t* | *n/t* |
-| Parallel index build | **Yes** (faster; no durable size cost) | *n/t* | *n/t* | *n/t* |
+| Parallel index build | **Yes** (faster; no durable size cost) | Yes (5 workers, 260 s) | *n/t* | *n/t* |
 | Parallel scan | No (built, measured, reverted) | *n/t* | *n/t* | *n/t* |
 | Managed-service safe (replica guard, privileges) | **Yes** | *n/t* | *n/t* | *n/t* |
 | Non-UTF-8 server encodings | **Yes** (fixed 1.5.9) | *n/t* | *n/t* | *n/t* |
@@ -125,14 +142,15 @@ need a Rust toolchain, and pg_search additionally needs OpenBLAS and pgvector.
 - **pg_fts** — you want one index that answers ranked BM25 *and* boolean, exact
   counts, phrase, prefix, fuzzy and regex, with PostgreSQL-consistent stemming, the
   smallest on-disk footprint, and no preload/Rust requirement. Accept slower
-  common-term ranked queries.
+  single-term ranked queries (pg_textsearch 1.4.0 and pg_search are both faster).
 - **pg_search** — you want the fastest ranked latency across the board and can
   accept a Tantivy analyzer that does not stem (so results differ from
   `to_tsvector`), a 1.9× larger index, and a Rust build.
 - **vchord** — you want fast ranking and nothing else; it has no boolean or count
   support, and the largest index here.
-- **pg_textsearch** — you want a minimal, familiar BM25 ranking on top of
-  PostgreSQL's own analyzer, and need nothing beyond ranked retrieval.
+- **pg_textsearch** — you want the fastest single-term BM25 ranking on top of
+  PostgreSQL's own analyzer (1.4.0 leads pg_fts 4-14x there). Boolean/phrase/prefix
+  work as a filter over the ranked scan, and there is no index-backed count.
 - **tsvector/GIN** — already in PostgreSQL, mature tooling, but no BM25 and no
   index-native top-k.
 

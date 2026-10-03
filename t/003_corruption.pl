@@ -253,5 +253,73 @@ my $common_after = $node->safe_psql('postgres',
 	"$q SELECT count(*) FROM docs WHERE to_ftsdoc('simple', body) \@\@\@ 'common'::ftsquery");
 is($common_after, 4000, 'REINDEX from heap restores correct answers after corruption');
 
+# ---------------------------------------------------------------------------
+# A corrupt TOMBSTONE blob must be a loud error, never a silent resurrection.
+#
+# sparsemap 5.6.0 hardened sm_open(): a buffer that fails validation is silently
+# replaced with an EMPTY map (void return, no errno).  For a general library taking
+# untrusted bytes that is correct.  For a tombstone map it would mean "nothing is
+# deleted" -- every vacuumed document reappears in query results with no error, the
+# exact plausible-wrong-answer failure this project refuses.  pg_fts therefore checks
+# the reopened size against the stored length (they are equal for any blob we wrote)
+# and raises ERRCODE_DATA_CORRUPTED instead.  This case would pass on 5.5.1 only by
+# accident (garbage offsets, likely a crash) and fails on 5.6.0 without the guard,
+# because the count comes back as if nothing had been deleted.
+# ---------------------------------------------------------------------------
+$node->safe_psql('postgres', q{
+	DELETE FROM docs WHERE id % 2 = 0;
+	VACUUM docs;                 -- bulkdelete records 2000 tombstones into a livedocs blob
+});
+my $live_before = $node->safe_psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_ftsdoc('simple', body) \@\@\@ 'common'::ftsquery");
+is($live_before, 2000, 'after deleting half: tombstones hide 2000 of 4000 (pre-corruption)');
+
+# REINDEX above gave the index a NEW relfilenode; the earlier $abs is stale.
+my $relpath2 = $node->safe_psql('postgres', "SELECT pg_relation_filepath('docs_fts')");
+my $abs2 = $node->data_dir . '/' . $relpath2;
+$node->stop;
+ok(-f $abs2, "re-resolved index file after REINDEX: $abs2");
+{
+	# Smash the CONTENTS of every blob page, leaving the page header and opaque intact
+	# so the chain is still followed and read; only the sparsemap bytes inside are
+	# garbage.  The tombstone blob is written by bm25_write_blob(), which stamps its
+	# pages BM25_TRGM_DATA (1<<5) -- the same page type as a trigram blob, because
+	# both are "opaque serialized sparsemap" pages.  This index was built with
+	# trigrams OFF (the default), so every TRGM_DATA page here IS the tombstone blob.
+	# (BM25_LIVEDOCS (1<<6) exists in the header but nothing writes it.)
+	my $LIVEDOCS = (1 << 5);
+	open(my $fh, '+<:raw', $abs2) or die "open $abs2: $!";
+	my $size = -s $fh;
+	my $hits = 0;
+	for (my $base = 0; $base + BLCKSZ <= $size; $base += BLCKSZ)
+	{
+		my $buf;
+		sysseek($fh, $base + OPAQUE_FLAGS_OFF, 0) or die;
+		sysread($fh, $buf, 2) == 2 or die;
+		my $flags = unpack('v', $buf);
+		next unless $flags & $LIVEDOCS;
+		sysseek($fh, $base + CONTENT_START, 0) or die;
+		syswrite($fh, "\xA5" x 256) == 256 or die;
+		$hits++;
+	}
+	close $fh;
+	ok($hits > 0, "corrupted $hits tombstone (livedocs) page(s)");
+}
+$node->start;
+
+my ($trc, $tout, $terr) = $node->psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_ftsdoc('simple', body) \@\@\@ 'common'::ftsquery");
+isnt($trc, 0, 'a scan over a corrupt tombstone blob ERRORS rather than answering');
+like($terr, qr/corrupt tombstone bitmap/,
+	 'the error names the corrupt tombstone bitmap (not a generic failure)');
+unlike($tout, qr/^\s*4000\s*$/,
+	 'and it did NOT silently return 4000 (the resurrected-deletes answer)');
+
+# Recoverable, as before.
+$node->safe_psql('postgres', 'REINDEX INDEX docs_fts');
+my $live_after = $node->safe_psql('postgres',
+	"$q SELECT count(*) FROM docs WHERE to_ftsdoc('simple', body) \@\@\@ 'common'::ftsquery");
+is($live_after, 2000, 'REINDEX restores the correct 2000 after tombstone corruption');
+
 $node->stop;
 done_testing();

@@ -46,6 +46,36 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
+      # THE CHECKOUT MUST BE THE RELEASE IT CLAIMS TO BE.
+      #
+      # Codeberg is the origin and mirrors to GitHub.  The mirror pushes main and the
+      # tag as separate ref updates, and the tag-push event can fire while GitHub's
+      # refs/tags/vX.Y.Z still resolves to the PREVIOUS release's commit -- a race of a
+      # few seconds that exists on every release.  On v1.8.4 it landed: the job checked
+      # out v1.8.3's commit, built pg_fts-1.8.3.zip, and failed only because the
+      # filename did not match.  Had it matched, this workflow would have published the
+      # previous release's code under the new tag.
+      #
+      # So: (1) re-fetch the tag until the checked-out META.json version equals the
+      # tag's version, bounded; (2) if it never does, FAIL -- never build a mislabelled
+      # artifact.  (1) tolerates the race; (2) is the invariant and is what matters.
+      - name: Verify checkout matches the tag (mirror race guard)
+        run: |
+          WANT="${{ steps.ver.outputs.version }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          for i in $(seq 1 12); do
+            GOT=$(grep -m1 '"version"' META.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+            if [ "$GOT" = "$WANT" ]; then
+              echo "checkout is $GOT for tag $TAG (attempt $i)"; exit 0
+            fi
+            echo "checkout says $GOT but tag is $TAG; mirror may still be catching up -- refetching ($i/12)"
+            sleep 10
+            git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+            git checkout -q --detach "refs/tags/$TAG" || true
+          done
+          echo "::error::checked out version $GOT does not match tag $TAG after 2 minutes; refusing to build a mislabelled release"
+          exit 1
+
       - name: Install PostgreSQL 17 + server headers
         run: |
           # Remove just the runner's preinstalled Microsoft apt repo (it can
