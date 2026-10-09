@@ -1,0 +1,92 @@
+== rare_k10
+Aggregate  (cost=10.25..10.26 rows=1 width=8)
+  ->  Limit  (cost=10.00..10.12 rows=10 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..10.12 rows=10 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 10
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"slovakia","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+== mid_k10
+Aggregate  (cost=10.25..10.26 rows=1 width=8)
+  ->  Limit  (cost=10.00..10.12 rows=10 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..10.12 rows=10 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 10
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"hungary","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+== common_k10
+Aggregate  (cost=10.25..10.26 rows=1 width=8)
+  ->  Limit  (cost=10.00..10.12 rows=10 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..10.12 rows=10 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 10
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"year","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+== common_k100
+Aggregate  (cost=12.50..12.51 rows=1 width=8)
+  ->  Limit  (cost=10.00..11.25 rows=100 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..11.25 rows=100 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 100
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"year","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+== and_k10
+Aggregate  (cost=97.73..97.74 rows=1 width=8)
+  ->  Limit  (cost=10.00..97.61 rows=10 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..97.61 rows=10 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 10
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"slovakia hungary","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":true}}}}
+== or_k10
+Aggregate  (cost=228.36..228.37 rows=1 width=8)
+  ->  Limit  (cost=10.00..228.24 rows=10 width=12)
+        ->  Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..228.24 rows=10 width=12)
+              Table: docs
+              Index: docs_idx
+              Segment Count: 16
+              Exec Method: TopKScanExecState
+              Scores: true
+                 TopK Order By: pdb.score() desc
+                 TopK Limit: 10
+              Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"slovakia hungary","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+== phrase_k10
+Aggregate  (cost=1017.97..1017.98 rows=1 width=8)
+  ->  Limit  (cost=1010.02..1017.85 rows=10 width=12)
+        ->  Gather Merge  (cost=1010.02..10214.61 rows=11764 width=12)
+              Workers Planned: 2
+              ->  Parallel Custom Scan (ParadeDB Base Scan) on docs  (cost=10.00..7856.73 rows=3 width=12)
+                    Table: docs
+                    Index: docs_idx
+                    Segment Count: 16
+                    Exec Method: TopKScanExecState
+                    Scores: true
+                       TopK Order By: pdb.score() desc
+                       TopK Limit: 10
+                    Tantivy Query: {"with_index":{"query":{"tokenized_phrase":{"field":"content","phrase":"united states","slop":null}}}}
+== count_common
+Custom Scan (ParadeDB Aggregate Scan) on docs  (cost=0.00..0.00 rows=1 width=8)
+  Index: docs_idx
+  Tantivy Query: {"with_index":{"query":{"match":{"field":"content","value":"year","tokenizer":null,"distance":null,"transposition_cost_one":null,"prefix":null,"conjunction_mode":false}}}}
+    Applies to Aggregates: COUNT(*)
+    Aggregate Definition: {"0":{"filter":"*"}}

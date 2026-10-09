@@ -4,6 +4,33 @@ All notable changes to pg_fts are documented here.
 
 ## Unreleased
 
+### Merged upstream 1.9.1 - 1.11.0
+
+- Brings in upstream 1.9.1, 1.10.0 and 1.11.0 (tag `v1.11.0`): the lazy phrase gate,
+  shared document-length arrays, best-first top-k, the MaxScore and `term:LABEL` fixes,
+  the pending-delete VACUUM fix, the four concurrency fixes and the faster builds and
+  merges.  No on-disk format change; no REINDEX required.
+- MaxScore is upstream's.  The fork had already replaced the inherited suffix bound with
+  a low-impact prefix; upstream's 1.11.0 fix is the same correction.  Final scores are now
+  summed in query-term order on every ranked path (upstream), which replaces the fork's
+  fixed descending cursor order for the same purpose: one document, one score, whatever
+  the path or result limit.
+- Block-max WAND keeps upstream's skip-to jump, but never jumps past the end of an
+  at-or-before cursor's current block.  Upstream's "always make progress" step jumped past
+  the pivot in that case and skipped the pivot document unscored; new test
+  `bmw_block_end` returns the wrong top-1 without this (6.97 instead of 7.32).  This is
+  the fork's earlier "block bounds past their valid range" fix, kept.
+- The lazy phrase gate takes only plain ordered phrase chains (`"a b c"`).  The legal-search
+  shapes that `bm25_phrase_chain` also accepts -- unordered `w/N` (WITHIN), exact gaps
+  (`<N>`) and `(A OR B) w/N C` -- keep the collect path that evaluates them.
+- `phrase_gate` sorts its labels with `COLLATE "C"`, so its expected output no longer
+  depends on the server locale.
+- Known residual: pruning bounds (WAND pivot, block sums, MaxScore prefixes) are summed in
+  cursor order while final scores are summed in query-term order.  A bound can therefore
+  round up to one unit in the last place below a candidate's exact score; a document whose
+  score beats the k-th by less than that could be skipped.  No test shows it.  Restoring
+  the fork's same-order guarantee would mean changing every upstream bound site.
+
 ### Proximity, phrase search, and ranking
 
 - Added unordered `w/N`, chained/nested groups, OR alternatives and phrases on
@@ -41,8 +68,10 @@ All notable changes to pg_fts are documented here.
 - Fixed score-addition order across ranked result limits. Tiny floating-point
   changes could reorder tied rows and make adaptive index scans repeat or omit
   results. Pruning bounds use the same addition order as final scores so they
-  cannot underestimate a candidate through grouped rounding. Three-term and
-  four-term queries now have exact prefix checks.
+  cannot underestimate a candidate through grouped rounding (superseded by the
+  upstream 1.11.0 merge above: final scores now use query-term order; see the
+  known residual there). Three-term and four-term queries now have exact prefix
+  checks.
 - Independent exhaustive SQL checks cover direct, indexed, counted and ranked
   result sets with positions on/off, pending/flushed data, and text/binary I/O.
   Strict checks compare ranked prefixes and complete indexed result sets.
@@ -191,6 +220,238 @@ All notable changes to pg_fts are documented here.
   its pending row is ranked by the exact pending fallback), a deep pull across segments with deletes, VACUUM
   and heap-slot reuse (every filter row exactly once, in exact order), and NULL `WHERE` and
   `ORDER BY` values.
+
+## 1.11.0 - 2026-10-08
+
+Ranked queries visit blocks best-first; builds no longer need `fts_vacuum`; three
+wrong-result bugs fixed, one of them in VACUUM (a deleted pending row stayed in the index);
+four concurrency bugs fixed that lost inserted rows, crashed backends or failed scans under
+concurrent insert + merge/VACUUM (all present in every earlier release).
+**No on-disk format change**; **no REINDEX required** to upgrade (a REINDEX does clear
+entries the VACUUM bug already left).  No new SQL objects (`pg_fts--1.10.0--1.11.0.sql` is a
+no-op).  New GUC `pg_fts.bestfirst` (default on; off = the 1.10.0 traversals, identical
+results).  Measured in `bench/RESULTS_A_2026-10-07.md` (protocol written before the run).
+
+### Fixed (wrong results)
+
+- **A row inserted and then deleted before the next VACUUM stayed in the index**
+  (every release).  Newly inserted rows sit in the pending list until a VACUUM folds
+  them into a segment; VACUUM's dead-row pass looked only at segments, so it never
+  removed a deleted pending row, and the cleanup that followed wrote that row into a
+  segment pointing at the freed heap slot.  Afterwards `count(*)` counted it, a
+  bitmap scan returned whatever row later reused the slot (wrong rows that do not
+  contain the term), and an index scan could fail with "could not read blocks".
+  Reproduced on 1.10.0: 2,300 counted and 100 wrong rows returned against 2,200
+  true matches.  VACUUM now folds the pending list into a segment before the dead-row
+  pass.  An index that already holds such entries is corrected by `REINDEX`; new
+  test `pending_delete`.
+- **Ranked queries of four or more terms could return the wrong top-k** (every release
+  with MaxScore, i.e. since 0.1.0).  The essential/non-essential split summed the
+  maximum contributions of the terms AFTER a term instead of the low-impact terms up to
+  it, so candidates were drawn only from the high-impact terms and documents scoring
+  mostly on the others were never seen.  `film | music | album | band` on 2.19M
+  Wikipedia articles returned none of the true top-10.  Found by an exhaustive reference
+  check (`bench/data_A_2026-10-07/mt_oracle.py`); regression test `ranked_exact`.
+- **Ranked `term:LABEL` queries returned documents without that label** (since 1.4.0).
+  The ranked path treated a weight-restricted term as plain presence; `@@@` and counts
+  were correct.  It now takes the heap-recheck path, like fuzzy and regex.
+- **Scores are summed in query-term order on every ranked path.**  The block-max WAND
+  loop summed in cursor order, which is arbitrary among equal docids, so a three-term
+  score could differ in the last bit between two traversals of the same query.
+
+### Fixed (concurrency)
+
+Found by the release churn gate (8 inserters + ranked/count readers + VACUUM/`fts_merge`,
+aarch64), each reproduced on 1.10.0 before the fix.
+
+- **Rows inserted while the pending list was being flushed were lost from the index.**
+  The flush read the list under a share lock, folded it into a segment, then emptied the
+  whole list, dropping every row appended in between: 648-883 rows per flush, about 137k
+  of 3.0M rows after 40 s of 8-way ingest, missing from every scan and count until
+  REINDEX.  The flush now seals the list under the exclusive metapage lock first (a fresh
+  tail page takes new inserts) and folds and frees only the sealed pages.
+- **Merge and VACUUM truncated the index under a lock that admits inserters and
+  scans.**  Symptoms: a backend SIGSEGV in `GenericXLogFinish` on insert, "unexpected data
+  beyond EOF", "could not read blocks", and in the test a corrupted unrelated relation
+  (`bad magic number in sequence`).  The free tail is now truncated only under
+  AccessExclusiveLock (already held by `fts_vacuum`, REINDEX and CREATE INDEX; VACUUM and
+  `fts_merge` try for it conditionally and otherwise leave the tail for a later pass, so
+  the space stays reusable through the FSM).  As with heap VACUUM's truncation, the brief
+  lock is WAL-logged, so on a hot standby it can cancel a conflicting query on the index.
+- **A scan could follow a freed page's recycle stamp as a block number.**  Freeing a page
+  stored its free-time XID in the page's next-page link, but the recycle gate exists
+  because a scan on an older directory snapshot may still be walking that chain: it read
+  the XID as a block ("could not read blocks N..N" with N far past the end of the index),
+  or landed on a live page and raised "corrupt tombstone bitmap".  The stamp now lives in
+  the page header's `pd_prune_xid`, unused on index pages, and the link is left intact;
+  pages freed by earlier releases are still read correctly.  No format change.
+- **A scan that raced a directory change freed its tombstone maps twice** (SIGSEGV in
+  `sm_contains_many`).  The count/bitmap path's retry freed the maps again; the free is
+  now idempotent.
+
+### Changed (performance)
+
+- **Single-term top-k is best-first.**  The term's block headers are read, ordered by
+  block bound, and visited until the best remaining bound is below the k-th score.  The
+  block bound is now exact for the effective length the scorer uses (the existing
+  `min_doclen` header field stores `floor(max_tf * min(len/tf))`; readers are unchanged,
+  old segments keep the looser bound until a merge rewrites them).  Common-term `year`
+  top-10 8.48 -> 0.81 ms, top-100 8.77 -> 1.30 ms.
+- **AND and phrase top-k walk the rarest term's blocks best-first** and look the other
+  terms up, with a bound per block from the overlapping blocks of every term; phrases
+  check adjacency on the candidate.  `united & states` 23.9 -> 2.7 ms, `"united states"`
+  25.0 -> 3.6 ms.
+- **Dictionary seek** binary-searches each index page.
+- **Builds and merges.**  The merge resolves each output term once instead of hashing it
+  per posting, collects the merged length sidecar once per document instead of once per
+  posting, merges the per-source posting runs instead of sorting, and reads source lengths
+  in O(1); FOR packing works a byte at a time.  Every live page is byte-identical to the
+  previous merge output (checked for positions off/on, inline lengths, and a tombstoned
+  merge).  A plain `CREATE INDEX`/`REINDEX` now compacts at the end, so the new index is
+  at its packed size: an expression index on 2.19M articles builds in 257 s at 1,369 MiB,
+  where 1.10.0 took 412 s to a 3.43 GB index plus 198 s of `fts_vacuum`.
+  `CREATE INDEX CONCURRENTLY` keeps the old behaviour; run `fts_vacuum` after it.
+- **Maintenance I/O goes through a buffer ring** (BULKWRITE), so a merge or `fts_vacuum`
+  leaves the hot set resident: with `shared_buffers = 4GB`, an `fts_merge` of a 2.19M
+  index left 99.9% of a warmed second index resident, against 0% before.  A build still
+  evicts through core PostgreSQL's TOAST detoast of the indexed column, which pg_fts
+  cannot route through a ring.
+- **Prefetch** of the ranked candidates' heap blocks before the visibility check, and of
+  the next page wherever a page chain jumps.  Cold-cache top-10 on local NVMe: rare
+  49 -> 45 ms, common 58 -> 49 ms, `united & states` 90 -> 64 ms.
+
+### Retracted
+
+- "pg_search is ~17x / 3.5x faster on common-term ranking, and that gap is architectural
+  (scalar postings vs bitmap + SIMD), not a tuning matter" (AGENTS.md, README, 1.10.0
+  results).  The gap was the traversal: with best-first block order and exact block
+  bounds, pg_fts's common-term top-10 is 0.81 ms against pg_search's 2.63 on the same
+  hardware.
+- The 1.10.0 build time "298 s + 200 s `fts_vacuum`" was a build on a pre-filled stored
+  column; the 995 s fill was not counted, while the other engines analysed text inside
+  their build.  The expression-index figure (412 s + 198 s for 1.10.0) is the comparable
+  one.
+
+### Tests
+
+- `t/012_concurrent_flush.pl`: 6 inserting clients and 2 ranked/count readers against a
+  `fts_merge` + delete + VACUUM loop; the index must match the heap exactly with no
+  error or crash.  Fails 3/3 on 1.10.0's code; reverting each fix alone, it fails 3/3
+  (lost rows), 3/3 (stale link) and 5/6 (truncation lock).
+- `test/a1_recycle/double_free.sh` (out-of-band, needs `-DPG_FTS_TEST_HOOKS` and a
+  `--enable-cassert` server): forces the scan retry deterministically; "detected double
+  pfree" 3/3 unfixed, exact 3/3 fixed.
+- `pending_delete` regression test: pending rows deleted before a VACUUM, slots reused
+  by non-matching rows; count, bitmap and ranked results checked (fails on 1.10.0).
+- `ranked_exact` regression test: every ranked path (best-first, block-max WAND,
+  MaxScore, conjunctive, phrase) against an exhaustive per-term reference, after deletes
+  and with two segments; every mutant tried (MaxScore split, overlap bound, stop test,
+  cursor rewind, phrase adjacency, `term:LABEL`) fails it.
+
+## 1.10.0 - 2026-10-07
+
+Rare-term ranked throughput no longer falls as concurrent backends increase (ROADMAP I6).
+**No on-disk format change**; **no REINDEX required**. One new SQL function
+(`pg_fts--1.9.1--1.10.0.sql`).
+
+### Changed (performance; bench/RESULTS_110_2026-10-07.md)
+
+- **One shared copy of each segment's document-length array per server.** 1.9 decoded
+  it into every backend (~4.8 MB per backend at 2.19M documents), and the copies
+  competed for the CPU's last-level cache. The first ranked scan to need a segment's
+  array now publishes it in dynamic shared memory and every other backend maps the same
+  pages. Same host and binary, Graviton3, shared vs per-backend: rare-term tps at 64
+  clients 16,654 vs 13,283 (+25%), mid-term +21-25% at every client count, common-term
+  +1-3%; rare-term throughput is now flat from 16 to 64 clients. Results identical on
+  21/21 ranked (query, k) cases across the shared, per-backend and page-cursor paths.
+  - The copy is keyed by the segment's identity (database, index relfilenode, first
+    sidecar block, document count, total length), not by "latest for this index":
+    a segment's sidecar is written once and never modified, and MVCC never consults it,
+    so backends with different snapshots share it safely. A scan holds a reference on
+    each copy it reads until its resource owner is released; a segment a merge drops is
+    retired and freed when its last reader finishes. Nothing here can fail a query or a
+    merge: no free slot, DSM slot exhaustion, `/dev/shm` full (tested), or a cancel
+    during the build all fall back to a private copy.
+  - New GUC `pg_fts.shared_doclen` (default on, superuser; off = the 1.9 behaviour),
+    new function `fts_shared_doclen_stats()` for monitoring.
+  - The one-off build of a segment's array (28 ms at 2.19M documents) is now paid once
+    per server per segment instead of once per backend per segment-directory change.
+
+### Tests
+
+- `shared_doclen` regression test (shared == per-backend == cursor scores for every
+  document; references released after statements, errors, open cursors; REINDEX).
+- `t/011_shared_doclen.pl` (multi-session): a scan that outlives a merge, 12 sessions
+  racing to publish, a session terminated while holding a copy, and 90 concurrent ranked
+  reads during insert/delete/merge churn, each compared to the cursor path in one
+  snapshot. Planted mutants: never releasing references fails 4 cases; shifting the
+  published bytes fails the regression test. Keying without document count and total
+  length is NOT caught: the page recycle gate keeps a freed sidecar block from heading
+  a new segment while any scan could hold the old copy (measured), so those two key
+  fields are defence in depth, and the code says so.
+
+### Fixed
+
+- Retirement of a shared copy also runs from a parallel merge's leader, which frees its
+  inputs inside parallel mode (found by `t/011`: before the fix, copies of segments
+  dropped by `fts_merge` piled up until evicted).
+
+### Retracted
+
+- **"Tantivy does not stem: for `year` it returns 495,580 matches"** (README, 1.6 through
+  1.9.1). True of the pg_search configuration measured in September, not of pg_search:
+  0.26.0 with `stemmer=english` returns 735,955 (regex ground truth 733,960; pg_fts
+  734,896). The README no longer says it; pg_search's common-term lead is now compared
+  with a stemmed index.
+
+## 1.9.1 - 2026-10-06
+
+Ranked phrase queries are 4x faster, and the rare-term throughput drop is explained.
+**No on-disk format change**; **no REINDEX required**; no SQL-visible change
+(`pg_fts--1.9.0--1.9.1.sql` is a comment).
+
+### Changed (performance; bench/RESULTS_191_2026-10-06.md)
+
+- **Lazy phrase gate** (ROADMAP I5). A ranked phrase or NEAR query on a `positions=on`
+  index no longer builds the whole phrase match set before ranking. WAND ranks the terms
+  and admits a candidate only after checking adjacency from the positions of that one
+  posting, read from the block the cursor already holds. Same predicate as the collect
+  path, so the results are identical (28/28 phrase/k cases on 2.19M rows; new test
+  `phrase_gate`). A block stored without positions makes the query fall back to the
+  collect path. `"united states"` top-10: 138 -> **34.8 ms** (pg_textsearch 1.4.0: 43.0).
+  New GUC `pg_fts.lazy_phrase` (default on; off = the 1.9.0 path).
+- Heap admission skips the boolean/phrase gate for a candidate whose score cannot enter
+  a full top-k heap. It cannot change which documents enter.
+- `fts_search_dense1` (single-term common-term scoring) is kept out of line. The phrase
+  gate added no code to it, but inlined it slowed from ~7.15 to ~7.6 ms through code
+  placement alone; out of line it is 7.0-7.15 ms on four hosts.
+- Vendored sparsemap 5.8.0 -> 5.8.1. `sm_validate` now rejects a sparse chunk whose
+  readers disagree (a data slot above the chunk's reduced capacity), so the tombstone
+  open guard turns such a corrupt blob into `ERRCODE_DATA_CORRUPTED` instead of
+  accepting it. pg_fts only reads blobs through `sm_contains`/`sm_next_member`, which
+  never disagreed with each other, so no query result changes. The upstream
+  `sm_add_many` use-after-free is in a function pg_fts does not call. `fuzz_smblob`
+  gained the property; it fails on 5.8.0. Wire format unchanged.
+
+### Fixed
+
+- **An incremental `make` could run stale code.** `pg_fts_am.c` `#include`s
+  `pg_fts_am_scan.c`, `pg_fts_lev.c` and `pg_fts_trgm_index.c`, but the Makefile did not
+  know, so editing one of them left the old `pg_fts_am.o` in place. Clean builds (CI,
+  nix, packages) were never affected. Found because a planted-bug test "passed" against
+  unmodified code.
+
+### Known issues
+
+- **Rare-term throughput still falls with client count: 12.7k tps at 16 clients, 8.8k-8.9k
+  at 64** (1.9.0: 12.4k / 8.6k). pg_textsearch is flat at 8.2k. The cause is now
+  measured (ROADMAP I6): each backend builds a private ~4.8 MB copy of the document-length
+  array, and 64 copies do not fit in L3. All of the extra per-transaction cost at 64
+  clients is in `bm25_doclen_cursor_lookup`, and `pg_fts.doclen_cache_mb = 0` is flat.
+  A diagnostic build with one shared copy was flat at 12.3k / 12.5k / 12.6k tps
+  (16 / 32 / 64). The fix (one copy per server in dynamic shared memory) is a design
+  change and is planned, not shipped: `bench/PLAN_I6_SHARED_DOCLEN_2026-10-06.md`.
+
 ## 1.9.0 - 2026-10-01
 
 Ranked-retrieval performance release, and two exactness fixes that affect every prior

@@ -1,0 +1,29 @@
+[11:47:03] engine=fts pg=postgres (PostgreSQL) 17.10 nproc=16 physcores=8
+[11:47:03] ext 1.9.1
+[12:07:46] build_s=259.800852571
+[12:10:46] size=1489600512
+501144|181836
+[12:10:46] result rare_k10=10
+[12:10:56] result common_k10=10
+[12:11:06] result count_common=734896
+  fts rare_k10 c=16 -> 12658.705111tps 1.264ms
+  fts rare_k10 c=32 -> 11357.194000tps 2.818ms
+  fts rare_k10 c=64 -> 9330.653281tps 6.859ms
+  fts common_k10 c=16 -> 936.334549tps 17.088ms
+  fts common_k10 c=32 -> 938.088210tps 34.112ms
+  fts common_k10 c=64 -> 933.800626tps 68.537ms
+  fts count_common c=16 -> 46325.118511tps 0.345ms
+  fts count_common c=32 -> 48028.927849tps 0.666ms
+  fts count_common c=64 -> 47817.984377tps 1.338ms
+OK wrote+validated /nvme/out_conc/underload_pass1.json
+  fts rare_k10 c=16 -> 12932.444963tps 1.237ms
+  fts rare_k10 c=32 -> 11391.896155tps 2.809ms
+  fts rare_k10 c=64 -> 9367.337277tps 6.832ms
+  fts common_k10 c=16 -> 937.177051tps 17.073ms
+  fts common_k10 c=32 -> 938.587889tps 34.094ms
+  fts common_k10 c=64 -> 933.841396tps 68.534ms
+  fts count_common c=16 -> 46296.539530tps 0.346ms
+  fts count_common c=32 -> 47986.187414tps 0.667ms
+  fts count_common c=64 -> 48095.023347tps 1.331ms
+OK wrote+validated /nvme/out_conc/underload_pass2.json
+[12:20:17] CONC_DONE

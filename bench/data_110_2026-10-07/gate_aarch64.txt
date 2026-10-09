@@ -1,0 +1,36 @@
+== tree: default_version = '1.10.0' shdoclen=baa82d1f
+== fuzz
+PASS: fuzz_for
+PASS: fuzz_docvalid
+PASS: fuzz_block
+PASS: fuzz_smblob
+PASS: fuzz_block_noclamp aborted as expected (count-clamp teeth)
+PASS: fuzz_block_signed aborted as expected (signed-count teeth)
+PASS: fuzz_block_randstream aborted as expected (corrupt-width teeth)
+PASS: fuzz_block_nosumtf aborted as expected (sumtf-vs-posbytelen teeth)
+== ALL CLEAN ==
+== build
+0
+== regress+isolation
+ok 1 pg_fts;ok 2 unicode_fold;ok 3 idx_scan_stats;ok 4 limit_hint;ok 5 doclen_slots;ok 6 score_reuse;ok 7 wand_last_block;ok 8 dense_score;ok 9 phrase_gate;ok 10 shared_doclen;ok 1 bm25_concurrency;ok 2 bm25_cic;
+== tap (all t/*)
+t/001_crash_recovery.pl ....... ok
+t/002_replication.pl .......... ok
+t/003_corruption.pl ........... ok
+t/004_encodings.pl ............ ok
+t/005_concurrency.pl .......... ok
+t/006_concurrent_extend.pl .... ok
+t/007_segment_cap.pl .......... ok
+t/008_vacuum_reclaim.pl ....... ok
+t/009_doclen_sidecar.pl ....... ok
+t/010_vacuum_delete_heavy.pl .. ok
+t/011_shared_doclen.pl ........ ok
+Files=11, Tests=127, 166 wallclock secs ( 0.47 usr  0.01 sys +  4.74 cusr  2.17 csys =  7.39 CPU)
+Result: PASS
+== coverage
+Result: PASS
+== pg_fts-own line coverage: 91.7% (gate: >= 90%) ==
+PASS: line coverage 91.7% >= 90%
+== pg_fts-own function coverage: 97.5% (gate: >= 85%) ==
+== pg_fts-own branch coverage:   73.1% (gate: >= 73%) ==
+PASS: function 97.5% >= 85%, branch 73.1% >= 73%

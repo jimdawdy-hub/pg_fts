@@ -1,0 +1,14 @@
+engine=fts 2026-10-07T23:34:36Z loadavg=16.18 30.72 32.72
+rare_k10 rows=10
+pass=1 band=rare_k10 c16=12180.325383 c32=13408.001362 c64=14389.418781
+pass=2 band=rare_k10 c16=11976.961215 c32=13461.728096 c64=14744.481294
+mid_k10 rows=10
+pass=1 band=mid_k10 c16=13765.200648 c32=15573.535461 c64=16553.917034
+pass=2 band=mid_k10 c16=13641.794667 c32=15400.342746 c64=
+common_k10 rows=
+pass=1 band=common_k10 c16= c32= c64=
+pass=2 band=common_k10 c16= c32= c64=
+count_common rows=
+pass=1 band=count_common c16= c32= c64=
+pass=2 band=count_common c16= c32= c64=
+TPS2_DONE

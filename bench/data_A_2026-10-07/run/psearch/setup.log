@@ -1,0 +1,34 @@
+PG_DONE
+Note: switching to 'f37c13f68b57d2c3472b2214fbcff699d6d34876'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+pgvector v0.8.7
+ Package: postgresql-17-pg-search
+ Version: 0.26.0
+pg_search.so
+pg_search--0.15.0--0.15.1.sql
+pg_search--0.15.1--0.15.2.sql
+pg_search--0.15.10--0.15.11.sql
+pg_search--0.15.11--0.15.12.sql
+pg_search--0.15.12--0.15.13.sql
+pg_search--0.15.13--0.15.14.sql
+pg_search--0.15.14--0.15.15.sql
+pg_search--0.15.15--0.15.16.sql
+pg_search--0.15.16--0.15.17.sql
+pg_search--0.15.17--0.15.18.sql
+EXT_DONE
+SETUP_DONE

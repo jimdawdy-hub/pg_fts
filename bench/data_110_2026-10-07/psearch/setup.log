@@ -1,0 +1,16 @@
+PG_DONE
+ Package: postgresql-17-pg-search
+ Version: 0.26.0
+pg_search.so
+pg_search--0.15.0--0.15.1.sql
+pg_search--0.15.1--0.15.2.sql
+pg_search--0.15.10--0.15.11.sql
+pg_search--0.15.11--0.15.12.sql
+pg_search--0.15.12--0.15.13.sql
+pg_search--0.15.13--0.15.14.sql
+pg_search--0.15.14--0.15.15.sql
+pg_search--0.15.15--0.15.16.sql
+pg_search--0.15.16--0.15.17.sql
+pg_search--0.15.17--0.15.18.sql
+EXT_DONE
+SETUP_DONE

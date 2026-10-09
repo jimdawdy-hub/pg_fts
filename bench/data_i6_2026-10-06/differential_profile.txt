@@ -1,0 +1,34 @@
+comm c16:
+  78494         postgres 
+    946          pgbench 
+    404          swapper 
+      7             perf 
+comm c64:
+  79253         postgres 
+    690          pgbench 
+      8  kworker/9:1-mm_ 
+      7  kworker/8:2-eve 
+per-txn cost units: c16=78.74 c64=115.75  (ratio 1.470)
+largest per-txn growth (c64-c16, units 1e-4 %CPU-per-tps):
+  +40.585  c16=13.524 c64=54.110  pg_fts.so [.] bm25_doclen_cursor_lookup
+   +0.863  c16= 0.719 c64= 1.582  postgres [.] hash_search_with_hash_value
+   +0.376  c16= 0.229 c64= 0.605  postgres [.] SearchCatCacheInternal
+   +0.099  c16= 0.087 c64= 0.186  libc.so.6 [.] 0x0000000000172237
+   +0.051  c16= 0.379 c64= 0.430  postgres [.] base_yyparse
+   +0.050  c16= 0.648 c64= 0.698  postgres [.] PinBuffer
+   +0.049  c16= 0.055 c64= 0.105  postgres [.] heap_page_prune_opt
+   +0.046  c16= 0.221 c64= 0.268  postgres [.] AllocSetAlloc
+   +0.046  c16= 0.024 c64= 0.070  postgres [.] SearchCatCacheList
+   +0.045  c16= 0.071 c64= 0.116  pg_fts.so [.] bm25_meta_from_page
+   +0.042  c16= 0.016 c64= 0.058  libc.so.6 [.] 0x000000000008f3a7
+   +0.041  c16= 0.063 c64= 0.105  postgres [.] AllocSetFree
+   +0.040  c16= 0.355 c64= 0.395  [kernel.kallsyms] [k] _raw_spin_unlock_irqrestore
+   +0.038  c16= 0.055 c64= 0.093  [kernel.kallsyms] [k] fdget
+   +0.034  c16= 0.024 c64= 0.058  postgres [.] hash_search
+   +0.034  c16= 0.024 c64= 0.058  postgres [.] AllocSetContextCreateInternal
+   +0.034  c16= 0.047 c64= 0.081  postgres [.] fmgr_info_cxt_security
+   +0.033  c16= 0.537 c64= 0.570  pg_fts.so [.] wand_load_block
+   +0.031  c16= 0.016 c64= 0.047  postgres [.] FileSize
+   +0.027  c16= 0.008 c64= 0.035  postgres [.] SearchCatCache
+   +0.027  c16= 0.008 c64= 0.035  libc.so.6 [.] 0x000000000017699e
+   +0.027  c16= 0.032 c64= 0.058  [kernel.kallsyms] [k] irqentry_exit_to_user_mode

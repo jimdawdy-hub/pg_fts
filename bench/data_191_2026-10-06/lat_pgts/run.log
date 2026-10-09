@@ -1,0 +1,23 @@
+[11:42:10] engine=pgts host=<host> pg=postgres (PostgreSQL) 17.10
+[11:42:10] ext 1.4.0
+commit 7a932505b537d50ad8d2d068a053cd1dd7b646ea 2026-08-18
+NOTICE:  BM25 index build started for relation docs_pgts
+NOTICE:  Using text search configuration: english
+NOTICE:  Using index options: k1=1.20, b=0.75
+NOTICE:  parallel index build: launched 5 of 5 requested workers
+DETAIL:  Words longer than 2047 characters are ignored.
+DETAIL:  Words longer than 2047 characters are ignored.
+DETAIL:  Words longer than 2047 characters are ignored.
+DETAIL:  Words longer than 2047 characters are ignored.
+DETAIL:  Words longer than 2047 characters are ignored.
+NOTICE:  BM25 index build completed: 2188038 documents, avg_length=316.55
+[11:46:37] build_s=265.073042280
+[11:46:37] size=1978318848
+223296|241494
+[11:50:47] df slovakia=10875
+[11:54:58] df hungary=24097
+[11:59:08] df year=734896
+[11:59:22] regex slovakia=10898
+[11:59:36] regex hungary=24148
+[11:59:47] regex years?=733960
+[11:59:52] LAT_DONE

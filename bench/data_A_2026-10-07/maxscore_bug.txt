@@ -1,0 +1,12 @@
+# MaxScore (>= 4 terms) returned wrong top-k in every release with MaxScore (found 2026-10-07)
+# mt_oracle.py: exhaustive reference from the stored ftsdoc (tf), the quantized doclen the index
+# scores with, the index's N/df/avgdl; ties by docid.
+# v1.10.0, ftswip (before BMW skip-to), cur: identical result on 12 cases:
+#   DIFF film | music | album | band k=1, k=10, k=100   (index top-10 shared NONE with the true top-10)
+#   e.g. true #1 4198099 score 19.696; index #1 7445408 score 18.94 (hand-computed)
+# ms_bisect.sh: the same query forced through BMW returns the true top-10 -> MaxScore defect.
+# Cause: the essential/non-essential split used a SUFFIX sum of max_contrib (terms after i) where
+#   MaxScore needs the PREFIX sum of the low-impact terms; candidates were then iterated only from
+#   the high-impact terms and docs scoring mostly on the "non-essential" terms were never seen.
+# After the fix: mt_oracle 36 cases, 0 differ, 1 float-tie order only (|d score| <= 1e-9, rank 49
+#   of slovakia|hungary|poland k=100: three docs at 20.926791869688994/998).

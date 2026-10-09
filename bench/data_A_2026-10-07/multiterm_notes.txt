@@ -1,0 +1,16 @@
+# multi-term ranked (BMW), aarch64, after A1 bounds + best-first single term (2026-10-07)
+# ab_bool.sh medians (ms, k10): slovakia&hungary 1.61, slovakia|hungary 1.58, year&film 24.2,
+#   year|film 24.3, united&states 23.7, united|states 23.7  (1.10.0 run: and/or slovakia/hungary 2.16/2.10)
+# EXPLAIN: united|states 15,978 buffer hits; year|film 14,981.
+# bmw_prof.sh united|states: candidates_range 39%, wand_seek 11%, for_unpack 5.6%;
+#   per 20 queries: 58,543 wand_load_block (~2.9k blocks/query = ~all blocks of both terms
+#   need loading) and 4.8M wand_seek calls (~240k/query).
+# mt_sim.py (docid-order BMW, simplified, exact): postings scored with the new block bounds:
+#   united+states 93,846 of 1,201,064 (7.8%); year+film 206,660 of 945,590 (21.9%);
+#   slovakia+hungary 6,278 of 34,972. Term-wide max (dl=0 vs max block bound) makes no
+#   difference in the simulation.
+# seed_sim.py: seeding the OR threshold from the best single-term k-th score skips NO block
+#   (seed 3.0 vs true k-th 5.6 for united|states): single-term scores are too far below
+#   two-term sums. Not pursued.
+# => the implementation scores far fewer postings than it visits: the cost is the walk itself
+#    (wand_seek per posting, block loads), i.e. A2 (block-level skipping in the multi-term walk).

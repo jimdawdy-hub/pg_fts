@@ -1,0 +1,10 @@
+== rare_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.16 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6149187.48 rows=2184793 width=16)
+              Order By: (content <@> 'docs_pgts:slovakia'::bm25query)
+== common_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.16 rows=10 width=16)
+        ->  Index Scan using docs_pgts on docs  (cost=0.01..6149187.48 rows=2184793 width=16)
+              Order By: (content <@> 'docs_pgts:year'::bm25query)

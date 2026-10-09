@@ -259,7 +259,14 @@ extern int64 bm25_count_visible_oid(Oid indexoid, FtsQuery q);
 extern int pg_fts_build_collapse_max_mb;
 extern int pg_fts_build_mem_ceiling_mb;
 extern int pg_fts_doclen_cache_mb;
+extern bool pg_fts_shared_doclen;
 extern int pg_fts_dense_score_min_df;
+extern bool pg_fts_bestfirst;
+
+/* pg_fts_am.c: resets the maintenance buffer-ring scope at transaction end */
+#include "access/xact.h"
+extern void bm25_maint_xact_reset(XactEvent event, void *arg);
+extern bool pg_fts_lazy_phrase;
 extern double fts_current_distance_value;	/* set by bm25_gettuple, read by fts_current_distance() */
 
 #endif							/* PG_FTS_H */

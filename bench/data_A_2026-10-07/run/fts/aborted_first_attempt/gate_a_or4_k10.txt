@@ -1,0 +1,3 @@
+psql:/tmp/g.sql:3: ERROR:  column "music" does not exist
+LINE 1: ...RDER BY d <=> to_ftsquery('english','film ') LIMIT music) s;
+                                                              ^

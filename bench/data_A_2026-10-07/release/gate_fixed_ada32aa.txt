@@ -1,0 +1,44 @@
+# 1.11.0 release gate on ada32aa (after the four concurrency fixes).  Supersedes
+# gate_aarch64_release.txt and gate_x86_nix_release.txt (tree 2858955, before the fixes).
+#
+# x86_64 nix: installcheck-pg17, installcheck-pg18, tap-pg17, tap-pg18 all EXIT=0
+#   installcheck: All 12 tests passed + All 2 tests passed (pg17 and pg18)
+#   tap-pg17: Files=9, Tests=104 PASS (t/012_concurrent_flush.pl ok)
+#   tap-pg18: Files=9, Tests=104 PASS (t/012_concurrent_flush.pl ok)
+# ci/check-alloc.sh clean; make check-ascii clean.
+#
+# aarch64 r7gd.4xlarge, PG 17.10, Debian 13 (gate_arm.sh on the ada32aa tree):
+== tree: default_version = '1.11.0' shdoclen=baa82d1f
+== fuzz
+PASS: fuzz_for
+PASS: fuzz_docvalid
+PASS: fuzz_block
+PASS: fuzz_smblob
+PASS: fuzz_block_noclamp aborted as expected (count-clamp teeth)
+PASS: fuzz_block_signed aborted as expected (signed-count teeth)
+PASS: fuzz_block_randstream aborted as expected (corrupt-width teeth)
+PASS: fuzz_block_nosumtf aborted as expected (sumtf-vs-posbytelen teeth)
+== ALL CLEAN ==
+== build (warnings+errors)
+0
+== regress+isolation
+ok 1 pg_fts;ok 2 unicode_fold;ok 3 idx_scan_stats;ok 4 limit_hint;ok 5 doclen_slots;ok 6 score_reuse;ok 7 wand_last_block;ok 8 dense_score;ok 9 phrase_gate;ok 10 shared_doclen;ok 11 ranked_exact;ok 12 pending_delete;ok 1 bm25_concurrency;ok 2 bm25_cic;
+== tap (all t/*)
+t/001_crash_recovery.pl ....... ok
+t/002_replication.pl .......... ok
+t/003_corruption.pl ........... ok
+t/004_encodings.pl ............ ok
+t/005_concurrency.pl .......... ok
+t/006_concurrent_extend.pl .... ok
+t/007_segment_cap.pl .......... ok
+t/008_vacuum_reclaim.pl ....... ok
+t/009_doclen_sidecar.pl ....... ok
+t/010_vacuum_delete_heavy.pl .. ok
+t/011_shared_doclen.pl ........ ok
+t/012_concurrent_flush.pl ..... ok
+Files=12, Tests=137, 261 wallclock secs
+Result: PASS
+== coverage
+line 91.2% (>= 90%), function 96.9% (>= 85%), branch 73.0% (>= 73%): PASS
+#
+# Upgrade qualification (local x86, PG 17.10): upgrade_qual_ada32aa.txt -- 112 checks, 0 bad.

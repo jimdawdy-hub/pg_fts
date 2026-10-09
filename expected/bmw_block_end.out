@@ -1,0 +1,71 @@
+-- bmw_block_end: a block-max WAND skip may pass only the documents its block
+-- bounds cover.
+--
+-- When the current blocks of the cursors at or before the pivot cannot beat the
+-- threshold, BMW jumps them forward.  A cursor's block bound covers its
+-- postings only up to that block's last docid; a LATER block of the same term
+-- can hold a higher contribution for the pivot document itself.  So the jump
+-- must stop at the earliest such block end, even when that is not past the
+-- pivot.  Jumping past the pivot anyway ("always make progress") skips the
+-- pivot document unscored.
+--
+-- Shape: X (rare term "bee" x3, short) sets the top-1 threshold.  130 long bee
+-- rows put P in bee's second posting block, whose bound is low.  2000 long
+-- "aye" rows give aye blocks that all end before P.  P holds aye x3 and bee
+-- once in a short document: each term's CURRENT block bound is below what P
+-- scores, but P's total beats X.  The true top-1 is P.
+SET client_min_messages = warning;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- exhaustive single-term scores (dense path), as in ranked_exact
+CREATE FUNCTION bb_term(t text, idx text DEFAULT 'bb_fts') RETURNS TABLE (tid tid, s float8)
+LANGUAGE sql SET pg_fts.bestfirst = off SET pg_fts.dense_score_min_df = 1 AS $$
+  SELECT f.ctid, f.score FROM fts_search(idx::regclass, to_ftsquery('simple', t), 100000) f $$;
+CREATE TABLE bb (id int PRIMARY KEY, d ftsdoc);
+INSERT INTO bb VALUES (1, to_ftsdoc('simple', 'bee bee bee one two'));
+INSERT INTO bb SELECT 1 + g, to_ftsdoc('simple', 'bee ' || repeat('pad ', 49))
+FROM generate_series(1, 130) g;
+INSERT INTO bb SELECT 1000 + g, to_ftsdoc('simple', 'aye ' || repeat('pad ', 49))
+FROM generate_series(1, 2000) g;
+INSERT INTO bb VALUES (5000, to_ftsdoc('simple', 'aye aye aye bee one'));
+INSERT INTO bb SELECT 10000 + g, to_ftsdoc('simple', repeat('zed ', 20))
+FROM generate_series(1, 2868) g;
+CREATE INDEX bb_fts ON bb USING fts (d);
+VACUUM ANALYZE bb;
+CREATE TEMP TABLE bb_ref AS
+  SELECT x.tid, sum(x.s) s FROM unnest(ARRAY['aye', 'bee']) t, LATERAL bb_term(t) x
+  GROUP BY x.tid;
+-- the reference top-1 is P
+SELECT b.id AS ref_top1 FROM bb_ref r JOIN bb b ON b.ctid = r.tid
+ORDER BY r.s DESC, b.id LIMIT 1;
+ ref_top1 
+----------
+     5000
+(1 row)
+
+-- every ranked k must equal the exhaustive top-k
+SELECT k, (SELECT array_agg(s ORDER BY s DESC) FROM
+             (SELECT round(s::numeric, 9) s FROM bb_ref ORDER BY s DESC LIMIT k) r)
+        = (SELECT array_agg(round(sc::numeric, 9) ORDER BY n) FROM
+             (SELECT row_number() OVER () n, x.score sc
+              FROM fts_search('bb_fts', to_ftsquery('simple', 'aye | bee'), k) x) i) AS aye_or_bee_exact
+FROM unnest(ARRAY[1, 2, 5]) k ORDER BY k;
+ k | aye_or_bee_exact 
+---+------------------
+ 1 | t
+ 2 | t
+ 5 | t
+(3 rows)
+
+-- and the ordering scan returns P first
+SELECT id AS index_top1 FROM bb
+WHERE d @@@ to_ftsquery('simple', 'aye | bee')
+ORDER BY d <=> to_ftsquery('simple', 'aye | bee') LIMIT 1;
+ index_top1 
+------------
+       5000
+(1 row)
+
+DROP TABLE bb_ref;
+DROP TABLE bb;
+DROP FUNCTION bb_term(text, text);

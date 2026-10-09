@@ -1,0 +1,29 @@
+# A2 conjunctive best-first (fts_search_and_bestfirst), aarch64 adev2, 2.19M docs, 2026-10-07
+# and_sim.py (offline, before coding): united&states k10 -> 184 of 4203 driver blocks visited, exact.
+# and_gate.sh: bestfirst on vs off, plain + positions index, 12 queries x k 1/10/100/1000:
+#   same=75 tie-order-only=5 differ=0
+# and_oracle.py (exhaustive heap reference, score sequence, fts_search scores):
+#   docs_fts 12 cases 0 differ; docs_fts_pos (phrase + AND) 9 cases 0 differ
+# and_time.sh (ms, median of last 5 of 8, 3 passes):
+#                         1.10.0         cur bestfirst=on    cur off
+#   slovakia & hungary    2.19-2.22      1.30-1.40           1.88-1.93
+#   united & states       23.87-23.92    2.76-2.78           11.49-11.51
+#   world & war           19.08-19.14    6.04-6.07           14.76-14.78
+#   year & film           24.52-24.53    14.18-14.33         24.12-24.18
+#   "united states" (pos) 24.97-25.26    3.51-3.80           12.56-12.64
+#   "world war" (pos)     19.79-19.88    6.80-6.89           15.43-15.57
+#   united & states (pos) 24.91-25.02    3.66-3.71           12.55-12.62
+# (published 1.10.0 phrase was 36.85 ms on a fresh positions build; this positions index was
+#  built by this branch's build, fts_vacuum'd: 2,754,207,744 bytes)
+# wt.sql / wt_ab.sh: ranked term:LABEL returned non-matching rows in 1.10.0 (150 rows, 100 wrong
+#  for alpha:A & beta, LIMIT 150; 100 true matches). Fixed: pure_or/pure_boolean exclude
+#  FTS_QF_WEIGHTED -> collect + heap recheck path. After: 100 rows, 0 wrong.
+# ranked_exact.sql mutants (rx_mut3.sh, rx_mut_ph.sh), each must make the test fail:
+#   overlap-one-block (bound from the first overlapping block only)  -> overlap_exact f x3
+#   stop-nonstrict (top.bound <= threshold + 0.5)                     -> p&q&r, p&q&r&s, a&c f
+#   no-rewind (conj_position does not rewind a decoded block)         -> m_and_n_exact k=72,100 f
+#   no-phrase-check (adjacency skipped on the conjunctive walk)       -> phrase_nonmatching 1/10/300
+#   weighted-pure (term:LABEL treated as pure boolean again)          -> ranked_nonmatching sum 400 (0 when fixed)
+#   MaxScore suffix split (rx_mut2.sh)                                -> p | q | r | s f
+# test lesson: a SET LOCAL inside a reference plpgsql function leaked to the caller's transaction
+#   and turned best-first OFF for the query under test (all mutants passed); now a SET clause.

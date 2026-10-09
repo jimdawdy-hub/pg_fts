@@ -1,0 +1,17 @@
+[22:32:00] engine=fts host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[22:32:12] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[22:32:12] ext 1.10.0 so=5b6de5f9
+[22:53:41] build_s=297.597874458
+[22:57:01] fts_vacuum_s=199.524501636
+[22:57:01] size_bytes=1489600512
+[22:57:01] count slovakia=10875
+[22:57:01] count hungary=24097
+[22:57:01] count year=734896
+[22:57:15] regex slovakia=10898
+[22:57:29] regex hungary=24148
+[22:57:39] regex years?=733960
+[23:03:16] pos_build_s=335.124221925
+[23:07:13] pos_size_bytes=2754101248
+[23:07:26] phrase count=361465 regex=362305
+[23:15:37] LAT_DONE
+[23:28:17] CONC_DONE

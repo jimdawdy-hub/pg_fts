@@ -1,0 +1,15 @@
+# Found during the 1.11.0 upgrade qualification (local PG 17.10 build, 2026-10-08).
+# cnt_probe.sh (insert 1,000 into pending, delete id%7=0, VACUUM): @@@ count 18,143 vs
+#   fts_match() heap count 18,000 after VACUUM, on 1.10.0 (c386ccc4) AND 1.11.0-pre (31b68841);
+#   REINDEX restores it.
+# cnt_probe2.sh: the excess is exactly the deleted PENDING rows (143 of 143); deleted segment
+#   rows are tombstoned correctly.
+# cnt_probe3.sh (pending rows deleted, VACUUM, slots reused by 1,000 rows without the term):
+#   1.10.0 and 1.11.0-pre: bitmap scan 20,773 rows of which 773 do not contain the term;
+#   index scan / ranked / count pushdown: ERROR could not read blocks 280..280 (heap truncated
+#   by VACUUM, index still points there).  Fixed binary (88b28667): 20,000 / 0 wrong, no error.
+# pdt.sh = sql/pending_delete.sql: 1.10.0 2300/100 wrong, 1.11.0-pre 2300/100, fixed 2200/0.
+# upgrade_qual_110_to_111.txt: index built by released 1.10.0 (positions=on, tombstones) opened
+#   by 1.11.0 (tree 2858955), ALTER EXTENSION, writes, REINDEX: 112 checks, 0 bad.  Truth is
+#   fts_match() on the heap (a seqscan "count" goes through the FtsCount pushdown and would
+#   have hidden the bug above).

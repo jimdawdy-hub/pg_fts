@@ -46,7 +46,7 @@
         buildFor = postgresql:
           pkgs.stdenv.mkDerivation {
             pname = "pg_fts";
-            version = "1.9.0";
+            version = "1.11.0";
             src = ./.;
 
             nativeBuildInputs = [ postgresql.pg_config pkgs.clang ];
@@ -63,7 +63,7 @@
               install -D -m 755 -t $out/lib pg_fts.so 2>/dev/null || \
                 install -D -m 755 -t $out/lib pg_fts.dylib
               install -D -m 644 -t $out/share/postgresql/extension pg_fts.control
-              install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.9.0.sql
+              install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.11.0.sql
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--0.2.0--0.2.1.sql
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--0.2.1--0.2.2.sql
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--0.2.2--0.2.3.sql
@@ -124,6 +124,9 @@
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.8.4--1.8.5.sql
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.8.5--1.8.6.sql
               install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.8.6--1.9.0.sql
+              install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.9.0--1.9.1.sql
+              install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.9.1--1.10.0.sql
+              install -D -m 644 -t $out/share/postgresql/extension pg_fts--1.10.0--1.11.0.sql
               runHook postInstall
             '';
 
@@ -208,7 +211,7 @@
               # harness), not here.  This is what makes `nix flake check`
               # actually exercise TAP instead of silently skipping it.
               make installcheck REGRESS= ISOLATION= \
-                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/010_vacuum_delete_heavy.pl' \
+                PROVE_TESTS='t/003_corruption.pl t/004_encodings.pl t/005_concurrency.pl t/006_concurrent_extend.pl t/007_segment_cap.pl t/008_vacuum_reclaim.pl t/010_vacuum_delete_heavy.pl t/011_shared_doclen.pl t/012_concurrent_flush.pl' \
                 PG_CONFIG=${pgConfigWrapped}/bin/pg_config \
                 || { echo '--- TAP logs ---'; cat tmp_check/log/*.log tmp_check/log/regress_log_* 2>/dev/null; exit 1; }
               touch $out

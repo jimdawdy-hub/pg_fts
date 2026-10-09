@@ -1,0 +1,38 @@
+1.10.0 so: 12837101  1.11.0 so: f41bf214  tree: ada32aa
+upgrade edge installed: 1
+built with ext 1.10.0
+1.10.0 built + deleted: nseg=1 live=200000
+1.11.0 binary started; ext SQL still 1.10.0
+  1.11.0 .so, 1.10.0 SQL [common]: count 160000/160000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL [rare]: count 40000/40000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL [common | rare]: count 200000/200000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL [w5]: count 2062/2062 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL [rare & w5]: count 413/413 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL [w1 | w2 | w3 | rare]: count 44949/44949 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  1.11.0 .so, 1.10.0 SQL ["hot dog"]: count 18182/18182 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+after ALTER: ext 1.11.0
+  after ALTER EXTENSION [common]: count 160000/160000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION [rare]: count 40000/40000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION [common | rare]: count 200000/200000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION [w5]: count 2062/2062 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION [rare & w5]: count 413/413 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION [w1 | w2 | w3 | rare]: count 44949/44949 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after ALTER EXTENSION ["hot dog"]: count 18182/18182 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+after insert+delete+vacuum+merge on 1.11.0: nseg=1
+  after 1.11.0 writes [common]: count 145714/145714 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes [rare]: count 34286/34286 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes [common | rare]: count 180000/180000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes [w5]: count 10339/10339 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes [rare & w5]: count 354/354 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes [w1 | w2 | w3 | rare]: count 38529/38529 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 writes ["hot dog"]: count 24156/24156 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+after REINDEX on 1.11.0: nseg=1 size=3424256
+  after 1.11.0 REINDEX [common]: count 145714/145714 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX [rare]: count 34286/34286 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX [common | rare]: count 180000/180000 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX [w5]: count 10339/10339 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX [rare & w5]: count 354/354 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX [w1 | w2 | w3 | rare]: count 38529/38529 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+  after 1.11.0 REINDEX ["hot dog"]: count 24156/24156 OK | top20 == ref OK | bestfirst on==off OK | orderby 20 rows OK
+UPG_DONE checks ok=112 bad=0
+UPG EXIT=0

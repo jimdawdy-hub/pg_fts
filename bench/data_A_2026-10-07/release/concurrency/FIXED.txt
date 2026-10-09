@@ -1,0 +1,38 @@
+# 1.11.0 concurrency fixes (commit ada32aa) -- verification record, aarch64 r7gd.4xlarge, PG 17.10.
+#
+# Fixes (CHANGELOG 1.11.0 "Fixed (concurrency)"):
+#  F1 bm25_flush_pending seals the pending list under the EXCLUSIVE metapage lock (fresh tail
+#     page), folds and frees only the sealed pages.                              [FINDINGS 1]
+#  F2 free-tail truncation only under AccessExclusiveLock (conditional if not held).  [FINDINGS 2]
+#  F3 bm25_free_page keeps nextblk and stamps the recycle XID in pd_prune_xid.  Found after F1+F2:
+#     4 "could not read blocks N..N" per 300 s churn, N ~ 89k-99k against a ~6k-block index.
+#     Probe (EOFPROBE in bm25_scan_readbuf): 358 past-EOF chain reads in 120 s, blk=89989 with
+#     next xid 89991 -- the block number WAS the free-time XID read through the overwritten link.
+#     A first attempt (EOF-tolerant reads at every scan site) removed the hard errors but then
+#     surfaced "corrupt tombstone bitmap" (3 readers, same blob, same ms): the stale link landed
+#     on a live page.  Reverted in favour of F3; with F3 the same probe logs 0 past-EOF reads.
+#  F4 bm25_tombstones_free idempotent.  Found after F1+F2: SIGSEGV in sm_contains_many (core:
+#     t->maps[0].m_data = 0x414b6f0700000000, freed-chunk garbage).  bm25_collect_matches freed
+#     the maps at the end of collection and again on its generation-retry path.  A probe
+#     (RETRYPROBE) showed 10 retries in 30 s of churn.
+#
+# Verification on the fixed tree (pg_fts.so md5 prefixes are per-build; marker greps checked
+# each build: seal / bm25_truncate_lock / pd_prune_xid / t->present = NULL):
+#  race.sh (8 inserters + fts_merge every 0.2 s, 40 s), 3 runs:
+#     heap=truth=pushdown=bitmap, missing=0, crashes=0, errors=0 (each run ~3.0M rows)
+#  churn (churn_bt.sh = churn111.sh + backtrace_functions), DUR=30, 8 runs: hard errors 0,
+#     WRONG 0, writer failed transactions 0
+#  churn DUR=120, 2 runs (with EOFPROBE): past-EOF reads 0, corrupt 0, hard 0, all 4 bands OK
+#  churn DUR=300 (with STALEPROBE): 3.11M writer txns, 0 failed; 0 corrupt/hard errors;
+#     common 12,193,325 / rare 2,237,026 / rare&w5 10,609 / common&rare 2,237,026 --
+#     truth == pushdown == bitmap, 0 nonmatching, ranked1000 0 nonmatching; 1347 MB, nseg=1
+#
+# t/012_concurrent_flush.pl, A/B (3 runs each unless noted):
+#     1.10.0-equivalent code (HEAD pg_fts_am.c + pg_fts_am_scan.c)   FAIL 3/3
+#     F1 reverted (old bm25_flush_pending)                            FAIL 3/3 (counts below heap)
+#     F3 reverted (XID back into nextblk)                             FAIL 3/3 (reads + stale-chain)
+#     F2 reverted (truncate without the AEL)                          FAIL 5/6
+#     F4 reverted (non-idempotent free)                               PASS 3/3 -- not caught here;
+#        test/a1_recycle/double_free.sh on a --enable-cassert server: unfixed "detected double
+#        pfree" 3/3, fixed exact 3/3
+#     fixed                                                           PASS 6/6, 3/3, 3/3

@@ -1,0 +1,22 @@
+# dleff_probe.py: blocks with bound <= final threshold, existing header field, x = floor(T*min(dl/tf))
+{"term": "year", "blocks": 5742, "k10": {"skip_cur": 2453, "skip_dleff": 5715, "skip_exact": 5734}, "k100": {"skip_cur": 656, "skip_dleff": 5547, "skip_exact": 5674}, "soundness_violations": 0}
+{"term": "film", "blocks": 1647, "k10": {"skip_cur": 22, "skip_dleff": 1487, "skip_exact": 1638}, "k100": {"skip_cur": 1, "skip_dleff": 419, "skip_exact": 1555}, "soundness_violations": 0}
+{"term": "also", "blocks": 9180, "k10": {"skip_cur": 1228, "skip_dleff": 8899, "skip_exact": 9174}, "k100": {"skip_cur": 106, "skip_dleff": 2403, "skip_exact": 9094}, "soundness_violations": 0}
+{"term": "united", "blocks": 4203, "k10": {"skip_cur": 1357, "skip_dleff": 4141, "skip_exact": 4194}, "k100": {"skip_cur": 259, "skip_dleff": 3474, "skip_exact": 4114}, "soundness_violations": 0}
+{"term": "states", "blocks": 5182, "k10": {"skip_cur": 1659, "skip_dleff": 5127, "skip_exact": 5173}, "k100": {"skip_cur": 219, "skip_dleff": 4268, "skip_exact": 5093}, "soundness_violations": 0}
+{"term": "hungary", "blocks": 189, "k10": {"skip_cur": 22, "skip_dleff": 133, "skip_exact": 180}, "k100": {"skip_cur": 2, "skip_dleff": 34, "skip_exact": 131}, "soundness_violations": 0}
+{"term": "slovakia", "blocks": 85, "k10": {"skip_cur": 12, "skip_dleff": 40, "skip_exact": 77}, "k100": {"skip_cur": 2, "skip_dleff": 4, "skip_exact": 39}, "soundness_violations": 0}
+# walk_sim.py: docid-order walk with a running top-k heap (postings scored / df)
+{"term": "year", "df": 734896, "k10_cur": {"scored": 519808, "pct_scored": 70.73}, "k10_dleff": {"scored": 19072, "pct_scored": 2.6}, "k100_cur": {"pct_scored": 96.48}, "k100_dleff": {"pct_scored": 18.86}}
+{"term": "also", "k10_cur": {"pct_scored": 90.23}, "k10_dleff": {"pct_scored": 15.42}, "k100_dleff": {"pct_scored": 90.55}}
+{"term": "film", "k10_cur": {"pct_scored": 99.15}, "k10_dleff": {"pct_scored": 31.65}, "k100_dleff": {"pct_scored": 95.08}}
+{"term": "united", "k10_cur": {"pct_scored": 82.1}, "k10_dleff": {"pct_scored": 7.83}, "k100_dleff": {"pct_scored": 47.33}}
+{"term": "states", "k10_cur": {"pct_scored": 80.45}, "k10_dleff": {"pct_scored": 6.12}, "k100_dleff": {"pct_scored": 36.19}}
+# walk_sim2.py: best-first (blocks by descending bound, stop when next bound < k-th score); exact top-k checked
+{"term": "year", "df": 734896, "k10": {"scored": 4096, "pct_scored": 0.56, "blocks_visited": 32, "exact": true}, "k100": {"scored": 25088, "pct_scored": 3.41, "blocks_visited": 196, "exact": true}}
+{"term": "also", "df": 1174939, "k10": {"scored": 35968, "pct_scored": 3.06, "blocks_visited": 281, "exact": true}, "k100": {"scored": 872064, "pct_scored": 74.22, "blocks_visited": 6813, "exact": true}}
+{"term": "film", "df": 210694, "k10": {"scored": 20608, "pct_scored": 9.78, "blocks_visited": 161, "exact": true}, "k100": {"scored": 157184, "pct_scored": 74.6, "blocks_visited": 1228, "exact": true}}
+{"term": "united", "df": 537876, "k10": {"scored": 8064, "pct_scored": 1.5, "blocks_visited": 63, "exact": true}, "k100": {"scored": 93312, "pct_scored": 17.35, "blocks_visited": 729, "exact": true}}
+{"term": "states", "df": 663188, "k10": {"scored": 7168, "pct_scored": 1.08, "blocks_visited": 56, "exact": true}, "k100": {"scored": 118144, "pct_scored": 17.81, "blocks_visited": 923, "exact": true}}
+{"term": "hungary", "df": 24097, "k10": {"scored": 7296, "pct_scored": 30.28, "blocks_visited": 57, "exact": true}, "k100": {"scored": 19840, "pct_scored": 82.33, "blocks_visited": 155, "exact": true}}
+{"term": "slovakia", "df": 10875, "k10": {"scored": 6011, "pct_scored": 55.27, "blocks_visited": 47, "exact": true}, "k100": {"scored": 10363, "pct_scored": 95.29, "blocks_visited": 81, "exact": true}}

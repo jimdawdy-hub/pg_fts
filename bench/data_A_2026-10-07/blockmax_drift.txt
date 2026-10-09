@@ -1,0 +1,10 @@
+# python3 blockmax_drift.py ...: blocks skippable at (k=10, k=100) when the exact block max is
+# inflated by (1+eps) for average-length drift
+{"term": "year", "blocks": 5742, "skip_k10_k100": {"eps0": [5734, 5674], "eps5": [5727, 5667], "eps10": [5724, 5660], "eps25": [5717, 5630]}}
+{"term": "also", "blocks": 9180, "skip_k10_k100": {"eps0": [9174, 9094], "eps5": [9170, 9084], "eps10": [9168, 9073], "eps25": [9160, 9043]}}
+{"term": "united", "blocks": 4203, "skip_k10_k100": {"eps0": [4194, 4114], "eps5": [4191, 4105], "eps10": [4191, 4092], "eps25": [4186, 4061]}}
+{"term": "states", "blocks": 5182, "skip_k10_k100": {"eps0": [5173, 5093], "eps5": [5171, 5081], "eps10": [5167, 5069], "eps25": [5165, 4998]}}
+{"term": "film", "blocks": 1647, "skip_k10_k100": {"eps0": [1638, 1555], "eps5": [1635, 1538], "eps10": [1634, 1510], "eps25": [1628, 1409]}}
+{"term": "hungary", "blocks": 189, "skip_k10_k100": {"eps0": [180, 131], "eps5": [177, 123], "eps10": [176, 122], "eps25": [173, 106]}}
+{"term": "slovakia", "blocks": 85, "skip_k10_k100": {"eps0": [77, 39], "eps5": [75, 37], "eps10": [74, 36], "eps25": [71, 29]}}
+# drift correction bound w(a_q) <= w(a_w) * max(1, a_q/a_w): 2,000,000 random cases, 0 violations

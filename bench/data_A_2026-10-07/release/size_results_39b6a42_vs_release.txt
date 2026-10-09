@@ -1,0 +1,5 @@
+# 39b6a42 (benchmarked binary) vs 1.11.0 release tree ada32aa: local x86, PG 17.10, 600k rows,
+# expression index, autovacuum off.  sizes in bytes after CREATE INDEX / DELETE 25% + VACUUM / fts_merge;
+# per band: count / md5 prefix of the ordered top-20 ids.  Script: szcmp.sh (this directory).
+pgA so=02016688 build=5267456 vacuum=5431296 merge=5431296 | [rare] 90000/4c2b9f06 [common] 360000/74be090a [rare & w5] 929/162ea15c [w1 | w2 | w3 | rare] 101136/57cecc8a ["hot dog"] 40909/0241e030
+pg111 so=f41bf214 build=5267456 vacuum=5431296 merge=5431296 | [rare] 90000/4c2b9f06 [common] 360000/74be090a [rare & w5] 929/162ea15c [w1 | w2 | w3 | rare] 101136/57cecc8a ["hot dog"] 40909/0241e030

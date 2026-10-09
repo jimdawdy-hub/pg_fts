@@ -1,0 +1,18 @@
+190 so=3847e29c dense1_sym=0
+191 so=b1947d01 dense1_sym=0
+191n so=52204fb7 dense1_sym=1
+pass=1 v=190 year_k10=7.057[10] year_k100=7.379[100]
+pass=1 v=191 year_k10=7.666[10] year_k100=7.873[100]
+pass=1 v=191n year_k10=7.096[10] year_k100=7.285[100]
+pass=2 v=190 year_k10=7.251[10] year_k100=7.528[100]
+pass=2 v=191 year_k10=7.773[10] year_k100=8.120[100]
+pass=2 v=191n year_k10=7.017[10] year_k100=7.223[100]
+pass=3 v=190 year_k10=7.177[10] year_k100=7.499[100]
+pass=3 v=191 year_k10=7.593[10] year_k100=7.852[100]
+pass=3 v=191n year_k10=7.012[10] year_k100=7.247[100]
+pass=4 v=190 year_k10=7.204[10] year_k100=7.488[100]
+pass=4 v=191 year_k10=7.544[10] year_k100=7.856[100]
+pass=4 v=191n year_k10=7.071[10] year_k100=7.249[100]
+pass=5 v=190 year_k10=7.114[10] year_k100=7.367[100]
+pass=5 v=191 year_k10=7.526[10] year_k100=7.790[100]
+pass=5 v=191n year_k10=7.068[10] year_k100=7.267[100]

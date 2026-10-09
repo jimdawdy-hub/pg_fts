@@ -1,0 +1,11 @@
+# maintenance buffer ring (BAS_BULKWRITE, 16 MB) -- shared_buffers = 4GB, docs_fts (1.49 GB) warmed
+# evict3.sh: fts_merge of a 7-segment 2.19M index (index I/O only, no heap/TOAST):
+#   prev: docs_fts resident 181,836 -> 0 (0%), merged index 438,260 pages resident, 45.5 s
+#   cur:  docs_fts resident 181,836 -> 181,786 (99.9%), merged index 2,114 resident, 46.7 s
+# evict.sh: CREATE INDEX of a second index:
+#   prev: docs_fts 181,836 -> 0, new index 181,883 resident
+#   cur:  docs_fts 181,836 -> 0, new index 48 resident
+# evict2.sh (cur, after a build): pg_toast_16442 498,479 pages + its index 11,139 resident:
+#   the build's eviction is now the DETOAST of the ftsdoc column (heap_fetch_toast_slice ->
+#   systable_beginscan_ordered, default strategy, in core PostgreSQL) -- not pg_fts's I/O.
+#   pg_fts cannot pass a strategy to detoast; an expression index pays the same.  Known limit.

@@ -168,6 +168,49 @@ one_case(int iter)
 		got = sm_get_size(&b);
 		assert(got != len || !sm_validate(&b) || got == SM_SIZEOF_OVERHEAD);
 	}
+
+	/*
+	 * property 7 (sparsemap 5.8.1): for ANY single-byte corruption of a stored
+	 * tombstone blob that bm25_sm_open_checked would ACCEPT (reopens at the
+	 * stored size and validates), every reader agrees on the set.  5.8.0's
+	 * sm_validate accepted a sparse descriptor with a data slot above the
+	 * chunk's NONE-reduced capacity, where slot-indexed readers (cardinality)
+	 * counted bits that capacity-bounded readers (contains / next_member --
+	 * the ones pg_fts uses) skipped.  pg_fts only uses the latter, so it could
+	 * never see a different answer between two of ITS reads, but an accepted
+	 * buffer whose readers disagree is a corrupt buffer passing the guard --
+	 * exactly what the guard exists to refuse.  Assert the 5.8.1 contract.
+	 */
+	if (len > SM_SIZEOF_OVERHEAD)
+	{
+		uint8_t		bad[65536];
+		int			f;
+
+		for (f = 0; f < 8; f++)
+		{
+			sm_t		b;
+			size_t		pos = (size_t) (rng_next() % len);
+
+			memcpy(bad, blob, len);
+			bad[pos] ^= (uint8_t) (1u << (rng_next() % 8));
+			sm_open(&b, bad, len);
+			if (sm_get_size(&b) == len && sm_validate(&b))
+			{
+				sm_cursor_t cur = SM_CURSOR_INIT;
+				uint64_t	x;
+				size_t		walked = 0;
+
+				for (x = sm_next_member(&b, (uint64_t) -1, &cur);
+					 x != SM_IDX_MAX && walked <= (size_t) 1 << 24;
+					 x = sm_next_member(&b, x, &cur))
+					walked++;
+				if ((size_t) sm_cardinality(&b) != walked)
+					fprintf(stderr, "iter %d flip byte %zu: cardinality %zu, walk %zu\n",
+							iter, pos, (size_t) sm_cardinality(&b), walked);
+				assert((size_t) sm_cardinality(&b) == walked);
+			}
+		}
+	}
 }
 
 int

@@ -661,6 +661,7 @@ int			pg_fts_test_pause_advisory_key = 0;
 void
 _PG_init(void)
 {
+	RegisterXactCallback(bm25_maint_xact_reset, NULL);
 	bm25_init_reloptions();
 	RegisterCustomScanMethods(&fts_count_scan_methods);
 
@@ -680,12 +681,33 @@ _PG_init(void)
 							4096, 0, INT_MAX,
 							PGC_USERSET, GUC_UNIT_MB, NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_fts.bestfirst",
+							 "Single-term, AND and phrase ranked queries visit posting blocks in descending score-bound order and stop as soon as no remaining block can enter the top-k.",
+							 "Results are identical; off uses the docid-order paths (block-max WAND, or exhaustive scoring above pg_fts.dense_score_min_df).",
+							 &pg_fts_bestfirst,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable("pg_fts.dense_score_min_df",
 							"Single-term ranked queries on a term with at least this many postings (in one segment) are scored exhaustively instead of with block-max WAND; 0 disables.",
 							"WAND prunes almost nothing for a very common term, so scoring every posting in a tight loop is faster; results are identical.",
 							&pg_fts_dense_score_min_df,
 							32768, 0, INT_MAX,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_fts.shared_doclen",
+							 "Keep one server-wide copy of each index segment's document-length array in shared memory, instead of one per backend.",
+							 "Ranked results are identical either way; with many concurrent backends the shared copy is what keeps throughput from falling. Off restores the 1.9 per-backend copies.",
+							 &pg_fts_shared_doclen,
+							 true,
+							 PGC_SUSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_fts.lazy_phrase",
+							 "Ranked phrase queries on a positions=on index check adjacency per candidate instead of building the full phrase match set first.",
+							 "Results are identical; off restores the pre-1.9.1 collect-then-rank path.",
+							 &pg_fts_lazy_phrase,
+							 true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable("pg_fts.doclen_cache_mb",
 							"Per-backend memory budget (MB) for the resident slot-indexed document-length arrays used by ranked scans; 0 disables.",

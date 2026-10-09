@@ -1,0 +1,30 @@
+so=6c11c2a0 control=default_version = '1.9.1' dense1_sym=1
+SAME k=1 rows=1 ph="united states"
+SAME k=10 rows=10 ph="united states"
+SAME k=100 rows=100 ph="united states"
+SAME k=1000 rows=1000 ph="united states"
+SAME k=1 rows=1 ph="new york city"
+SAME k=10 rows=10 ph="new york city"
+SAME k=100 rows=100 ph="new york city"
+SAME k=1000 rows=1000 ph="new york city"
+SAME k=1 rows=1 ph="world war"
+SAME k=10 rows=10 ph="world war"
+SAME k=100 rows=100 ph="world war"
+SAME k=1000 rows=1000 ph="world war"
+SAME k=1 rows=1 ph="the united states of america"
+SAME k=10 rows=10 ph="the united states of america"
+SAME k=100 rows=27 ph="the united states of america"
+SAME k=1000 rows=27 ph="the united states of america"
+SAME k=1 rows=1 ph="university of california"
+SAME k=10 rows=10 ph="university of california"
+SAME k=100 rows=100 ph="university of california"
+SAME k=1000 rows=207 ph="university of california"
+SAME k=1 rows=1 ph=NEAR(river valley, 3)
+SAME k=10 rows=10 ph=NEAR(river valley, 3)
+SAME k=100 rows=100 ph=NEAR(river valley, 3)
+SAME k=1000 rows=1000 ph=NEAR(river valley, 3)
+SAME k=1 rows=0 ph="rare phrase zzzq"
+SAME k=10 rows=0 ph="rare phrase zzzq"
+SAME k=100 rows=0 ph="rare phrase zzzq"
+SAME k=1000 rows=0 ph="rare phrase zzzq"
+phrase df: 361465

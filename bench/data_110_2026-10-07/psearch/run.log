@@ -1,0 +1,13 @@
+[22:26:24] engine=psearch host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[22:26:36] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[22:26:36] ext vector 0.8.7, pg_search 0.26.0
+[22:27:48] build_s=70.800816858
+[22:27:48] size_bytes=3561218048
+[22:27:49] count slovakia=10898
+[22:27:49] count hungary=24152
+[22:27:49] count year=735955
+[22:28:02] regex slovakia=10898
+[22:28:16] regex hungary=24148
+[22:28:26] regex years?=733960
+[22:28:27] LAT_DONE
+[22:41:07] CONC_DONE

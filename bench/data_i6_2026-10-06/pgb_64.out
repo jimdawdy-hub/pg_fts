@@ -1,0 +1,13 @@
+pgbench (17.10)
+transaction type: /tmp/w_rare.sql
+scaling factor: 1
+query mode: simple
+number of clients: 64
+number of threads: 8
+maximum number of tries: 1
+duration: 22 s
+number of transactions actually processed: 189126
+number of failed transactions: 0 (0.000%)
+latency average = 7.444 ms
+initial connection time = 13.451 ms
+tps = 8597.328839 (without initial connection time)

@@ -2,7 +2,7 @@
    "name": "pg_fts",
    "abstract": "Full-text search with BM25 ranking for PostgreSQL",
    "description": "A PostgreSQL extension providing full-text search with true BM25/BM25F relevance ranking, a dedicated fts inverted-index access method, and boolean/phrase/NEAR/prefix/fuzzy/regex query support. The index maintains the corpus statistics BM25 needs and stores term frequency and document length in the posting lists, so ranking is answered from the index without a heap recheck.",
-   "version": "1.9.0",
+   "version": "1.11.0",
    "maintainer": [
       "Gregory Burd <greg@burd.me>"
    ],
@@ -12,7 +12,7 @@
          "abstract": "Full-text search with BM25 ranking",
          "file": "pg_fts--1.4.0.sql",
          "docfile": "doc/pg_fts.sgml",
-         "version": "1.9.0"
+         "version": "1.11.0"
       }
    },
    "prereqs": {

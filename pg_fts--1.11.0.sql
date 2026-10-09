@@ -407,3 +407,11 @@ CREATE OPERATOR || (
     LEFTARG = ftsdoc, RIGHTARG = ftsdoc, FUNCTION = ftsdoc_concat
 );
 
+
+-- 1.10.0: inspect the server-wide shared document-length copies (ROADMAP I6)
+CREATE FUNCTION fts_shared_doclen_stats(
+    OUT dbid oid, OUT relfilenumber oid, OUT doclenstart bigint, OUT ndocs float8,
+    OUT state text, OUT refcnt integer, OUT retired boolean, OUT bytes bigint)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'fts_shared_doclen_stats'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;

@@ -1,0 +1,19 @@
+PG_DONE
+ Package: postgresql-17-pg-tokenizer
+ Version: 0.1.1-1
+ Package: postgresql-17-vchord-bm25
+ Version: 0.3.0
+pg_tokenizer.so
+vchord_bm25.so
+pg_tokenizer--0.1.0--0.1.1.sql
+pg_tokenizer--0.1.1.sql
+pg_tokenizer.control
+vchord_bm25--0.1.0--0.1.1.sql
+vchord_bm25--0.1.1--0.2.0.sql
+vchord_bm25--0.2.0--0.2.1.sql
+vchord_bm25--0.2.1--0.2.2.sql
+vchord_bm25--0.2.2--0.3.0.sql
+vchord_bm25--0.3.0.sql
+vchord_bm25.control
+EXT_DONE
+SETUP_DONE

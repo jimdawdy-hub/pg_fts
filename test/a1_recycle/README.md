@@ -40,3 +40,13 @@ also has the matching PostgreSQL, and point `JOIN` at it.
 Run out-of-band (like the fuzz teeth builds); the standard CI gates build
 without `-DPG_FTS_TEST_HOOKS`. `t/005_concurrency.pl` is the in-tree
 probabilistic hammer for the same hazard.
+
+## `double_free.sh` (1.11.0)
+
+Same hook, different defect: the retry path above freed the scan's tombstone
+maps a second time. A stalled bitmap scan over a tombstoned segment, plus a
+VACUUM that rewrites the tombstone blob, forces the retry. Deterministic only
+on a `--enable-cassert` PostgreSQL (the second `pfree` raises "detected double
+pfree"); without asserts it is latent heap corruption. `B=<cassert-pg>/bin bash
+test/a1_recycle/double_free.sh`: unfixed FAIL 3/3, fixed PASS 3/3.
+`t/012_concurrent_flush.pl` is the in-tree hammer for the churn defects.

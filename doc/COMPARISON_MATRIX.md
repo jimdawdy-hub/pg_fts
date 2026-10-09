@@ -71,10 +71,11 @@ all); pg_search is the only competitor with comparable breadth.
 | WAL-logged / crash-safe | **Yes** (all writes via GenericXLog) | *n/t* | *n/t* | *n/t* |
 | Physical-replication safe (failover tested) | **Yes** (`t/002`) | *n/t* | *n/t* | *n/t* |
 
-**Read:** the stemming row is the important one. pg_search's speed advantage is
-partly a different (smaller) unit of work — it does not stem, so `year` matches
-495,580 documents where the correct English answer is 734,896, confirmed by regex
-on the raw text.
+**Read:** stemming depends on configuration. pg_search's default tokenizer does not stem:
+in the September measurement `year` matched 495,580 documents where the English answer is
+734,896 (regex on the raw text), so part of its speed then came from a smaller unit of
+work. With `stemmer=english` (0.26.0, 2026-10-07) it matches 735,955, within 0.3% of the
+regex, and the current comparison below uses that configuration.
 
 ## Performance (2.19M Wikipedia articles, identical single column)
 
@@ -90,23 +91,32 @@ on the raw text.
 | phrase (tuned) | 229 ms | — | **22.9** | — |
 
 **Caution: the pg_fts column above used `fts_search()`; the competitors used `ORDER BY`
-forms** (see the retraction in CHANGELOG 1.8.6). And pg_textsearch has since moved.
-Head-to-head on 2026-09-30, both engines using `ORDER BY` forms (pg_fts 1.8.6 vs
-pg_textsearch v1.4.0, same hardware and corpus):
+forms** (see the retraction in CHANGELOG 1.8.6). pg_fts and pg_textsearch have both moved
+since. Current head-to-head, 2026-10-07/08: all four engines at their latest release, one
+AWS r7gd.4xlarge (Graviton3) per engine, Debian 13 arm64, PostgreSQL 17.10, each engine's
+documented English index and query form.  pg_fts is **1.11.0**, with 1.10.0 re-measured on the same host and index
+(`bench/RESULTS_A_2026-10-07.md`; 1.10.0's own run: `bench/RESULTS_110_2026-10-07.md`):
 
-| Measure | pg_fts 1.8.6 | pg_textsearch 1.4.0 |
-|---|---|---|
-| rare / mid k10 | 10.21 / 15.99 ms | **0.92 / 1.17** |
-| common k10 / k100 | 49.16 / 50.14 | **11.41 / 13.75** |
-| AND / OR2 / OR3 k10 | **9.03 / 10.69 / 15.40** | 37.69 / 36.94 / 31.79 |
-| prefix / phrase k10 | 18.38 / 239 (`positions=on`) | **13.41 / 41.8** |
-| exact `count(*)` | **2.50 ms** | 251 s (seqscan) |
-| saturated tps, rare / common / count | 1,050 / 205 / **2,645** | **8,130 / 640** / -- |
-| index size | **1,421 MB** | 1,887 MB |
+| Measure | pg_fts 1.11.0 | pg_fts 1.10.0 | pg_textsearch 1.5.1 | pg_search 0.26.0 | VectorChord-bm25 0.3.0 |
+|---|---|---|---|---|---|
+| rare / mid top-10 | **0.64 / 0.43 ms** | 1.07 / 0.83 | 0.99 / 1.21 | 2.66 / 2.27 | 20.4 / 36.8 |
+| common top-10 / top-100 | **0.81 / 1.30** | 8.48 / 8.77 | 10.71 / 13.06 | 2.63 / 5.51 | 84.5 / 86.8 |
+| AND / OR top-10 (rare terms) | **1.38 / 1.84** | 2.15 / 2.11 | >300 s (seq scan) | 3.45 / 3.75 | n/a / 12.6 |
+| AND top-10, `united & states` / `world & war` | **2.71** / 5.98 | 23.89 / 19.12 | >300 s | 11.97 / **5.73** | n/a |
+| 4-term OR top-10 | 13.99 | wrong result | 14.98 | **13.92** | 50.9 |
+| phrase top-10 `"united states"` / `"world war"` | **3.55 / 6.84** | 24.95 / 19.79 | >300 s | 12.08 / 11.95 | n/a |
+| exact `count(*)` | **0.19 ms** | 0.21 | n/a | 10.56 | n/a |
+| tps, rare top-10, 16 / 64 clients | **26,750 / 26,338** | 17,496 / 17,274 | 13,355 / 12,157 | 5,147 / 5,998 | 334 / 667 |
+| tps, common top-10, 16 / 64 clients | **22,369 / 21,590** | 1,911 / 1,875 | 1,176 / 1,236 | 5,241 / 5,951 | 59 / 119 |
+| index size | **1,421 MiB** (1,369 as expression index) | same | 1,887 MiB | 3,397 MiB | 42,434 MiB |
+| build (expression index, analysis included) | 257 s | 412 s + 198 s `fts_vacuum` | 268 s | **71 s** | 267 s (+ 3,959 s tokenize/model) |
 
-**Read:** pg_fts wins size, `count(*)` and multi-term boolean ranked. pg_textsearch 1.4.0
-now leads on every single-term ranked query (4-14x) and on prefix and phrase. Both trail
-pg_search on common-term ranked.
+**Read:** 1.11.0 leads ranked latency and throughput at every term
+frequency, conjunctive queries and phrases, exact counts and index size.  pg_search builds
+3.6x faster and is within 5% on `world & war` and on a 4-term OR.  pg_textsearch is close
+on a single rare term, but its boolean and phrase forms scan the table.  VectorChord's
+results reflect the tokenizer setup it documents for English, which built a 41 GB index
+here.
 
 ## Operational surface
 
@@ -141,16 +151,17 @@ need a Rust toolchain, and pg_search additionally needs OpenBLAS and pgvector.
 
 - **pg_fts** — you want one index that answers ranked BM25 *and* boolean, exact
   counts, phrase, prefix, fuzzy and regex, with PostgreSQL-consistent stemming, the
-  smallest on-disk footprint, and no preload/Rust requirement. Accept slower
-  single-term ranked queries (pg_textsearch 1.4.0 and pg_search are both faster).
-- **pg_search** — you want the fastest ranked latency across the board and can
-  accept a Tantivy analyzer that does not stem (so results differ from
-  `to_tsvector`), a 1.9× larger index, and a Rust build.
-- **vchord** — you want fast ranking and nothing else; it has no boolean or count
-  support, and the largest index here.
-- **pg_textsearch** — you want the fastest single-term BM25 ranking on top of
-  PostgreSQL's own analyzer (1.4.0 leads pg_fts 4-14x there). Boolean/phrase/prefix
-  work as a filter over the ranked scan, and there is no index-backed count.
+  smallest on-disk footprint, and no preload/Rust requirement.  pg_search builds 3.6x
+  faster (1.10.0 also trailed on common-term ranking and phrase).
+- **pg_search** — you want the fastest build, and can accept Tantivy's analyzer (configure `stemmer=english`;
+  tokenization still differs slightly from `to_tsvector`), a 2.4× larger index,
+  lower single-term throughput under load, and a Rust build (it also requires pgvector).
+- **vchord** — ranking only (no boolean AND, phrase or count support); measured here
+  with its documented English tokenizer setup, which produced a 41 GB index and the
+  slowest queries of the four on this corpus.
+- **pg_textsearch** — BM25 ranking on top of PostgreSQL's own analyzer, with flat
+  throughput as clients increase. Boolean/phrase/prefix work as a filter over the
+  ranked scan, and there is no index-backed count.
 - **tsvector/GIN** — already in PostgreSQL, mature tooling, but no BM25 and no
   index-native top-k.
 

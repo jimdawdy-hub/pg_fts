@@ -1,0 +1,24 @@
+[12:11:17] engine=pgts pg=postgres (PostgreSQL) 17.10 nproc=16 physcores=8
+[12:11:17] ext 1.4.0
+[12:11:18] build_s=.004745109
+[12:11:18] size=1978318848
+223238|241494
+[12:11:18] result rare_k10=10
+[12:11:28] result common_k10=10
+  pgts rare_k10 c=16 -> 8142.126425tps 1.965ms
+  pgts rare_k10 c=32 -> 8263.561698tps 3.872ms
+  pgts rare_k10 c=64 -> 8201.525858tps 7.803ms
+  pgts common_k10 c=16 -> 646.197127tps 24.760ms
+  pgts common_k10 c=32 -> 663.551727tps 48.225ms
+  pgts common_k10 c=64 -> 662.599487tps 96.589ms
+skip count_common (no BAND_count_common)
+OK wrote+validated /nvme/out_conc/underload_pass1.json
+  pgts rare_k10 c=16 -> 8167.450010tps 1.959ms
+  pgts rare_k10 c=32 -> 8270.609519tps 3.869ms
+  pgts rare_k10 c=64 -> 8198.433345tps 7.806ms
+  pgts common_k10 c=16 -> 644.960439tps 24.808ms
+  pgts common_k10 c=32 -> 664.256183tps 48.174ms
+  pgts common_k10 c=64 -> 662.976160tps 96.534ms
+skip count_common (no BAND_count_common)
+OK wrote+validated /nvme/out_conc/underload_pass2.json
+[12:17:38] CONC_DONE

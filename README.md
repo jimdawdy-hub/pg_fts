@@ -158,8 +158,9 @@ Features
     > candidate document. Measured on 2.19M Wikipedia articles
     > (`bench/NOTE_PHRASE_PROFILE_2026-09-06.md`): ranked top-10 for
     > `"united states"` costs **8,385 ms** with the default and **229 ms** with
-    > `positions = on` (**36x**); an exact phrase `count(*)` goes **7,170 ms ->
-    > 132 ms** (**54x**). The cost is a larger index -- 1421 MB -> 2626 MB
+    > `positions = on` (**36x**; 1.6-era figures; 1.10.0 runs it in **36.9 ms**
+    > with `positions = on`, see Performance); an exact phrase `count(*)` goes **7,170 ms ->
+    > 132 ms** (**54x**). The cost is a larger index -- 1,421 MB -> 2,626 MB
     > (1.85x) on that corpus. If you issue phrase or NEAR queries at scale,
     > enable it at CREATE INDEX time.
     >
@@ -261,34 +262,62 @@ Example
 Performance
 -----------
 
-`bench/INDEX.md` says which benchmark documents are current; the numbers below are
-from `bench/BENCHMARK_SUMMARY.md` (r6id.4xlarge, 2.19M Wikipedia docs, 8 runs, median
-of the last 5, every row parity-checked against regex ground truth).  This paragraph
-is regenerated from that file whenever it changes -- if they ever disagree, the
-summary is right and this is stale.
+Numbers below are from `bench/RESULTS_A_2026-10-07.md` (summarized in
+`bench/BENCHMARK_SUMMARY.md`; if the two ever disagree, the results file is right).  They
+are for **1.11.0**; the 1.10.0 column is re-measured on the same host and index.  Method, briefly: four engines at their
+latest release, **one AWS r7gd.4xlarge per engine** (Graviton3, 16 vCPU, 128 GiB, local
+NVMe), Debian 13 arm64, PostgreSQL 17.10 built from source with identical settings on every
+host; English Wikipedia, 2,188,038 articles, md5-identical input; each engine's documented
+English-stemmed index and query form; warm cache; latency = median of the last 5 of 8 runs
+in one session, 3 sessions; throughput = `pgbench -T 30` at 16/32/64 clients after a
+CHECKPOINT and 60 s idle.  Both pg_fts binaries return identical results on every band
+before any timing is taken, and both are checked against an exhaustive reference.  Match
+counts are checked against a regex over the raw text.  Protocol, scripts, raw output and
+every engine's install log: `bench/PROTOCOL_A_2026-10-07.md`, `bench/data_A_2026-10-07/run/`.
 
-  * **Where pg_fts wins.**  Against pg_textsearch 1.4.0 (1.9.0, 2026-10-01, identical
-    query forms): every ranked band -- rare **0.67 ms vs 0.84**, mid 0.79 vs 1.07,
-    common `year` (df 734,896) **7.19 vs 11.40**, top-100 7.37 vs 13.87 -- and
-    boolean ranked AND/OR **11-17x**, prefix 1.7x.  Under load at 16 clients: rare
-    12,412 vs 8,115 tps, common 968 vs 650.  Exact `count(*)` is index-native:
-    **0.19 ms** on a common term; pg_textsearch answers it only by sequential scan
-    (251 s) and VectorChord-bm25 cannot answer it; vs pg_search (September) 2.20 vs
-    13.63 ms.  Smallest index of the five engines measured (**1,421 MB** vs
-    1,887-2,902 MB).  The full query language -- phrase, NEAR, prefix, fuzzy, regex,
-    field zones -- through one operator.  Exact top-k (no early termination),
-    MVCC-correct results, crash/replication/corruption tested.
-  * **Where pg_fts loses.**  Ranked phrase: 138 ms vs pg_textsearch's 42.9 (3.2x;
-    `positions=on`), because pg_fts materializes the whole phrase match set before
-    ranking.  Rare-term throughput falls from 12.4k to 8.6k tps between 16 and 64
-    clients, while pg_textsearch stays flat at ~8.2k (cause not yet identified; see
-    the CHANGELOG known issues).  Against pg_search (Tantivy, September, 1.6-era
-    numbers, not re-measured) the common-term gap was ~17x single-client and has not
-    been re-measured since 1.9.0.  Build time (272 s + `fts_vacuum`) trails pg_search
-    (127 s) and VectorChord (56 s).
-  * **A caveat on pg_search's speed.**  Tantivy does not stem: for `year` it
-    returns 495,580 matches where the correct stemmed count is 734,896.  Part of
-    its advantage is a smaller unit of work.
+| ms, single client | **pg_fts 1.11.0** | pg_fts 1.10.0 | pg_textsearch 1.5.1 | pg_search 0.26.0 | VectorChord-bm25 0.3.0 |
+|---|---|---|---|---|---|
+| rare term top-10 | **0.64** | 1.07 | 0.99 | 2.66 | 20.4 |
+| mid term top-10 | **0.43** | 0.83 | 1.21 | 2.27 | 36.8 |
+| common term (df 735k) top-10 | **0.81** | 8.48 | 10.71 | 2.63 | 84.5 |
+| common term top-100 | **1.30** | 8.77 | 13.06 | 5.51 | 86.8 |
+| AND / OR top-10 (rare terms) | **1.38 / 1.84** | 2.15 / 2.11 | >300 s / >300 s | 3.45 / 3.75 | n/a / 12.6 |
+| AND top-10, `united & states` | **2.71** | 23.89 | >300 s | 11.97 | n/a |
+| AND top-10, `world & war` | 5.98 | 19.12 | not run | **5.73** | n/a |
+| 4-term OR top-10 | 13.99 | wrong result | 14.98 | **13.92** | 50.9 |
+| phrase top-10, `"united states"` | **3.55** | 24.95 | >300 s | 12.08 | n/a |
+| exact `count(*)` | **0.19** | 0.21 | n/a | 10.56 | n/a |
+
+| tps, 16 / 64 clients | **pg_fts 1.11.0** | pg_fts 1.10.0 | pg_textsearch | pg_search | VectorChord |
+|---|---|---|---|---|---|
+| rare term top-10 | **26,750 / 26,338** | 17,496 / 17,274 | 13,355 / 12,157 | 5,147 / 5,998 | 334 / 667 |
+| common term top-10 | **22,369 / 21,590** | 1,911 / 1,875 | 1,176 / 1,236 | 5,241 / 5,951 | 59 / 119 |
+| exact count | **75,381 / 69,584** | 66,912 / 61,214 | n/a | 773 / 2,547 | n/a |
+
+Index size: pg_fts **1,421 MiB** on a stored `ftsdoc` column (1,369 MiB as an expression
+index), pg_textsearch 1,887, pg_search 3,397, VectorChord 42,434 (see the caveat in the
+results file).  Build, as an expression index so every
+engine analyses the text inside its build: pg_search **71 s**, pg_fts 1.11.0 257 s (1.10.0:
+412 s plus 198 s of `fts_vacuum`), pg_textsearch 268 s.
+
+  * **Where pg_fts wins.**  Ranked single-term queries at every frequency, including
+    common terms (best-first block order with exact block bounds: a top-10 for a term in
+    735k documents visits ~32 blocks).  Throughput under load: 2.0-3.5x pg_textsearch and
+    4.4-5.9x pg_search on rare/mid terms, 3.6-4.3x pg_search on a common term.
+    Conjunctive queries, both rare and common, and phrases: AND and phrase walk the rarest
+    term's blocks best-first and look the others up.  pg_textsearch's boolean and phrase
+    forms are sequential scans that each exceeded 300 s here.  Exact `count(*)` is
+    index-native, 55x pg_search single-client.  The smallest index.  One operator for the
+    full query language (phrase, NEAR, prefix, fuzzy, regex, field zones), exact top-k
+    (no early termination), MVCC-correct results, and crash, replication and corruption
+    testing.
+  * **Where pg_fts does not win.**  pg_search builds 3.6x faster.  On `world & war` (both
+    terms frequent, their best documents spread over many blocks) and on a 4-term OR,
+    pg_search and pg_fts are within 5% of each other.
+  * **What is not compared.**  Relevance quality (NDCG), write throughput, x86 for this
+    run, and network storage (a cold-cache band on local NVMe is in the results file:
+    41-61 ms for pg_fts, against 50-86 ms for 1.10.0).  All four engines rank the same
+    documents highly but tokenize slightly differently.
   * vs the built-in tsvector/GIN + ts_rank stack, pg_fts is far faster on ranked
     retrieval (up to ~40x on common-term top-k, because ts_rank must fetch and
     sort every match).
@@ -299,9 +328,8 @@ Ranked-retrieval performance continues to iterate (see ROADMAP.md).
 Known limitations / future work
 --------------------------------
 
-  The headline gap is ranked-retrieval latency vs the specialist BM25 engines
-  (above); ROADMAP.md tracks the codec direction that closes it.  Other tracked
-  ideas:
+  Build time trails pg_search (above); ROADMAP.md tracks the remaining work.  Other
+  tracked ideas:
 
   * A fully resumable WAND cursor (emit/suspend/resume) instead of the current
     adaptive-k batch-with-growth.  WAND needs the top-k threshold to prune, so

@@ -199,6 +199,8 @@ bm25_index_idf(double N, double df)
  * least this many postings is scored exhaustively (fts_search_dense1) instead of
  * via WAND.  0 disables.  Registered in pg_fts_customscan.c. */
 int			pg_fts_dense_score_min_df = 32768;
+bool		pg_fts_lazy_phrase = true;
+static bool lazy_phrase_suppressed = false;	/* set during the collect-path redo */
 
 /*
  * Inlined TID sort for tidset_sort_uniq (every collect path funnels through it).
@@ -307,6 +309,15 @@ bm25_tombstones_load(Relation index, const BM25MetaPageData *meta, BM25Tombstone
 	}
 }
 
+/*
+ * Idempotent (1.11.0): bm25_collect_matches frees the maps after collecting
+ * and again on its generation-retry path, so a scan that raced a directory
+ * change freed every map twice; the reload after the retry could then get the
+ * same chunks back and a later pfree corrupted them (a SIGSEGV in
+ * sm_contains_many reading a garbage m_data, found by the 1.11.0 churn gate).
+ * The retry is rare, which is why it went unseen in every release since the
+ * generation re-check was added.
+ */
 static void
 bm25_tombstones_free(BM25Tombstones *t)
 {
@@ -320,6 +331,10 @@ bm25_tombstones_free(BM25Tombstones *t)
 	pfree(t->blobs);
 	pfree(t->maps);
 	pfree(t->present);
+	t->hasany = false;
+	t->blobs = NULL;
+	t->maps = NULL;
+	t->present = NULL;
 }
 
 /*
@@ -441,6 +456,18 @@ bm25_dict_seek(Relation index, const BM25SegMeta *seg,
 	BlockNumber iblk = seg->dictindexstart;
 	BlockNumber best = seg->dictstart;
 
+	/*
+	 * The dictionary index is a chain of pages of sorted (first-term, blk)
+	 * entries, one entry per dictionary page.  Each index page's entries are
+	 * variable length, so a page is searched by first collecting its entry
+	 * offsets (one pass over the page, no comparisons), then binary searching
+	 * them.  The chain is walked page by page only while the term sorts after
+	 * the page's last entry (the next page is prefetched only where the chain
+	 * jumps, see bm25_chain_prefetch).  1.10.0 compared the term against every entry of every page up
+	 * to the target: ~31k memcmp per lookup on 2.19M Wikipedia (91 index
+	 * pages, 31k dictionary pages), twice per query term -- 21% of a common-term
+	 * top-10 once the posting walk itself became cheap (perf, 2026-10-07).
+	 */
 	while (iblk != InvalidBlockNumber)
 	{
 		Buffer		buf;
@@ -448,7 +475,11 @@ bm25_dict_seek(Relation index, const BM25SegMeta *seg,
 		char	   *ptr,
 				   *end;
 		BlockNumber next;
-		bool		overshot = false;
+		uint16		offs[BLCKSZ / MAXALIGN(offsetof(BM25DictIndexEntry, term) + 1) + 1];
+		int			n = 0,
+					lo,
+					hi,
+					cand = -1;
 
 		CHECK_FOR_INTERRUPTS();		/* between pages, no buffer lock held: safe to let a cancel unwind */
 		buf = ReadBuffer(index, iblk);
@@ -457,25 +488,44 @@ bm25_dict_seek(Relation index, const BM25SegMeta *seg,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
-		while (ptr < end)
+		bm25_chain_prefetch(index, iblk, next);
+		while (ptr + offsetof(BM25DictIndexEntry, term) <= end &&
+			   n < (int) lengthof(offs))
 		{
 			BM25DictIndexEntry *ie = (BM25DictIndexEntry *) ptr;
+			Size		esz = MAXALIGN(offsetof(BM25DictIndexEntry, term) + ie->termlen);
+
+			if (ie->termlen > BLCKSZ || ptr + esz > end + MAXIMUM_ALIGNOF)
+				break;			/* recycled/corrupt page: stop (bounded, as before) */
+			offs[n++] = (uint16) (ptr - (char *) page);
+			ptr += esz;
+		}
+		/* largest entry with entry term <= target */
+		lo = 0;
+		hi = n - 1;
+		while (lo <= hi)
+		{
+			int			mid = (lo + hi) >> 1;
+			BM25DictIndexEntry *ie = (BM25DictIndexEntry *) ((char *) page + offs[mid]);
 			int			cmplen = Min((int) ie->termlen, termlen);
 			int			c = memcmp(ie->term, term, cmplen);
 
 			if (c == 0)
 				c = (int) ie->termlen - termlen;
 			if (c <= 0)
-				best = ie->blk;		/* entry term <= target: candidate page */
-			else
 			{
-				overshot = true;	/* entries are sorted; no need to go further */
-				break;
+				cand = mid;
+				lo = mid + 1;
 			}
-			ptr += MAXALIGN(offsetof(BM25DictIndexEntry, term) + ie->termlen);
+			else
+				hi = mid - 1;
 		}
+		if (cand >= 0)
+			best = ((BM25DictIndexEntry *) ((char *) page + offs[cand]))->blk;
 		UnlockReleaseBuffer(buf);
-		if (overshot)
+		/* the term sorts before this page's last entry: no later page can
+		 * hold a closer candidate (entries are sorted across the chain) */
+		if (n == 0 || cand < n - 1)
 			break;
 		iblk = next;
 	}
@@ -789,6 +839,7 @@ bm25_lookup_prefix(Relation index, const BM25SegMeta *seg,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -1196,6 +1247,7 @@ bm25_fuzzy_terms(Relation index, const BM25SegMeta *seg,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -1477,6 +1529,7 @@ bm25_universe_bounded(Relation index, BlockNumber dictstart, double ndocs,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -2926,6 +2979,7 @@ bm25_collect_pending(Relation index, const BM25MetaPageData *meta,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -3363,6 +3417,7 @@ bm25_lookup_dict(Relation index, const BM25SegMeta *seg,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -3426,6 +3481,7 @@ bm25_lookup_df(Relation index, const BM25SegMeta *seg,
 		ptr = (char *) PageGetContents(page);
 		end = bm25_page_data_end(page);
 		next = BM25PageGetOpaque(page)->nextblk;
+		bm25_chain_prefetch(index, blk, next);
 
 		while (ptr < end)
 		{
@@ -3703,6 +3759,21 @@ typedef struct WandCursor
 	 */
 	uint64		docid_lo;
 	uint64		docid_hi;
+
+	/*
+	 * Lazy phrase gate (1.9.1): a copy of the current block's positions
+	 * column (posbytelen bytes, taken with blkbuf).  posoff[i] is the start of
+	 * posting i's run in it (prefix sum of tf), built on demand the first time
+	 * a doc of this block reaches the gate; posdecoded says posoff is valid
+	 * for the CURRENT block.  want_pos is set only on the gated path.
+	 */
+	bool		want_pos;
+	unsigned char *posbuf;
+	uint32		posbytelen;
+	bool		posdecoded;
+	int		   *posoff;			/* BM25_BLOCK_SIZE + 1 entries, palloc'd only when
+								 * want_pos: WAND swaps whole cursors while sorting,
+								 * so the struct must stay small */
 }			WandCursor;
 
 static inline void wand_skip_own_tombstoned(WandCursor *c);
@@ -3744,6 +3815,13 @@ wand_load_block(WandCursor *c)
 		pfree(c->blkbuf);
 		c->blkbuf = NULL;
 	}
+	if (c->posbuf)
+	{
+		pfree(c->posbuf);
+		c->posbuf = NULL;
+	}
+	c->posbytelen = 0;
+	c->posdecoded = false;
 	if (c->curblk == InvalidBlockNumber || c->nread >= (int) c->df)
 	{
 		c->blkcount = 0;
@@ -3817,6 +3895,15 @@ wand_load_block(WandCursor *c)
 	/* copy the block's FOR payload so tf/dl bytes stay valid after we unlock */
 	c->blkbuf = (unsigned char *) palloc(bh->bytelen);
 	memcpy(c->blkbuf, stream, bh->bytelen);
+	/* lazy phrase gate: keep this block's positions column (decoded only if a
+	 * doc of this block reaches the gate).  posbytelen == 0 means the block
+	 * carries no positions; the gate then reports "unknown" (see phrase_gate) */
+	if (c->want_pos && bh->posbytelen > 0)
+	{
+		c->posbuf = (unsigned char *) palloc(bh->posbytelen);
+		memcpy(c->posbuf, stream + bh->bytelen, bh->posbytelen);
+		c->posbytelen = bh->posbytelen;
+	}
 
 	/* eagerly decode ONLY docids (gaps); record tf/dl column offsets for lazy
 	 * per-posting access -- pruned blocks never touch tf/dl */
@@ -3851,6 +3938,14 @@ wand_load_block(WandCursor *c)
 			c->curblk = BM25PageGetOpaque(page)->nextblk;
 			c->curoff = MAXALIGN(SizeOfPageHeaderData);
 		}
+		/*
+		 * The current page's last block was just taken: the cursor's next read
+		 * is the next page of the chain, known now (1.11.0); prefetched only
+		 * when the chain jumps (bm25_chain_prefetch).  Not issued on a page
+		 * the cursor will keep reading, where the link may never be followed.
+		 */
+		if (c->curblk != BufferGetBlockNumber(buf) && c->nread + cnt < (int) c->df)
+			bm25_chain_prefetch(c->index, BufferGetBlockNumber(buf), c->curblk);
 	}
 	c->nread += cnt;
 	UnlockReleaseBuffer(buf);
@@ -4181,7 +4276,11 @@ fts_query_is_pure_or(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags != 0)
+			/* a term:LABEL leaf matches only in its zones, which the index
+			 * cannot see (labels live in the heap ftsdoc): not pure (1.11.0;
+			 * before, ranked term:A returned documents without an A zone) */
+			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX |
+							 FTS_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
@@ -4220,7 +4319,10 @@ fts_query_is_pure_boolean(FtsQuery q)
 
 		if (it->type == FTS_QI_VAL)
 		{
-			if (it->flags != 0)
+			/* term:LABEL: presence in the index is not a match (see
+			 * fts_query_is_pure_or) */
+			if (it->flags & (FTS_QF_PREFIX | FTS_QF_FUZZY | FTS_QF_REGEX |
+							 FTS_QF_WEIGHTED))
 				return false;
 		}
 		else					/* operator */
@@ -4246,13 +4348,19 @@ fts_query_is_pure_boolean(FtsQuery q)
  * pass.  `q` is pure boolean, so the stack machine mirrors fts_doc_matches's
  * boolean cases (no phrase, no prefix/fuzzy/regex leaves).
  */
+typedef struct PhraseGate PhraseGate;
+
 typedef struct BoolGate
 {
-	FtsQuery	q;				/* pure-boolean query (NULL => no gate) */
+	FtsQuery	q;				/* pure-boolean query (NULL => no RPN gate) */
 	bool	   *present;			/* present[termidx], nterms entries */
 	bool	   *stack;			/* scratch RPN stack, nitems entries */
 	int			nterms;
+	PhraseGate *phrase;			/* lazy phrase gate (q == NULL then), or NULL */
 }			BoolGate;
+
+static bool phrase_gate_admits(PhraseGate *g, WandCursor *cursors, int nterms,
+							   uint64 pivot_docid);
 
 /*
  * Evaluate the pure-boolean query's RPN over the current present[] flags.
@@ -4304,7 +4412,11 @@ bmw_gate_admits(BoolGate *g, WandCursor *cursors, int nterms, uint64 pivot_docid
 {
 	int			i;
 
-	if (g == NULL || g->q == NULL)
+	if (g == NULL)
+		return true;
+	if (g->phrase != NULL)
+		return phrase_gate_admits(g->phrase, cursors, nterms, pivot_docid);
+	if (g->q == NULL)
 		return true;
 	for (i = 0; i < g->nterms; i++)
 		g->present[i] = false;
@@ -4327,6 +4439,178 @@ wand_cursor_before(const WandCursor *a, const WandCursor *b)
 }
 
 /*
+ * Lazy phrase gate (1.9.1).  For a ranked pure phrase chain over a positions=on
+ * index, WAND ranks the bag of words and this gate decides heap admission by
+ * checking adjacency for the ONE pivot doc, from the positions column of the
+ * block each phrase-term cursor is already sitting on -- instead of building
+ * the full phrase match set before ranking (bm25_collect_matches), which was
+ * ~60% of a ranked phrase query.  Same predicate as bm25_phrase_eval_seg (all
+ * terms present, then fts_phrase_step_pos chained over the step distances),
+ * so the admitted set -- and therefore the top-k -- is identical.
+ */
+struct PhraseGate
+{
+	int			npt;			/* phrase terms, in phrase order */
+	int			term[FTS_QUERY_MAX_PHRASE_TERMS];	/* fts_query_terms ordinal of each */
+	uint32		step[FTS_QUERY_MAX_PHRASE_TERMS];	/* distance joining term i to i+1 */
+	uint32	   *acc;			/* scratch, BM25_PHRASE_POSBUF each */
+	uint32	   *tmp;
+	uint32	   *right;
+	bool		unknown;		/* a block lacked positions: answer not knowable here */
+};
+
+/*
+ * Make c->posoff valid for the current block: posoff[i] = Sum(tf[0..i-1]), the
+ * start of posting i's run in the positions column.  Done once per block, and
+ * only for a block whose doc reaches the gate.  Returns false if the block has
+ * no positions or its column disagrees with the tf column (the same exact-
+ * length check bm25_decode_term applies); the caller then reports "unknown".
+ */
+static bool
+wand_block_pos_index(WandCursor *c)
+{
+	uint64		tfs[BM25_BLOCK_SIZE];
+	Size		sumtf = 0;
+	Size		need;
+	unsigned int pw;
+	int			i;
+
+	if (c->posdecoded)
+		return true;
+	if (c->posbuf == NULL || c->posbytelen == 0 || c->blkcount <= 0)
+		return false;
+	bm25_for_unpack(c->blkbuf + c->tfoff, c->blkcount, tfs);
+	for (i = 0; i < c->blkcount; i++)
+	{
+		c->posoff[i] = (int) sumtf;
+		if (tfs[i] > (uint64) INT_MAX || sumtf + (Size) tfs[i] > (Size) INT_MAX)
+			return false;		/* corrupt tf column: bounded before it can wrap */
+		sumtf += (Size) tfs[i];
+	}
+	c->posoff[c->blkcount] = (int) sumtf;
+	pw = c->posbuf[0];
+	need = (pw == 0) ? 1 : (Size) 1 + ((sumtf * pw + 7) / 8);
+	/* every value read below lies inside [1, need): bm25_for_get touches only
+	 * the bytes covering its bits for a width <= 64 */
+	if (pw > 64 || need > (Size) c->posbytelen)
+		return false;
+	c->posdecoded = true;
+	return true;
+}
+
+/* Decode the current posting's positions (its slice of the block's column,
+ * un-delta'd) into out[]; returns the count, or -1 if it exceeds cap. */
+static int
+wand_cur_positions(WandCursor *c, uint32 *out, int cap)
+{
+	int			lo = c->posoff[c->cur];
+	int			n = c->posoff[c->cur + 1] - lo;
+	uint32		run = 0;
+	int			t;
+
+	if (n > cap)
+		return -1;
+	for (t = 0; t < n; t++)
+	{
+		run += (uint32) bm25_for_get(c->posbuf, lo + t);	/* delta resets per posting */
+		out[t] = run;
+	}
+	return n;
+}
+
+/*
+ * Adjacency for one segment's cursors pc[0..npt-1], all sitting on the same
+ * docid.  Exactly bm25_phrase_eval_seg's per-doc test.  Sets g->unknown when
+ * a block lacks positions or a posting exceeds BM25_PHRASE_POSBUF (the cases
+ * that make the collect path fall back too).
+ */
+static bool
+phrase_gate_adjacent(PhraseGate *g, WandCursor **pc)
+{
+	int			t,
+				nacc;
+
+	for (t = 0; t < g->npt; t++)
+		if (!wand_block_pos_index(pc[t]))
+		{
+			g->unknown = true;
+			return false;
+		}
+	nacc = wand_cur_positions(pc[0], g->acc, BM25_PHRASE_POSBUF);
+	for (t = 1; t < g->npt && nacc > 0; t++)
+	{
+		int			nt = wand_cur_positions(pc[t], g->right, BM25_PHRASE_POSBUF);
+		int			nout = 0;
+
+		if (nt < 0)
+		{
+			nacc = -1;
+			break;
+		}
+		fts_phrase_step_pos(g->acc, nacc, g->right, nt, g->step[t - 1], false,
+							g->tmp, &nout);
+		memcpy(g->acc, g->tmp, nout * sizeof(uint32));
+		nacc = nout;
+	}
+	if (nacc < 0)
+	{
+		g->unknown = true;		/* a posting beyond BM25_PHRASE_POSBUF: the collect
+								 * path bails to recheck there too */
+		return false;
+	}
+	return nacc > 0;
+}
+
+/*
+ * Admit pivot_docid iff, in some segment, every phrase term has a cursor on it
+ * and the positions are adjacent -- the union over segments that
+ * bm25_collect_matches builds.  (A live docid has postings in one segment
+ * only, so the segment match is defence in depth -- the phrase_gate test
+ * cannot tell it apart from matching any segment; looping over term 0's
+ * cursors keeps this exact without relying on that.)
+ * Once g->unknown is set the result is discarded and recomputed on the
+ * collect path, so admit nothing further.
+ */
+static bool
+phrase_gate_admits(PhraseGate *g, WandCursor *cursors, int nterms, uint64 pivot_docid)
+{
+	WandCursor *pc[FTS_QUERY_MAX_PHRASE_TERMS];
+	int			i0;
+
+	if (g->unknown)
+		return false;
+	for (i0 = 0; i0 < nterms; i0++)
+	{
+		int			t;
+		bool		all = true;
+
+		if (cursors[i0].termidx != g->term[0] || cursors[i0].docid != pivot_docid)
+			continue;
+		pc[0] = &cursors[i0];
+		for (t = 1; t < g->npt && all; t++)
+		{
+			int			i;
+
+			pc[t] = NULL;
+			for (i = 0; i < nterms; i++)
+				if (cursors[i].termidx == g->term[t] &&
+					cursors[i].segidx == pc[0]->segidx &&
+					cursors[i].docid == pivot_docid)
+				{
+					pc[t] = &cursors[i];
+					break;
+				}
+			all = (pc[t] != NULL);
+		}
+		if (all && phrase_gate_adjacent(g, pc))
+			return true;
+		if (g->unknown)
+			return false;
+	}
+	return false;
+}
+
+/*
  * fts_search_wand: exact top-k identical to the accumulate path, but using
  * document-at-a-time WAND so that documents which cannot enter the current
  * top-k are skipped via the per-term max-contribution bounds.  Returns the
@@ -4339,6 +4623,43 @@ wand_cursor_before(const WandCursor *a, const WandCursor *b)
  * threshold math -- filtered docs simply never reach the heap (and so never
  * raise the threshold).
  */
+/*
+ * A document's score is the sum of its terms' contributions IN QUERY-TERM
+ * ORDER, on every path (1.11.0).  Floating-point addition is not associative:
+ * BMW summed in cursor order, which its selection sort leaves arbitrary among
+ * equal docids, so a 3-term score could differ in the last bit between two
+ * traversals of the same query (the lazy phrase gate and the collect path
+ * disagreed on 46 of 199 scores).  acc[] holds one slot per query term
+ * (contributions are > 0: idf > 0 and tf >= 1); this adds the touched slots in
+ * term order and clears them.
+ */
+static inline double
+sum_term_order(double *acc, int nq)
+{
+	double		s = 0.0;
+	int			t;
+
+	for (t = 0; t < nq; t++)
+		if (acc[t] != 0.0)
+		{
+			s += acc[t];
+			acc[t] = 0.0;
+		}
+	return s;
+}
+
+/* one past the largest query-term ordinal among the cursors */
+static int
+cursors_nq(const WandCursor *cursors, int nterms)
+{
+	int			nq = 0,
+				i;
+
+	for (i = 0; i < nterms; i++)
+		nq = Max(nq, cursors[i].termidx + 1);
+	return nq;
+}
+
 static int
 fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter,
 			   BoolGate *gate, ScoredTid **out)
@@ -4347,6 +4668,8 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 	int			nheap = 0;
 	double		threshold = 0.0;
 	int			t;
+	int			nq = cursors_nq(cursors, nterms);
+	double	   *acc = (double *) palloc0(Max(nq, 1) * sizeof(double));	/* alloc-ok: nq = query term count */
 
 	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
 
@@ -4409,7 +4732,6 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 		if (nheap >= k)
 		{
 			double		blocksum = 0.0;
-			uint64		safe_until = pivot_docid;
 			int			nle = 0;		/* cursors with docid <= pivot */
 			int			lei = -1;		/* index of the (single) such cursor */
 
@@ -4420,9 +4742,6 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				if (cursors[i].docid <= pivot_docid)
 				{
 					blocksum += wand_block_max_contrib(&cursors[i]);
-					if (cursors[i].blkcount > 0)
-						safe_until = Min(safe_until,
-									 cursors[i].docids[cursors[i].blkcount - 1]);
 					nle++;
 					lei = i;
 				}
@@ -4470,10 +4789,56 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 				if (block_isolated)
 					wand_skip_block(&cursors[lei]);
 				else
+				{
+					/*
+					 * Block-max WAND skip (1.11.0).  blocksum bounds every
+					 * document in [pivot, d) where d is the smallest of
+					 *   - one past the last docid of any at-or-before cursor's
+					 *     current block (beyond it that cursor's bound changes),
+					 *   - the docid of the first cursor AFTER the pivot (from
+					 *     there that term can add its contribution).
+					 * No document below d can beat the threshold, so every
+					 * at-or-before cursor may jump to d.  The 1.10.0 code
+					 * advanced only to pivot+1, which on a two-common-term OR
+					 * was ~240k seeks to score ~94k postings.  With the
+					 * effective-length block bounds this branch is the common
+					 * one, so the jump is what makes them pay off.
+					 *
+					 * d can be at or below the pivot: an at-or-before cursor's
+					 * block may end before it, and the term's next block may
+					 * hold a higher contribution for the pivot itself.  Jump
+					 * only to d then -- never past the pivot -- so that block
+					 * is loaded and bounded (test bmw_block_end).  This still
+					 * makes progress: d exceeds the earliest cursor's docid,
+					 * because every current block ends at or after its
+					 * cursor's docid.
+					 */
+					uint64		skipto = UINT64_MAX;
+
+					for (i = 0; i < nterms; i++)
+					{
+						if (cursors[i].docid == UINT64_MAX)
+							continue;
+						if (cursors[i].docid <= pivot_docid)
+						{
+							if (cursors[i].blkcount > 0)
+							{
+								uint64		last = cursors[i].docids[cursors[i].blkcount - 1];
+
+								if (last + 1 < skipto)
+									skipto = last + 1;
+							}
+							else if (pivot_docid + 1 < skipto)
+								skipto = pivot_docid + 1;
+						}
+						else if (cursors[i].docid < skipto)
+							skipto = cursors[i].docid;
+					}
 					for (i = 0; i < nterms; i++)
 						if (cursors[i].docid != UINT64_MAX &&
-							cursors[i].docid <= safe_until)
-							wand_seek(&cursors[i], safe_until + 1);
+							cursors[i].docid <= pivot_docid)
+							wand_seek(&cursors[i], skipto);
+				}
 				continue;
 			}
 		}
@@ -4485,10 +4850,10 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 
 			bm25_docid_to_tid(pivot_docid, &tid);
 
-			score = 0.0;
 			for (i = 0; i < nterms; i++)
 				if (cursors[i].docid == pivot_docid)
-					score += wand_contrib_cur(&cursors[i]);
+					acc[cursors[i].termidx] += wand_contrib_cur(&cursors[i]);
+			score = sum_term_order(acc, nq);
 
 			/* push into the top-k min-heap -- but only if the docid is admitted
 			 * by the boolean match-set gate.  Two equivalent gates:
@@ -4501,7 +4866,11 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 			 * threshold; the traversal and its block-skip math are unchanged
 			 * (the threshold may just stay lower longer, costing pruning only,
 			 * never correctness). */
-			if (docid_admitted(filter, pivot_docid) &&
+			/* a doc that cannot enter a full heap (score <= threshold: the
+			 * replace branch below needs score > threshold) never needs the
+			 * gate -- for the lazy phrase gate that skips a positions decode */
+			if ((nheap < k || score > threshold) &&
+				docid_admitted(filter, pivot_docid) &&
 				bmw_gate_admits(gate, cursors, nterms, pivot_docid))
 			{
 			if (nheap < k)
@@ -4558,9 +4927,17 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 	{
 		if (cursors[t].blkbuf)
 			pfree(cursors[t].blkbuf);
+		if (cursors[t].posbuf)
+			pfree(cursors[t].posbuf);
+		if (cursors[t].posoff)
+			pfree(cursors[t].posoff);
+		cursors[t].blkbuf = NULL;
+		cursors[t].posbuf = NULL;
+		cursors[t].posoff = NULL;
 		bm25_doclen_cursor_free(&cursors[t].doclenc);
 	}
 
+	pfree(acc);
 	qsort(heap, nheap, sizeof(ScoredTid), cmp_scored_desc);
 	*out = heap;
 	return nheap;
@@ -4585,14 +4962,17 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 	ScoredTid  *heap;
 	int			nheap = 0;
 	double		threshold = 0.0;
-	double	   *prefix;			/* canonical-order bound for max_contrib[0..i) */
+	double	   *suffix;			/* suffix[i] = sum of max_contrib over [0, i) (a
+								 * prefix sum; name kept for the diff) */
 	int			t,
 				i,
 				j;
 	int			first_essential;	/* cursors[first_essential..) are essential */
+	int			nq = cursors_nq(cursors, nterms);
+	double	   *acc = (double *) palloc0(Max(nq, 1) * sizeof(double));	/* alloc-ok: nq = query term count */
 
 	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
-	prefix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
+	suffix = (double *) palloc((nterms + 1) * sizeof(double));	/* alloc-ok: nterms = query term count */
 
 	for (t = 0; t < nterms; t++)
 		wand_prime(&cursors[t]);
@@ -4607,17 +4987,18 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 				cursors[i] = cursors[j];
 				cursors[j] = tmp;
 			}
-	prefix[0] = 0.0;
+	/*
+	 * prefix[i] = sum of max_contrib over cursors [0, i): the most the first i
+	 * (lowest-impact) terms can add to any document.  1.10.0 used a SUFFIX sum
+	 * here and declared term i non-essential when the terms AFTER it could not
+	 * reach the threshold -- the wrong side: it then iterated candidates only
+	 * from the high-impact terms and missed documents whose score came mostly
+	 * from the "non-essential" ones.  Found by an exhaustive-reference check
+	 * (bench/data_A_2026-10-07): a 4-term OR returned none of the true top-10.
+	 */
+	suffix[0] = 0.0;
 	for (i = 0; i < nterms; i++)
-	{
-		/* Recompute each prefix in the exact scorer's descending order.
-		 * Reusing an ascending subtotal can round below a prefix-only score. */
-		double		bound = 0.0;
-
-		for (j = i; j >= 0; j--)
-			bound += cursors[j].max_contrib;
-		prefix[i + 1] = bound;
-	}
+		suffix[i + 1] = suffix[i] + cursors[i].max_contrib;
 
 	first_essential = 0;
 
@@ -4625,7 +5006,6 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 	{
 		uint64		cand = UINT64_MAX;
 		double		score;
-		double		bound;
 
 		CHECK_FOR_INTERRUPTS();	/* per document-at-a-time step; cursor blocks are palloc'd copies, no lock held */
 
@@ -4634,8 +5014,10 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 		 * non-essential */
 		if (nheap >= k)
 		{
+			/* terms [0, first_essential] together cannot beat the threshold:
+			 * a document containing only those terms cannot enter the top-k */
 			while (first_essential < nterms &&
-				   prefix[first_essential + 1] <= threshold)
+				   suffix[first_essential + 1] <= threshold)
 				first_essential++;
 		}
 
@@ -4646,31 +5028,33 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 		if (cand == UINT64_MAX)
 			break;				/* essential cursors exhausted */
 
-		/* score cand: essential contributions + upper bound of non-essentials */
+		/* score cand: essential contributions + upper bound of non-essentials;
+		 * the exact score is summed in query-term order (sum_term_order) */
 		score = 0.0;
-		/* Always add contributions in descending cursor order.  The essential
-		 * boundary changes with k; a fixed order avoids one-ULP score changes
-		 * that reorder ties across adaptive ranked-scan batches. */
-		for (i = nterms - 1; i >= first_essential; i--)
+		for (i = first_essential; i < nterms; i++)
 			if (cursors[i].docid == cand)
-				score += wand_contrib_cur(&cursors[i]);
+			{
+				double		c = wand_contrib_cur(&cursors[i]);
 
-		/* Add upper bounds in the same order as exact non-essential scores.
-		 * A grouped prefix add can round below the exact candidate score. */
-		bound = score;
-		for (i = first_essential - 1; i >= 0; i--)
-			bound += cursors[i].max_contrib;
-		/* early-exit check: essential score + non-essential upper bounds cannot
-		 * beat the threshold, so skip the non-essential lookups */
-		if (!(nheap >= k && bound <= threshold))
+				score += c;
+				acc[cursors[i].termidx] += c;
+			}
+
+		/* early-exit check: essential score + every non-essential term's max
+		 * (prefix sum over [0, first_essential)) <= threshold => cand cannot
+		 * make the top-k, skip the non-essential lookups */
+		if (nheap >= k && score + suffix[first_essential] <= threshold)
+			(void) sum_term_order(acc, nq);	/* clears acc */
+		else
 		{
 			/* add exact non-essential contributions by seeking to cand */
-			for (i = first_essential - 1; i >= 0; i--)
+			for (i = 0; i < first_essential; i++)
 			{
 				wand_seek(&cursors[i], cand);
 				if (cursors[i].docid == cand)
-					score += wand_contrib_cur(&cursors[i]);
+					acc[cursors[i].termidx] += wand_contrib_cur(&cursors[i]);
 			}
+			score = sum_term_order(acc, nq);
 
 			/* gate heap admission by the boolean match-set (DocidFilter for
 			 * non-pure-boolean, or the lazy BoolGate over term-presence at cand
@@ -4678,7 +5062,8 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 			 * and never raises the threshold.  The essential/non-essential
 			 * traversal (incl. the non-essential seeks above) is unchanged --
 			 * only heap insertion is gated. */
-			if (docid_admitted(filter, cand) &&
+			if ((nheap < k || score > threshold) &&
+				docid_admitted(filter, cand) &&
 				bmw_gate_admits(gate, cursors, nterms, cand))
 			{
 			if (nheap < k)
@@ -4726,9 +5111,17 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
 	{
 		if (cursors[t].blkbuf)
 			pfree(cursors[t].blkbuf);
+		if (cursors[t].posbuf)
+			pfree(cursors[t].posbuf);
+		if (cursors[t].posoff)
+			pfree(cursors[t].posoff);
+		cursors[t].blkbuf = NULL;
+		cursors[t].posbuf = NULL;
+		cursors[t].posoff = NULL;
 		bm25_doclen_cursor_free(&cursors[t].doclenc);
 	}
 
+	pfree(acc);
 	qsort(heap, nheap, sizeof(ScoredTid), cmp_scored_desc);
 	*out = heap;
 	return nheap;
@@ -4759,7 +5152,15 @@ fts_search_maxscore(WandCursor *cursors, int nterms, int k,
  * the result is the same top-k, ties included.  It is the reference algorithm
  * WAND approximates.  Gated by pg_fts.dense_score_min_df (fts_search_wand).
  */
-static int
+/*
+ * Kept out of line deliberately.  Inlined into its one caller, this loop's
+ * speed moved with unrelated code elsewhere in that function: the 1.9.1 phrase
+ * gate adds nothing to it, yet a common-term top-10 went from 7.1-7.2 to
+ * 7.5-7.9 ms on two hosts.  Out of line it measured 7.0-7.1 ms in 8 of 10
+ * server starts and 7.6-7.9 in the other 2 (2026-10-06): a code-layout effect,
+ * not an algorithmic one, so treat small changes here as needing a re-measure.
+ */
+pg_noinline static int
 fts_search_dense1(WandCursor *c, int k, ScoredTid **out)
 {
 	ScoredTid  *heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
@@ -4840,10 +5241,655 @@ fts_search_dense1(WandCursor *c, int k, ScoredTid **out)
 	return nheap;
 }
 
+/*
+ * Best-first single-term top-k (1.11.0).
+ *
+ * With the effective-length block bound (bm25_write_postings) the per-block
+ * score bound is tight: on 2.19M Wikipedia, a top-10 over `year` (735k
+ * postings) needs only the 32 highest-bound blocks.  A docid-ordered walk
+ * cannot use that -- its threshold starts at zero and rises slowly -- so:
+ *
+ *   pass 1  read every block HEADER of the term (24 bytes each, ~46 per page;
+ *           the payload is not decoded) and record (page, offset, bound);
+ *   pass 2  visit blocks in DESCENDING bound order, decode and score each one,
+ *           and stop at the first block whose bound cannot beat the current
+ *           k-th score.
+ *
+ * Exact: every unvisited block's bound is <= the k-th score already found, so
+ * no unvisited posting can enter the heap (the heap evicts by scored_worse,
+ * score then TID, the order every ranked path uses; a posting EQUAL to the
+ * k-th score could still displace it by TID, so the stop test is strict).
+ * Scoring arithmetic, tombstone skipping and the doclen lookup are the same
+ * as fts_search_dense1, which stays as the reference this is tested against.
+ *
+ * Kept out of line deliberately (pg_noinline), for the same code-layout
+ * reason as fts_search_dense1: inlined into bm25_topk_candidates_range, a hot
+ * loop's speed moved with unrelated code in that function (1.9.1).
+ */
+typedef struct BestFirstBlock
+{
+	BlockNumber blk;
+	uint32		off;			/* byte offset of the block header on blk */
+	uint32		nbefore;		/* the term's postings in earlier blocks */
+	uint32		grp;			/* conjunctive path: segment group of the block */
+	uint64		first;			/* first docid of the block */
+	float8		bound;
+} BestFirstBlock;
+
+/*
+ * Binary max-heap on bound.  A full sort of the block list was 39% of a
+ * common-term top-10 (perf), and only the first few dozen blocks are ever
+ * visited: heapify is O(n) and each pop O(log n), so the order costs only what
+ * is consumed.
+ */
+static void
+bestfirst_siftdown(BestFirstBlock *v, int n, int i)
+{
+	for (;;)
+	{
+		int			l = 2 * i + 1,
+					r = l + 1,
+					m = i;
+		BestFirstBlock t;
+
+		if (l < n && v[l].bound > v[m].bound)
+			m = l;
+		if (r < n && v[r].bound > v[m].bound)
+			m = r;
+		if (m == i)
+			return;
+		t = v[i];
+		v[i] = v[m];
+		v[m] = t;
+		i = m;
+	}
+}
+
+/* Collect every block header of c's term.  Returns the count, or -1 if the
+ * chain looks inconsistent (the caller then uses the docid-order path). */
+static int
+bestfirst_collect(WandCursor *c, BestFirstBlock **out)
+{
+	BlockNumber blk = c->firstblk;
+	uint32		off = c->firstoff;
+	int			nblocks = (int) ((c->df + BM25_BLOCK_SIZE - 1) / BM25_BLOCK_SIZE);
+	int			n = 0;
+	int			nread = 0;
+	BlockNumber nrel = RelationGetNumberOfBlocks(c->index);
+	BestFirstBlock *v;
+
+	v = (BestFirstBlock *) palloc(Max(nblocks, 1) * sizeof(BestFirstBlock));	/* alloc-ok: one entry per 128 postings of ONE term */
+	while (blk != InvalidBlockNumber && nread < (int) c->df)
+	{
+		Buffer		buf;
+		Page		page;
+		char	   *p,
+				   *pend;
+		BlockNumber next;
+
+		CHECK_FOR_INTERRUPTS();
+		if (blk >= nrel)
+			break;
+		buf = ReadBuffer(c->index, blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		pend = bm25_page_data_end(page);
+		next = BM25PageGetOpaque(page)->nextblk;
+		/* this walk reads every page of the term's chain: read ahead along
+		 * it (a one-page prefetch left a cold common-term top-10 36 ms in
+		 * this loop against 10 ms for the dense path's windowed read-ahead) */
+		bm25_chain_prefetch(c->index, blk, next);
+		p = (char *) page + off;
+		while (p + sizeof(BM25BlockHdr) <= pend && nread < (int) c->df)
+		{
+			BM25BlockHdr *bh = (BM25BlockHdr *) p;
+			const char *stream = (const char *) (bh + 1);
+			double		mtf = (double) bh->max_tf;
+			double		mindl;
+
+			if (bh->count == 0)
+				break;			/* empty tail of the page */
+			if (bh->count > (uint32) BM25_BLOCK_SIZE ||
+				stream + (Size) bh->bytelen + (Size) bh->posbytelen > pend ||
+				n >= nblocks)
+			{
+				UnlockReleaseBuffer(buf);
+				pfree(v);
+				return -1;		/* torn or recycled page: let the caller fall back */
+			}
+			mindl = (double) (c->has_doclen_col
+							  ? bh->min_doclen
+							  : fts_byte_to_doclen(fts_doclen_to_byte(bh->min_doclen)));
+			v[n].blk = blk;
+			v[n].off = (uint32) (p - (char *) page);
+			v[n].nbefore = (uint32) nread;
+			v[n].grp = 0;
+			v[n].first = ((uint64) bh->first_docid_hi << 32) | bh->first_docid_lo;
+			/* the scoring expression of wand_contrib_cur, at (max tf, min
+			 * length): the same operations in the same order, so the bound is
+			 * never an ulp below a score it covers */
+			v[n].bound = c->idf_k1p1 * mtf /
+				(mtf + c->k1_1mb + c->k1b_inv_avgdl * mindl);
+			n++;
+			nread += (int) bh->count;
+			p = (char *) MAXALIGN(stream + bh->bytelen + bh->posbytelen);
+		}
+		UnlockReleaseBuffer(buf);
+		blk = next;
+		off = MAXALIGN(SizeOfPageHeaderData);
+	}
+	if (nread != (int) c->df)
+	{
+		pfree(v);
+		return -1;				/* chain shorter/longer than df: fall back */
+	}
+	*out = v;
+	return n;
+}
+
+pg_noinline static int
+fts_search_bestfirst1(WandCursor *c, int k, ScoredTid **out)
+{
+	BestFirstBlock *v;
+	int			nb,
+				bi;
+	ScoredTid  *heap;
+	int			nheap = 0;
+	int			minpos = 0;
+	double		threshold = -1.0;
+	uint64		tfs[BM25_BLOCK_SIZE];
+
+	nb = bestfirst_collect(c, &v);
+	if (nb < 0)
+		return -1;
+	for (bi = nb / 2 - 1; bi >= 0; bi--)
+		bestfirst_siftdown(v, nb, bi);
+	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+
+	while (nb > 0)
+	{
+		int			i;
+		BestFirstBlock top = v[0];
+
+		/* every remaining block is bounded by top.bound: once that cannot beat
+		 * the k-th score, nothing left can enter (strict, see above) */
+		if (nheap == k && top.bound < threshold)
+			break;
+		v[0] = v[--nb];
+		bestfirst_siftdown(v, nb, 0);
+		CHECK_FOR_INTERRUPTS();
+		/* prefetch the next block in visit order if it is on another page */
+		if (nb > 0 && v[0].blk != top.blk)
+			PrefetchBuffer(c->index, MAIN_FORKNUM, v[0].blk);
+		/* position the cursor on this block and decode it (wand_load_block
+		 * reads the block at curblk/curoff and copies its payload) */
+		c->curblk = top.blk;
+		c->curoff = top.off;
+		c->nread = 0;
+		wand_load_block(c);
+		if (c->blkcount == 0)
+		{
+			/* the block vanished (concurrent recycle): the caller's
+			 * generation re-check restarts the scan; return what we have */
+			break;
+		}
+		/* tombstone lookups resume forward only: reset per block (blocks are
+		 * visited out of docid order) */
+		{
+			sm_cursor_t ini = SM_CURSOR_INIT;
+
+			c->tombcursor = ini;
+		}
+		bm25_for_unpack(c->blkbuf + c->tfoff, c->blkcount, tfs);
+		for (i = 0; i < c->blkcount; i++)
+		{
+			uint64		docid = c->docids[i];
+			double		tf,
+						dl,
+						score;
+			ScoredTid	st;
+
+			if (docid < c->docid_lo || docid >= c->docid_hi)
+				continue;
+			if (c->tombs != NULL && c->tombs->hasany)
+			{
+				c->cur = i;
+				c->docid = docid;
+				if (wand_cur_own_tombstoned(c))
+					continue;
+			}
+			tf = (double) tfs[i];
+			dl = c->has_doclen_col
+				? (double) bm25_for_get(c->blkbuf + c->dloff, i)
+				: (double) bm25_doclen_cursor_lookup(&c->doclenc, docid);
+			score = c->idf_k1p1 * tf / (tf + c->k1_1mb + c->k1b_inv_avgdl * dl);
+			if (nheap == k && score < threshold)
+				continue;
+			bm25_docid_to_tid(docid, &st.tid);
+			st.score = score;
+			if (nheap < k)
+			{
+				heap[nheap++] = st;
+				if (nheap == k)
+				{
+					int			j;
+
+					minpos = 0;
+					for (j = 1; j < nheap; j++)
+						if (scored_worse(&heap[j], &heap[minpos]))
+							minpos = j;
+					threshold = heap[minpos].score;
+				}
+			}
+			else if (scored_worse(&heap[minpos], &st))
+			{
+				int			j;
+
+				heap[minpos] = st;
+				minpos = 0;
+				for (j = 1; j < nheap; j++)
+					if (scored_worse(&heap[j], &heap[minpos]))
+						minpos = j;
+				threshold = heap[minpos].score;
+			}
+		}
+	}
+	if (c->blkbuf)
+		pfree(c->blkbuf);
+	c->blkbuf = NULL;
+	if (c->posbuf)
+		pfree(c->posbuf);
+	c->posbuf = NULL;
+	bm25_doclen_cursor_free(&c->doclenc);
+	pfree(v);
+	qsort(heap, nheap, sizeof(ScoredTid), cmp_scored_desc);
+	*out = heap;
+	return nheap;
+}
+
+/* Admit (tid, score) into the k-entry top-k heap; same rule as bestfirst1. */
+static inline void
+topk_admit(ScoredTid *heap, int *nheap, int k, int *minpos, double *threshold,
+		   uint64 docid, double score)
+{
+	ScoredTid	st;
+	int			j;
+
+	bm25_docid_to_tid(docid, &st.tid);
+	st.score = score;
+	if (*nheap < k)
+	{
+		heap[(*nheap)++] = st;
+		if (*nheap < k)
+			return;
+	}
+	else if (scored_worse(&heap[*minpos], &st))
+		heap[*minpos] = st;
+	else
+		return;
+	*minpos = 0;
+	for (j = 1; j < *nheap; j++)
+		if (scored_worse(&heap[j], &heap[*minpos]))
+			*minpos = j;
+	*threshold = heap[*minpos].score;
+}
+
+/* Position c on the block of hdr[0..n) covering docid lo (or the first block
+ * after it), rewinding to the block start so later seeks see every posting. */
+static void
+conj_position(WandCursor *c, const BestFirstBlock *hdr, int n, uint64 lo)
+{
+	sm_cursor_t ini = SM_CURSOR_INIT;
+
+	c->tombcursor = ini;		/* tombstone lookups resume forward only */
+	if (c->blkcount > 0 && c->docids[0] <= lo && lo <= c->docids[c->blkcount - 1])
+	{
+		c->cur = 0;				/* already decoded: rewind within the block */
+		c->docid = c->docids[0];
+		return;
+	}
+	{
+		int			a = 0,
+					b = n - 1,
+					j = 0;
+
+		while (a <= b)
+		{
+			int			m = (a + b) / 2;
+
+			if (hdr[m].first <= lo)
+			{
+				j = m;
+				a = m + 1;
+			}
+			else
+				b = m - 1;
+		}
+		c->curblk = hdr[j].blk;
+		c->curoff = hdr[j].off;
+		c->nread = (int) hdr[j].nbefore;
+		wand_load_block(c);
+	}
+}
+
+/*
+ * fts_search_and_bestfirst (1.11.0): exact top-k for a CONJUNCTIVE query -- a
+ * pure AND of plain terms, or a pure phrase chain whose admission the phrase
+ * gate decides.  Every match contains every term, and all of a document's
+ * postings live in its own segment, so within a segment the blocks of the
+ * rarest term (the driver) enumerate every candidate.  A driver block's bound
+ * is its own block bound plus, for each other term, the largest bound among
+ * that term's blocks overlapping the driver block's docid range [first, next
+ * block's first): no document in the range can score more.  The driver blocks
+ * of every segment go in one max-heap, visited best-first; the scan stops when
+ * the best remaining bound is below the k-th score (strict, as in
+ * fts_search_bestfirst1).  In a visited block each driver docid is looked up in
+ * the other terms with wand_seek, after each other cursor is positioned on the
+ * block covering the range start.  Scores are summed in term order, so a
+ * document's score does not depend on visit order.  Returns -1 (caller uses the
+ * docid-order paths) if a chain looks inconsistent.  The disjunctive BMW walk
+ * this replaces for AND/phrase ranks the bag of words and visits nearly every
+ * block of both terms of `united & states`.
+ *
+ * Kept out of line deliberately (pg_noinline): same code-layout reason as
+ * fts_search_dense1 (1.9.1).
+ */
+pg_noinline static int
+fts_search_and_bestfirst(WandCursor *cursors, int ncur, int k, BoolGate *gate,
+						 ScoredTid **out)
+{
+	int			nq = gate->nterms;	/* query term ordinals (incl. absent terms) */
+	BestFirstBlock **hdr;
+	int		   *nhdr;
+	int		   *grpstart;		/* group g = cursors grpidx[grpstart[g] ..) */
+	int		   *grpidx;
+	int		   *drv;			/* driver cursor of each group */
+	int			ngrp = 0,
+				ngi = 0,
+				nv = 0,
+				i;
+	uint32		maxseg = 0;
+	BestFirstBlock *v;
+	ScoredTid  *heap;
+	int			nheap = 0,
+				minpos = 0;
+	double		threshold = -1.0;
+	bool		bad = false;
+
+	for (i = 0; i < ncur; i++)
+		maxseg = Max(maxseg, cursors[i].segidx);
+	hdr = (BestFirstBlock **) palloc0(ncur * sizeof(BestFirstBlock *));
+	nhdr = (int *) palloc0(ncur * sizeof(int));
+	grpstart = (int *) palloc((ncur + 1) * sizeof(int));
+	grpidx = (int *) palloc(Max(ncur, 1) * sizeof(int));
+	drv = (int *) palloc(Max(ncur, 1) * sizeof(int));
+
+	/* one group per segment holding a cursor for EVERY query term; cursors were
+	 * built term-major, so a segment's cursors come out in term order */
+	{
+		uint32		s;
+
+		for (s = 0; s <= maxseg && !bad; s++)
+		{
+			int			g0 = ngi,
+						t = 0;
+
+			for (i = 0; i < ncur; i++)
+				if (cursors[i].segidx == s)
+				{
+					if (cursors[i].termidx != t)
+						break;	/* a term missing here: no match in s */
+					grpidx[ngi++] = i;
+					t++;
+				}
+			if (t != nq || (i < ncur && cursors[i].segidx == s))
+			{
+				ngi = g0;
+				continue;
+			}
+			grpstart[ngrp] = g0;
+			drv[ngrp] = grpidx[g0];
+			for (i = g0; i < ngi; i++)
+			{
+				int			c = grpidx[i];
+
+				if (cursors[c].df < cursors[drv[ngrp]].df)
+					drv[ngrp] = c;
+				nhdr[c] = bestfirst_collect(&cursors[c], &hdr[c]);
+				if (nhdr[c] < 0)
+					bad = true;
+			}
+			if (!bad)
+				nv += nhdr[drv[ngrp]];
+			ngrp++;
+		}
+		grpstart[ngrp] = ngi;
+	}
+	if (bad)
+	{
+		for (i = 0; i < ncur; i++)
+			if (hdr[i] != NULL && nhdr[i] >= 0)
+				pfree(hdr[i]);
+		pfree(hdr);
+		pfree(nhdr);
+		pfree(grpstart);
+		pfree(grpidx);
+		pfree(drv);
+		return -1;
+	}
+
+	/*
+	 * Driver-block bounds: per term, the largest bound among its blocks
+	 * overlapping the driver block's range (the driver's own block for the
+	 * driver), summed in term order -- the order the score below is summed in,
+	 * so the bound is never an ulp below a score it covers.  A term with no
+	 * overlapping block leaves nothing to match: the block is dead (-1).
+	 */
+	v = (BestFirstBlock *) palloc(Max(nv, 1) * sizeof(BestFirstBlock));	/* alloc-ok: one entry per 128 postings of the rarest term */
+	nv = 0;
+	{
+		int			g;
+
+		for (g = 0; g < ngrp; g++)
+		{
+			int			dc = drv[g];
+			BestFirstBlock *dh = hdr[dc];
+			int			nd = nhdr[dc],
+						b0 = nv,
+						gi;
+
+			for (i = 0; i < nd; i++)
+			{
+				v[nv] = dh[i];
+				v[nv].grp = (uint32) g;
+				v[nv].bound = 0.0;
+				nv++;
+			}
+			for (gi = grpstart[g]; gi < grpstart[g + 1]; gi++)
+			{
+				int			oc = grpidx[gi],
+							j = 0;
+				BestFirstBlock *oh = hdr[oc];
+				int			no = nhdr[oc];
+
+				for (i = 0; i < nd; i++)
+				{
+					uint64		lo = dh[i].first,
+								hi = (i + 1 < nd) ? dh[i + 1].first : UINT64_MAX;
+					double		mb = -1.0;
+					int			jj;
+
+					if (v[b0 + i].bound < 0.0)
+						continue;	/* already dead */
+					if (oc == dc)
+						mb = dh[i].bound;
+					else
+					{
+						/* block jj covers [oh[jj].first, oh[jj + 1].first) */
+						while (j + 1 < no && oh[j + 1].first <= lo)
+							j++;
+						for (jj = j; jj < no && oh[jj].first < hi; jj++)
+							mb = Max(mb, oh[jj].bound);
+					}
+					v[b0 + i].bound = (mb < 0.0) ? -1.0 : v[b0 + i].bound + mb;
+				}
+			}
+		}
+	}
+	for (i = nv / 2 - 1; i >= 0; i--)
+		bestfirst_siftdown(v, nv, i);
+	heap = (ScoredTid *) palloc(Max(k, 1) * sizeof(ScoredTid));
+
+	while (nv > 0)
+	{
+		BestFirstBlock top = v[0];
+		int			g = (int) top.grp,
+					dc = drv[g],
+					gi;
+		WandCursor *c = &cursors[dc];
+
+		if (top.bound < 0.0 || (nheap == k && top.bound < threshold))
+			break;
+		v[0] = v[--nv];
+		bestfirst_siftdown(v, nv, 0);
+		CHECK_FOR_INTERRUPTS();
+		if (nv > 0 && v[0].blk != top.blk)
+			PrefetchBuffer(c->index, MAIN_FORKNUM, v[0].blk);
+		c->curblk = top.blk;
+		c->curoff = top.off;
+		c->nread = (int) top.nbefore;
+		wand_load_block(c);
+		if (c->blkcount == 0)
+			break;				/* concurrent recycle: the generation re-check restarts */
+		{
+			sm_cursor_t ini = SM_CURSOR_INIT;
+
+			c->tombcursor = ini;
+		}
+		for (gi = grpstart[g]; gi < grpstart[g + 1]; gi++)
+			if (grpidx[gi] != dc)
+				conj_position(&cursors[grpidx[gi]], hdr[grpidx[gi]], nhdr[grpidx[gi]],
+							  c->docids[0]);
+		for (i = 0; i < c->blkcount; i++)
+		{
+			uint64		d = c->docids[i];
+			double		score = 0.0;
+			bool		all = true;
+
+			if (d < c->docid_lo || d >= c->docid_hi)
+				continue;
+			c->cur = i;
+			c->docid = d;
+			if (wand_cur_own_tombstoned(c))
+				continue;
+			for (gi = grpstart[g]; gi < grpstart[g + 1] && all; gi++)
+			{
+				WandCursor *o = &cursors[grpidx[gi]];
+
+				if (o != c)
+				{
+					wand_seek(o, d);
+					all = (o->docid == d);
+				}
+			}
+			if (!all)
+				continue;
+			for (gi = grpstart[g]; gi < grpstart[g + 1]; gi++)
+				score += wand_contrib_cur(&cursors[grpidx[gi]]);
+			if (nheap == k && score < threshold)
+				continue;
+			/* a pure AND is satisfied by presence; a phrase also needs
+			 * adjacency, checked on THIS segment's cursors only (the group is
+			 * in term order, so term t's cursor is grpidx[grpstart[g] + t]) */
+			if (gate->phrase != NULL)
+			{
+				PhraseGate *pg = gate->phrase;
+				WandCursor *pc[FTS_QUERY_MAX_PHRASE_TERMS];
+				int			pt;
+
+				for (pt = 0; pt < pg->npt; pt++)
+					pc[pt] = &cursors[grpidx[grpstart[g] + pg->term[pt]]];
+				if (!phrase_gate_adjacent(pg, pc))
+				{
+					if (pg->unknown)
+						break;	/* the caller discards this and recomputes */
+					continue;
+				}
+			}
+			topk_admit(heap, &nheap, k, &minpos, &threshold, d, score);
+		}
+		if (gate->phrase != NULL && gate->phrase->unknown)
+			break;
+	}
+
+	for (i = 0; i < ncur; i++)
+	{
+		if (hdr[i] != NULL)
+			pfree(hdr[i]);
+		if (cursors[i].blkbuf)
+			pfree(cursors[i].blkbuf);
+		if (cursors[i].posbuf)
+			pfree(cursors[i].posbuf);
+		if (cursors[i].posoff)
+			pfree(cursors[i].posoff);
+		cursors[i].blkbuf = NULL;
+		cursors[i].posbuf = NULL;
+		cursors[i].posoff = NULL;
+		bm25_doclen_cursor_free(&cursors[i].doclenc);
+	}
+	pfree(hdr);
+	pfree(nhdr);
+	pfree(grpstart);
+	pfree(grpidx);
+	pfree(drv);
+	pfree(v);
+	qsort(heap, nheap, sizeof(ScoredTid), cmp_scored_desc);
+	*out = heap;
+	return nheap;
+}
+
+/* GUC (1.11.0): single-term and conjunctive (AND, phrase) ranked queries visit
+ * blocks best-first. */
+bool		pg_fts_bestfirst = true;
+
+/* Every document the gate admits contains every query term: a phrase chain,
+ * or a pure-boolean query whose operators are all AND. */
+static bool
+bool_gate_conjunctive(const BoolGate *g)
+{
+	uint32		i;
+
+	if (g == NULL)
+		return false;
+	if (g->phrase != NULL)
+		return true;
+	if (g->q == NULL)
+		return false;
+	for (i = 0; i < g->q->nitems; i++)
+		if (g->q->items[i].type != FTS_QI_VAL && g->q->items[i].op != FTS_OP_AND)
+			return false;
+	return true;
+}
+
 static int
 fts_search_wand(WandCursor *cursors, int nterms, int k,
 				const DocidFilter *filter, BoolGate *gate, ScoredTid **out)
 {
+	if (filter == NULL && pg_fts_bestfirst && bool_gate_conjunctive(gate))
+	{
+		int			n = fts_search_and_bestfirst(cursors, nterms, k, gate, out);
+
+		if (n >= 0)
+			return n;
+	}
+	if (nterms == 1 && filter == NULL && gate == NULL && pg_fts_bestfirst)
+	{
+		int			n = fts_search_bestfirst1(&cursors[0], k, out);
+
+		if (n >= 0)
+			return n;
+		/* inconsistent chain: fall through to the docid-order paths */
+	}
 	if (nterms == 1 && filter == NULL && gate == NULL &&
 		pg_fts_dense_score_min_df > 0 &&
 		cursors[0].df >= (uint32) pg_fts_dense_score_min_df)
@@ -5083,11 +6129,12 @@ bm25_topk_exact(Relation index, FtsQuery q, const BM25MetaPageData *meta,
  * ordering scan score a document identically.  Loads the per-segment
  * tombstones into *tombs (the caller frees them after the traversal).  Returns
  * the number of cursors; *nterms_out receives the query's term count (the
- * BoolGate's termidx space).
+ * BoolGate's termidx space).  want_pos asks each cursor to keep its block's
+ * positions column for the lazy phrase gate (1.9.1).
  */
 static int
 bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
-				  uint64 docid_lo, uint64 docid_hi,
+				  uint64 docid_lo, uint64 docid_hi, bool want_pos,
 				  BM25DoclenDirCache *doclendir, BM25DoclenResident *doclenres,
 				  BM25Tombstones *tombs, WandCursor **cursors_out, int *nterms_out)
 {
@@ -5157,6 +6204,13 @@ bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
 			cursors[nactive].df = df;
 			cursors[nactive].termidx = t;
 			cursors[nactive].blkbuf = NULL;
+			cursors[nactive].want_pos = want_pos;
+			cursors[nactive].posbuf = NULL;
+			cursors[nactive].posbytelen = 0;
+			cursors[nactive].posdecoded = false;
+			cursors[nactive].posoff = want_pos
+				? (int *) palloc((BM25_BLOCK_SIZE + 1) * sizeof(int))
+				: NULL;
 			cursors[nactive].blkcount = 0;
 			cursors[nactive].cur = 0;
 			cursors[nactive].docid = 0;
@@ -5172,7 +6226,7 @@ bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
 			cursors[nactive].has_doclen_col =
 				(meta->segs[s].doclenstart == InvalidBlockNumber);
 			bm25_doclen_cursor_init(&cursors[nactive].doclenc, index,
-									meta->segs[s].doclenstart, doclendir,
+									&meta->segs[s], doclendir,
 									doclenres ? &doclenres[s] : NULL);
 			cursors[nactive].docid_lo = docid_lo;
 			cursors[nactive].docid_hi = docid_hi;
@@ -5205,6 +6259,57 @@ bm25_open_cursors(Relation index, const BM25MetaPageData *meta, FtsQuery q,
  * pending write buffer and modifier queries use bm25_topk_exact instead.
  * Its literal-term scores preserve the existing BM25 formula.
  */
+/*
+ * Can the ranked scan use the lazy phrase gate for q?  The SAME conditions
+ * under which bm25_collect_matches takes its exact positional fast path: a
+ * positions=on index and a pure phrase chain (VAL/PHRASE only, plain terms,
+ * canonical left-deep).  Fills g's term ordinals (fts_query_terms numbering:
+ * the k-th VAL item) and step distances.
+ */
+static bool
+bm25_lazy_phrase_ok(Relation index, FtsQuery q, PhraseGate *g)
+{
+	int			itemidx[FTS_QUERY_MAX_PHRASE_TERMS];
+	bool		stepexact[FTS_QUERY_MAX_PHRASE_TERMS];
+	int			or_anchor;
+	int			t;
+	uint32		i;
+
+	memset(g, 0, sizeof(*g));
+	if (!bm25_index_wants_positions(index) ||
+		!bm25_phrase_chain(q, itemidx, g->step, stepexact, &g->npt, &or_anchor))
+		return false;
+
+	/*
+	 * The gate chains ordered adjacency steps only.  The legal-search shapes
+	 * bm25_phrase_chain also accepts -- an unordered WITHIN, an exact-gap step
+	 * and the (A OR B) WITHIN C anchor -- keep the collect path, which
+	 * evaluates them.
+	 */
+	if (or_anchor >= 0)
+		return false;
+	for (i = 0; i < q->nitems; i++)
+		if (q->items[i].type == FTS_QI_OPR && q->items[i].op != FTS_OP_PHRASE)
+			return false;
+	for (t = 0; t + 1 < g->npt; t++)
+		if (stepexact[t])
+			return false;
+
+	for (t = 0; t < g->npt; t++)
+	{
+		int			vi = 0;
+
+		/* item index -> ordinal among VAL items (= WandCursor.termidx) */
+		for (i = 0; i < (uint32) itemidx[t]; i++)
+			if (q->items[i].type == FTS_QI_VAL)
+				vi++;
+		if (q->items[itemidx[t]].flags & FTS_QF_WEIGHTED)
+			return false;		/* label filter needs the heap recheck */
+		g->term[t] = vi;
+	}
+	return true;
+}
+
 static int
 bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 						   uint64 docid_lo, uint64 docid_hi, ScoredTid **out)
@@ -5225,6 +6330,8 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	uint64	   *filter_docids = NULL;
 	BoolGate	gate;
 	BoolGate   *gatep = NULL;
+	PhraseGate	phrase;
+	PhraseGate *pgate = NULL;
 	int			ncand;
 	int			nactive;
 
@@ -5267,6 +6374,20 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	if (!fts_query_is_pure_or(q) && fts_query_is_pure_boolean(q))
 	{
 		/* lazy path: gate built after cursors so nterms is known */
+		gatep = &gate;
+	}
+	else if (pg_fts_lazy_phrase && !lazy_phrase_suppressed &&
+			 bm25_lazy_phrase_ok(index, q, &phrase))
+	{
+		/*
+		 * Pure phrase chain over a positions=on index: the LAZY phrase gate
+		 * (1.9.1).  Same predicate bm25_collect_matches' positional fast path
+		 * computes, evaluated per pivot from the cursors' own blocks instead
+		 * of materializing every match first.  If a block turns out to lack
+		 * positions the gate reports unknown and we redo the query below on
+		 * the collect path.
+		 */
+		pgate = &phrase;
 		gatep = &gate;
 	}
 	else if (!fts_query_is_pure_or(q))
@@ -5319,15 +6440,42 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	}
 
 	nactive = bm25_open_cursors(index, &meta, q, docid_lo, docid_hi,
-								doclendir, doclenres, &tombs, &cursors, &nterms);
+								(pgate != NULL), doclendir, doclenres, &tombs,
+								&cursors, &nterms);
 
 	/* build the lazy BoolGate now that nterms is known (pure-boolean path) */
 	if (gatep != NULL)
 	{
-		gate.q = q;
+		gate.q = (pgate != NULL) ? NULL : q;
 		gate.nterms = nterms;
 		gate.present = (bool *) palloc0(Max(nterms, 1) * sizeof(bool));	/* alloc-ok: nterms = query term count */
 		gate.stack = (bool *) palloc(Max(q->nitems, 1) * sizeof(bool));
+		gate.phrase = pgate;
+	}
+	if (pgate != NULL)
+	{
+		/* a phrase term absent from every segment: no doc can match (the
+		 * collect path returns its empty set here too) */
+		int			pt;
+
+		for (pt = 0; pt < pgate->npt; pt++)
+		{
+			int			i;
+
+			for (i = 0; i < nactive; i++)
+				if (cursors[i].termidx == pgate->term[pt])
+					break;
+			if (i == nactive)
+			{
+				bm25_tombstones_free(&tombs);
+				*out = NULL;
+				return 0;
+			}
+		}
+		pgate->acc = (uint32 *) palloc(BM25_PHRASE_POSBUF * sizeof(uint32));
+		pgate->tmp = (uint32 *) palloc(BM25_PHRASE_POSBUF * sizeof(uint32));
+		pgate->right = (uint32 *) palloc(BM25_PHRASE_POSBUF * sizeof(uint32));
+		pgate->unknown = false;
 	}
 
 	ncand = fts_search_wand(cursors, nactive, wantk, filterp, gatep, &cand);
@@ -5338,6 +6486,38 @@ bm25_topk_candidates_range(Relation index, FtsQuery q, int wantk,
 	{
 		pfree(gate.present);
 		pfree(gate.stack);
+	}
+	if (pgate != NULL)
+	{
+		bool		unknown = pgate->unknown;
+
+		pfree(pgate->acc);
+		pfree(pgate->tmp);
+		pfree(pgate->right);
+		if (unknown)
+		{
+			/*
+			 * Some block on the path had no positions column (the page-
+			 * overflow case bm25_lookup_term_pos reports as NOPOS), so the
+			 * gate could not decide every pivot.  Discard this result and
+			 * recompute on the exact collect path; it is the same answer the
+			 * pre-1.9.1 code gave for every phrase.
+			 */
+			if (cand)
+				pfree(cand);
+			pfree(cursors);
+			lazy_phrase_suppressed = true;
+			PG_TRY();
+			{
+				ncand = bm25_topk_candidates_range(index, q, wantk, docid_lo,
+												   docid_hi, &cand);
+			}
+			PG_FINALLY();
+			{
+				lazy_phrase_suppressed = false;
+			}
+			PG_END_TRY();
+		}
 	}
 
 	*out = cand;
@@ -5423,7 +6603,7 @@ bm25_rank_filter(Relation index, FtsQuery rankq, TidSet *rows,
 		if (doclendir != NULL)
 			doclenres = (BM25DoclenResident *)
 				palloc0(sizeof(BM25DoclenResident) * Max((int) meta.nsegments, 1));
-		ncur = bm25_open_cursors(index, &meta, rankq, 0, UINT64_MAX,
+		ncur = bm25_open_cursors(index, &meta, rankq, 0, UINT64_MAX, false,
 								 doclendir, doclenres, &tombs, &cursors, &nterms);
 		for (t = 0; t < ncur; t++)
 		{
@@ -5527,6 +6707,8 @@ bm25_topk_visible(Relation index, FtsQuery q, int k, bool as_distance,
 	int			i;
 	int			wantk = Max(k * 4, 64);
 	int			wantk_cap;
+	int			pfwin,
+				pfnext;
 	Snapshot	snap = GetActiveSnapshot();
 	Relation	heap;
 	IndexFetchTableData *fetch;
@@ -5588,12 +6770,30 @@ bm25_topk_visible(Relation index, FtsQuery q, int k, bool as_distance,
 #else
 		fetch = table_index_fetch_begin(heap);
 #endif
+		/*
+		 * Prefetch the candidates' heap blocks a window ahead of the
+		 * visibility check (1.11.0): the fetches are in score order, so their
+		 * heap blocks are scattered, and a cold heap read per row was the whole
+		 * cost of a cold ranked query.  The window is the heap tablespace's
+		 * effective_io_concurrency; PrefetchBuffer is a no-op for a resident
+		 * block and for a build without posix_fadvise.
+		 */
+		pfwin = get_tablespace_io_concurrency(heap->rd_rel->reltablespace);
+		pfnext = 0;
 		for (i = 0; i < ncand && nvis < k; i++)
 		{
 			ItemPointerData tid = cand[i].tid;
 			bool		call_again = false;
 			bool		all_dead = false;
-			TupleTableSlot *slot = table_slot_create(heap, NULL);
+			TupleTableSlot *slot;
+
+			while (pfnext < ncand && pfnext <= i + pfwin)
+			{
+				PrefetchBuffer(heap, MAIN_FORKNUM,
+							   ItemPointerGetBlockNumber(&cand[pfnext].tid));
+				pfnext++;
+			}
+			slot = table_slot_create(heap, NULL);
 
 			if (table_index_fetch_tuple(fetch, &tid, snap, slot,
 										&call_again, &all_dead))

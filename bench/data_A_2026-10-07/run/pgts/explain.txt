@@ -1,0 +1,41 @@
+== rare_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_idx on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_idx:slovakia'::bm25query)
+== mid_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_idx on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_idx:hungary'::bm25query)
+== common_k10
+Aggregate  (cost=28.28..28.29 rows=1 width=8)
+  ->  Limit  (cost=0.01..28.15 rows=10 width=16)
+        ->  Index Scan using docs_idx on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_idx:year'::bm25query)
+== common_k100
+Aggregate  (cost=282.70..282.71 rows=1 width=8)
+  ->  Limit  (cost=0.01..281.45 rows=100 width=16)
+        ->  Index Scan using docs_idx on docs  (cost=0.01..6157941.67 rows=2188038 width=16)
+              Order By: (content <@> 'docs_idx:year'::bm25query)
+== and_k10
+Aggregate  (cost=792738.26..792738.27 rows=1 width=8)
+  ->  Limit  (cost=792738.11..792738.14 rows=10 width=16)
+        ->  Sort  (cost=792738.11..792738.66 rows=219 width=16)
+              Sort Key: ((docs.content <@> 'docs_idx:slovakia hungary'::bm25query))
+              ->  Seq Scan on docs  (cost=0.00..792733.38 rows=219 width=16)
+                    Filter: (content @@ '''slovakia'' & ''hungari'''::tsquery)
+== or_k10
+Aggregate  (cost=847916.12..847916.13 rows=1 width=8)
+  ->  Limit  (cost=847915.97..847916.00 rows=10 width=16)
+        ->  Sort  (cost=847915.97..847971.23 rows=22101 width=16)
+              Sort Key: ((docs.content <@> 'docs_idx:slovakia hungary'::bm25query))
+              ->  Seq Scan on docs  (cost=0.00..847438.38 rows=22101 width=16)
+                    Filter: (content @@ '''slovakia'' | ''hungari'''::tsquery)
+== phrase_k10
+Aggregate  (cost=1070841.55..1070841.56 rows=1 width=8)
+  ->  Limit  (cost=1070841.40..1070841.42 rows=10 width=16)
+        ->  Sort  (cost=1070841.40..1071117.66 rows=110507 width=16)
+              Sort Key: ((docs.content <@> 'docs_idx:united states'::bm25query))
+              ->  Seq Scan on docs  (cost=0.00..1068453.38 rows=110507 width=16)
+                    Filter: (content @@ '''unit'' <-> ''state'''::tsquery)

@@ -13,9 +13,9 @@ VectorChord-bm25, built-in GIN, and (unmeasurably) PlanetScale's closed TIN.
 
 **It optimises for correctness and verifiability over headline latency.** It is the
 smallest index and the only one with an index-native exact count and the full query
-language; it is ~17x slower than pg_search on common-term ranked top-k, and that gap is
-architectural (scalar postings vs bitmap+SIMD), not a tuning matter. Do not try to close it
-with a point release.
+language.  The common-term ranking gap to pg_search that was once called "architectural"
+was the traversal: best-first block order with exact block bounds closed it (CHANGELOG
+1.11.0, Retracted).  pg_search still builds ~3.6x faster.
 
 ## Where things live
 

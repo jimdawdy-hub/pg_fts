@@ -41,8 +41,8 @@ only parallel blocker was OOM under their 30G cgroup, addressed by
 pg_fts.build_mem_ceiling_mb (1.1.5) + the (workers+1) x 2 x mwm memory formula.
 The per-doc sort is ~30% of CPU and could be ~1.5x faster with glibc introsort
 (qsort_r) instead of pg_qsort, but that is a portability-risky micro-opt on a
-working build and was deliberately NOT taken (ponytail: don't rewrite a sort
-under portability risk for 11% on a build that already completes).
+working build and was deliberately NOT taken: rewriting a sort under portability
+risk for 11% on a build that already completes is not worth it.
 
 ## Shipped (1.1.7)
 Build progress logging (LOG level: "~N documents analyzed" every 250k, and

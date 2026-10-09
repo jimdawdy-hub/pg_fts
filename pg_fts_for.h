@@ -82,17 +82,26 @@ bm25_for_pack(const uint64 *vals, int n, unsigned char *buf)
 	bitpos = 0;
 	for (i = 0; i < n; i++)
 	{
+		/*
+		 * OR the value's bits in a byte at a time: the same little-endian bit
+		 * order as the old per-bit loop (bit b of value i at stream bit
+		 * bitpos + b), so the byte stream is identical.  The per-bit loop was
+		 * over half of a merge (1.11.0).  vals[i] < 2^width by construction
+		 * (width is the bit width of the column maximum).
+		 */
 		uint64		v = vals[i];
-		int			b;
+		int			abs = bitpos;
+		int			left = width;
 
-		for (b = 0; b < width; b++)
+		while (left > 0)
 		{
-			if (v & ((uint64) 1 << b))
-			{
-				int			abs = bitpos + b;
+			int			sh = abs & 7;
+			int			take = (8 - sh < left) ? 8 - sh : left;
 
-				buf[1 + (abs >> 3)] |= (unsigned char) (1 << (abs & 7));
-			}
+			buf[1 + (abs >> 3)] |= (unsigned char) ((v & ((1u << take) - 1)) << sh);
+			v >>= take;
+			abs += take;
+			left -= take;
 		}
 		bitpos += width;
 	}

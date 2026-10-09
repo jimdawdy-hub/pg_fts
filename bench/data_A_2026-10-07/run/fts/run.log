@@ -1,0 +1,89 @@
+[17:39:54] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[17:40:06] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[17:40:06] so 110=80c9ffdc a=c9c4079c a_tree=approach-a b78ccaa
+[17:40:06] ext 1.10.0
+[17:50:24] arm=110 expr_build_s=412.062969941 size_after_build=3429638144 fts_vacuum_s=197.613386423 size=1435443200
+[17:54:43] arm=a expr_build_s=257.289373636 size_after_build=1435443200 fts_vacuum_s=.021030227 size=1435443200
+[18:11:18] column_fill_s=995.367723332
+[18:19:49] arm=110 positions=off column_build_s=295.250344445 size_after_build=3590520832 fts_vacuum_s=191.071825705 size=1489600512
+[18:29:12] arm=110 positions=on column_build_s=331.857883694 size_after_build=6150840320 fts_vacuum_s=231.214978085 size=2754289664
+[18:31:27] arm=a positions=off column_build_s=130.998130138 size_after_build=1489600512 fts_vacuum_s=.021167437 size=1489600512
+[18:34:35] arm=a positions=on column_build_s=188.613023439 size_after_build=2754265088 fts_vacuum_s=.035925746 size=2754265088
+[18:34:36] measuring on docs_idx=1489600512 docs_pos=2754265088 (built by arm a)
+[18:34:40] gate: 12 bands identical, 0 differ
+[18:35:35] LAT_DONE
+[18:37:08] COLD_DONE
+[19:04:01] RESTART from the gate (harness fix: band field separator, 8-timing slice); builds above stand
+[19:04:01] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[19:04:13] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[19:04:13] so 110=80c9ffdc a=c9c4079c a_tree=approach-a b78ccaa
+[19:04:13] ext 1.10.0
+[19:04:55] GATE ERROR in /nvme/out/gate_110_and_common_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_and_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_and_ww_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_common_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_common_k100.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_mid_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_or4_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_or_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_phrase_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_phrase_ww_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_110_rare_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_and_common_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_and_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_and_ww_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_common_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_common_k100.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_mid_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_or4_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_or_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_phrase_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_phrase_ww_k10.txt
+[19:04:55] GATE ERROR in /nvme/out/gate_a_rare_k10.txt
+[19:04:55] gate: 12 bands identical, 22 differ
+[19:04:55] GATE FAILED: not timing
+[19:05:38] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[19:05:50] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[19:05:50] so 110=80c9ffdc a=c9c4079c a_tree=approach-a b78ccaa
+[19:05:50] ext 1.10.0
+[19:09:02] restart: rebuilt docs_pos with arm a in 189.184550111 s, size=2754043904
+[19:09:06] GATE FAIL or4_k10
+[19:09:06] gate: 11 bands identical, 1 differ
+[19:09:06] GATE FAILED: not timing
+[19:16:45] RESTART 2: gate treats or4_k10 as the known 1.10.0 MaxScore bug if arm a matches the oracle
+[19:16:45] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[19:16:57] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[19:16:57] so 110=80c9ffdc a=c9c4079c a_tree=approach-a b78ccaa
+[19:16:57] ext 1.10.0
+[19:17:01] GATE FAIL or4_k10
+[19:17:01] gate: 11 bands identical, 1 differ
+[19:19:13] or4_k10: 1.10.0 differs (the MaxScore bug); arm a == exhaustive oracle (TOTAL 3 cases, 0 differ, 0 float-tie order only); 1.10.0 not timed on or4_k10
+[19:20:04] LAT_DONE
+[19:21:30] COLD_DONE
+[19:55:21] ALL_DONE
+[22:11:13] RERUN with the final binary 0005078c (approach-a 76fce63); builds above were measured with the pre-a3 arm-a binary (the build/merge path is unchanged by a3: prefetch only)
+[22:11:13] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[22:11:26] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[22:11:26] so 110=80c9ffdc a=0005078c a_tree=approach-a 76fce63
+[22:11:26] ext 1.10.0
+[22:14:09] restart: rebuilt docs_pos with arm a in 161.130916203 s, size=2754117632
+[22:14:13] GATE FAIL or4_k10
+[22:14:13] gate: 11 bands identical, 1 differ
+[22:16:24] or4_k10: 1.10.0 differs (the MaxScore bug); arm a == exhaustive oracle (TOTAL 3 cases, 0 differ, 0 float-tie order only); 1.10.0 not timed on or4_k10
+[22:17:14] LAT_DONE
+[22:18:37] COLD_DONE
+[22:52:28] ALL_DONE
+RERUN_DONE
+[23:59:47] RERUN with the final binary 4486203a (approach-a 39b6a42); builds above were measured with the first arm-a binary (c9c4079c); later commits change only prefetch on read paths
+[23:59:47] host=<host> arch=aarch64 cpu=Neoverse-V1 nproc=16 pg=postgres (PostgreSQL) 17.10
+[23:59:59] corpus md5=f5939e8559543f16e8a2365049836d63 rows=2188038
+[23:59:59] so 110=80c9ffdc a=4486203a a_tree=approach-a 39b6a42
+[23:59:59] ext 1.10.0
+[00:02:59] restart: rebuilt docs_pos with arm a in 178.251726349 s, size=2754068480
+[00:03:03] GATE FAIL or4_k10
+[00:03:03] gate: 11 bands identical, 1 differ
+[00:05:15] or4_k10: 1.10.0 differs (the MaxScore bug); arm a == exhaustive oracle (TOTAL 3 cases, 0 differ, 0 float-tie order only); 1.10.0 not timed on or4_k10
+[00:06:07] LAT_DONE
+[00:07:33] COLD_DONE
+[00:41:25] ALL_DONE
+RERUN_DONE

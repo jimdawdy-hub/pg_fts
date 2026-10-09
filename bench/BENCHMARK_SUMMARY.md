@@ -1,4 +1,4 @@
-# pg_fts benchmark summary — methodology and results (as of v1.9.0, 2026-10-01)
+# pg_fts benchmark summary — methodology and results (as of v1.11.0, 2026-10-08)
 
 Consolidated view of the current measurements. Every number here is traceable to a
 run recorded under `bench/`; nothing is estimated. Where a figure was previously
@@ -9,10 +9,14 @@ published wrong, the correction is stated rather than quietly replaced.
 ## 1. Methodology
 
 ### Rig
-EC2 **r6id.4xlarge** (Xeon 8375C @ 2.90 GHz, 16 vCPU, 128 GB RAM, 884 GB local
-NVMe instance store), Amazon Linux 2023, PostgreSQL **17.10** built from source,
-`shared_buffers = 64GB`. **One dedicated instance per engine** for comparative
-runs — no engine shares a host with another.
+**Current (1.10.0):** EC2 **r7gd.4xlarge** (AWS Graviton3 / Neoverse-V1, 16 vCPU, 128 GiB,
+32 MB L3, local NVMe instance store), Debian 13 arm64, PostgreSQL **17.10** built from
+source, `shared_buffers = 32GB`; full protocol in `bench/PROTOCOL_110_2026-10-07.md`.
+Earlier sections were measured on EC2 **r6id.4xlarge** (Xeon 8375C @ 2.90 GHz, 16 vCPU,
+128 GB RAM, 884 GB local NVMe), Amazon Linux 2023 or Debian 13 x86-64,
+`shared_buffers = 64GB`; numbers from the two rigs are not compared column by column.
+**One dedicated instance per engine** for comparative runs — no engine shares a host
+with another.
 
 Benchmarks run on **local NVMe, never tmpfs**, so I/O behaviour is real.
 
@@ -56,7 +60,76 @@ alone.
 
 ## 2. Comparative latency
 
-### 2a'. Current: pg_fts 1.9.0 vs pg_textsearch 1.4.0 (2026-10-01, Debian 13)
+### 2a''''. Current: pg_fts 1.11.0 vs 1.10.0 and the field (2026-10-07/08, aarch64)
+
+`bench/RESULTS_A_2026-10-07.md` (protocol `bench/PROTOCOL_A_2026-10-07.md`, written before
+the run; raw data `bench/data_A_2026-10-07/run/`).  Same rig and corpus as 1.10.0; pg_fts
+1.10.0 and 1.11.0 measured on one host, against the same index files,
+after a correctness gate (identical results, and an exhaustive reference on every band).
+Measured at commit 39b6a42; the 1.11.0 release adds, after that commit, the VACUUM pending-delete fix and the four
+concurrency fixes (CHANGELOG 1.11.0), which change the write, flush, free and truncate paths
+and not the query traversals.  Timings were not re-run on the release binary (unmeasured); on a
+600k-row index built locally, 39b6a42 and the release give identical sizes after build, VACUUM
+and merge, and identical counts and top-20 on five bands
+(`data_A_2026-10-07/release/size_results_39b6a42_vs_release.txt`).
+
+| ms, single client | pg_fts 1.11.0 | pg_fts 1.10.0 | pg_textsearch | pg_search | VectorChord |
+|---|---|---|---|---|---|
+| rare / mid top-10 | **0.64 / 0.43** | 1.07 / 0.83 | 0.99 / 1.21 | 2.66 / 2.27 | 20.4 / 36.8 |
+| common top-10 / top-100 | **0.81 / 1.30** | 8.48 / 8.77 | 10.71 / 13.06 | 2.63 / 5.51 | 84.5 / 86.8 |
+| AND / OR top-10 (rare) | **1.38 / 1.84** | 2.15 / 2.11 | >300 s (seq scan) | 3.45 / 3.75 | n/a / 12.6 |
+| AND `united & states` / `world & war` | **2.71** / 5.98 | 23.89 / 19.12 | >300 s | 11.97 / **5.73** | n/a |
+| 4-term OR | 13.99 | wrong result | 14.98 | **13.92** | 50.9 |
+| phrase `"united states"` / `"world war"` | **3.55 / 6.84** | 24.95 / 19.79 | >300 s | 12.08 / 11.95 | n/a |
+| exact count | **0.19** | 0.21 | n/a | 10.56 | n/a |
+
+| tps at 16 / 32 / 64 clients | pg_fts 1.11.0 | pg_fts 1.10.0 | pg_textsearch | pg_search | VectorChord |
+|---|---|---|---|---|---|
+| rare top-10 | **26,750 / 26,341 / 26,338** | 17,496 / 17,328 / 17,274 | 13,355 / 12,165 / 12,157 | 5,147 / 5,360 / 5,998 | 334 / 593 / 667 |
+| mid top-10 | **35,304 / 34,407 / 34,328** | 20,414 / 20,142 / 20,146 | 10,811 / 9,976 / 9,904 | 5,987 / 6,439 / 6,789 | 175 / 323 / 359 |
+| common top-10 | **22,369 / 21,984 / 21,590** | 1,911 / 1,883 / 1,875 | 1,176 / 1,232 / 1,236 | 5,241 / 5,379 / 5,951 | 59 / 102 / 119 |
+| exact count | **75,381 / 70,724 / 69,584** | 66,912 / 63,164 / 61,214 | n/a | 773 / 2,004 / 2,547 | n/a |
+
+pg_fts throughput: two settled runs per arm (order 110, dev, dev, 110), median of 4 passes;
+same-arm runs within 4%.  Others: the in-run measurement (in 1.10.0 in-run and settled
+agreed within 8% for each).  Cold cache (local NVMe, median of 5): dev 41-64 ms against
+1.10.0's 49-90 ms on the same three bands (`RESULTS_A`, cold table).
+
+### 2a'''. 1.10.0 release: pg_fts 1.10.0 vs pg_textsearch 1.5.1, pg_search 0.26.0, VectorChord-bm25 0.3.0 (2026-10-07, aarch64)
+
+`bench/RESULTS_110_2026-10-07.md` (method, raw data, install logs). One r7gd.4xlarge
+per engine, latest release of each, documented English-stemmed index and query form.
+
+| ms, single client | pg_fts | pg_textsearch | pg_search | VectorChord |
+|---|---|---|---|---|
+| rare / mid top-10 | 1.16 / **1.05** | **1.00** / 1.22 | 2.35 / 2.02 | 20.4 / 36.9 |
+| common top-10 / top-100 | 8.50 / 8.77 | 10.71 / 13.06 | **2.44 / 5.31** | 82.8 / 86.2 |
+| AND / OR top-10 | **2.16 / 2.10** | >300 s / >300 s (seq scan) | 3.12 / 3.22 | n/a / 12.45 |
+| phrase top-10 | 36.85 | >300 s | **11.26** | n/a |
+| exact count | **0.21** | n/a | 9.88 | n/a |
+
+| tps at 16 / 32 / 64 clients | pg_fts | pg_textsearch | pg_search | VectorChord |
+|---|---|---|---|---|
+| rare top-10 | **17,051 / 16,852 / 16,841** | 14,131 / 13,145 / 12,397 | 5,373 / 5,834 / 6,227 | 346 / 615 / 671 |
+| mid top-10 | **17,447 / 17,297 / 17,217** | 11,427 / 10,709 / 10,236 | 6,133 / 7,002 / 6,595 | 222 / 334 / 360 |
+| common top-10 | 1,907 / 1,879 / 1,863 | 1,218 / 1,256 / 1,256 | **4,783 / 4,950 / 5,487** | 65 / 118 / 128 |
+| exact count | **66,150 / 62,707 / 61,597** | n/a | 750 / 1,961 / 2,492 | n/a |
+
+Index: pg_fts 1,421 MiB, pg_textsearch 1,887, pg_search 3,396, VectorChord 42,434 (its
+corpus-trained vocabulary; see the results file before reading anything into it).
+The I6 fix in isolation (same host and binary, shared copy on vs off): rare-term tps at
+64 clients 16,654 vs 13,283 (+25%), mid-term +21-25% at every client count, common +1-3%.
+
+### 2a''. Historical: pg_fts 1.9.1 vs pg_textsearch 1.4.0 (2026-10-06, Debian 13 x86-64, same-day control)
+
+`bench/RESULTS_191_2026-10-06.md`. ms: rare **0.68** vs 0.85, mid **0.78** vs 1.07, common
+k10 **7.0** vs 11.5, common k100 **7.2** vs 13.9, count **0.18** vs seqscan, AND **1.47**
+vs 41.1, OR2 **1.48** vs 26.4, OR3 **2.76** vs 32.1, prefix **5.82** vs 10.5, phrase
+(`positions=on`) **34.8** vs 43.0. tps at 16 clients: rare **12,696** vs 8,142, common
+**944** vs 646. Rare-term tps falls to 8,757-8,931 at 64 clients (pg_textsearch 8,202):
+known issue, cause measured (ROADMAP I6). Index 1,421 MB vs 1,978 MB.
+
+### 2a'. Historical: pg_fts 1.9.0 vs pg_textsearch 1.4.0 (2026-10-01, Debian 13)
 
 `bench/RESULTS_190_2026-10-01.md`. ms: rare **0.67** vs 0.84, mid **0.79** vs 1.07, common
 k10 **7.19** vs 11.40, common k100 **7.37** vs 13.87, count **0.19** vs seqscan, AND **1.51**
@@ -132,7 +205,8 @@ smaller than vchord. It is also the slowest to build of the three that stem.
 | **year** | **734,896** | **734,896** | **734,896** | **495,580** |
 
 **Three of four engines agree byte-for-byte.** pg_search is 33% low on `year`
-because **Tantivy does not stem**; regex ground truth confirms `\myears?\M` =
+because **Tantivy's default tokenizer does not stem** (0.26.0 with `stemmer=english`
+counts 735,955 -- see §2a'''); regex ground truth confirms `\myears?\M` =
 733,960, i.e. ours is the correct English set. So pg_fts scans ~48% more postings
 than pg_search on that query *and* returns the right answer — worth holding in mind
 when reading the common-term row.
@@ -313,36 +387,65 @@ Kept because the corrections are part of the result.
 
 ---
 
+7. **"pg_search is 3.5x faster on common-term ranking, and the gap is architectural
+   (scalar postings vs bitmap + SIMD)"** (1.10.0 and earlier).  The gap was pg_fts's
+   traversal: best-first block order with exact block bounds makes the common-term
+   top-10 0.81 ms against pg_search's 2.63 on the same rig (2a'''').  Retracted in the
+   CHANGELOG (1.11.0).
+8. **The 1.10.0 build time (298 s + 200 s `fts_vacuum`)** timed a build on a pre-filled
+   column (the 995 s fill was not counted); the comparable expression-index figure is
+   412 s + 198 s.
+
+---
+
 ## 7a. Coverage gaps — what this document does not measure
 
-See `bench/COVERAGE_AUDIT_2026-09-10.md`. In short: everything above is
-**single-client latency, size and correctness**. Three standard axes are unmeasured —
-**concurrent throughput** (rival data exists, our own arm's file is truncated and its
-latency is 1.5.0-era), **ingest/update throughput**, and **ranking quality vs rivals**.
-On the throughput axis the rivals differ sharply from each other (vchord's tps
-collapses under concurrency where pg_textsearch and pg_search scale), so this is not a
-formality — it could move the overall story either way, and a 2x single-client gap
-would matter far less than a throughput cliff.
+Measured as of 1.10.0: single-client latency, **concurrent throughput** (16/32/64
+clients, all four engines), index size, build time, and match-count correctness.
+Still unmeasured: **ingest/update throughput**, **cold-cache (disk-bound) latency**,
+and **ranking quality (NDCG) vs rivals**. All four engines put 6-10 of the same
+documents in each top-10, so relevance differences are about near-ties, but that is
+not a quality measurement.
 
-## 8. Honest summary
+## 8. Honest summary (1.11.0, aarch64, 2026-10-08)
 
-**Strengths.** Smallest index in the field (1,421 MB, 25% under next best). Fastest
-exact `count(*)` (2.20 ms — 6× pg_search; pg_textsearch 1.4.0 can now count, but only by
-seqscan, 251 s). Multi-term boolean ranked beats pg_textsearch 1.4.0 2-4x. Correct
-English stemming, verified against regex ground truth. Widest query language by a
-large margin (see `CAPABILITIES.md` and the feature matrix).
+**Strengths.** Lowest ranked latency and highest throughput of the four at every term
+frequency: rare 0.64 ms / 26.8k tps, common 0.81 ms / 22.4k tps (pg_search 2.63 ms /
+5.2k).  Conjunctive queries and phrases walk the rarest term best-first: `united & states`
+2.71 ms, `"united states"` 3.55 ms (pg_search 11.97 / 12.08).  Index-native exact count,
+smallest index, PostgreSQL's own stemming, widest query language.  A plain build needs
+no `fts_vacuum` (257 s as an expression index, 1.6x faster than 1.10.0's 412 s, which
+also needed 198 s of `fts_vacuum`).
 
-**Weaknesses.** Common-term ranked top-k (36.16 ms vs pg_search 2.12) — the largest
-remaining gap, now understood as doclen gap-decode and addressable only by a sidecar
-format change worth ~1.5×. Phrase needs a non-default option to be usable at scale,
-and even tuned is ~10× off pg_search. Parallel merge is a regression; parallel build
-trades size for speed. Big-endian is untested in CI (sparsemap 5.5.0 fixed a
-corruption that reached our tombstone iteration).
+**Weaknesses.** pg_search builds 3.6x faster (71 s).  On `world & war` (both terms
+frequent, with good documents in many blocks) and on a 4-term OR, pg_search is within 5%.
+Phrase still needs `positions = on` (an 85% larger index).  Not measured: x86 for this
+run, network storage, relevance quality.
 
-**Comparator note.** `pg_textsearch` is the fairest reference point — same
-PostgreSQL `english` config, byte-identical match counts, same C-extension model.
-Against **v1.4.0** (2026-09-30), pg_fts is 11x slower on rare, 14x on mid and 4.3x on
-common k10; 2-4x faster on AND/OR; 25% smaller; and the only one of the two with an
-index-backed count, NEAR, fuzzy and regex. The September claim "faster on rare" compared
-different query forms and is retracted. The larger deficits are against the two engines shipping their own
-posting formats — one of which does not stem.
+**The 1.10.0 summary below stands for the 1.10.0 release.**
+
+### 1.10.0 (aarch64, 2026-10-07)
+
+**Strengths.** Fastest rare- and mid-frequency ranked retrieval under load, and the only
+engine of the four whose rare-term throughput is flat from 16 to 64 clients (17.1k ->
+16.8k tps; pg_textsearch 14.1k -> 12.4k, pg_search 5.4k -> 6.2k). Boolean AND/OR ranked
+in the index (2.1 ms; pg_textsearch's boolean filter is a sequential scan, >300 s on
+2.19M rows). Index-native exact `count(*)` (0.21 ms; pg_search 9.88 ms, the other two
+cannot). Smallest index (1,421 MiB; 25% under pg_textsearch, 58% under pg_search).
+Correct English stemming (PostgreSQL's own `english` config). Widest query language.
+
+**Weaknesses.** Common-term ranked top-k: pg_search is 3.5x faster single-client and
+2.5-3.0x under load (Tantivy's block-max skipping over bitmap postings vs pg_fts's
+scalar postings -- architectural, ROADMAP D). Phrase: pg_search is 3.3x faster, and
+pg_fts needs `positions=on` (an 85% larger index) to be usable at all. Build: pg_search
+is 4x faster (71 s vs 298 s + `fts_vacuum`). pg_textsearch is 14% faster on a single
+rare-term query (1.00 vs 1.16 ms) though slower under load.
+
+**Comparator note.** pg_textsearch remains the closest comparison -- same PostgreSQL
+`english` configuration, byte-identical match counts, same C-extension model. pg_search
+now stems (`stemmer=english`); its counts are within 0.3% of the regex ground truth, so
+the earlier "Tantivy does not stem" caveat no longer applies to 0.26 with a stemmer
+configured. VectorChord-bm25 was measured with the setup its tokenizer documents for
+English; its 41 GB index and ~42k buffer reads per query suggest that setup does not
+suit a 2.19M-article corpus, so its numbers are reported but not used to characterize
+it.

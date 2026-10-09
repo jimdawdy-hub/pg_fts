@@ -1,0 +1,13 @@
+# rare_k10 c16 probes on the bfts host (same index docs_idx, built by arm a), after ALL_DONE
+# tps_probe.sh (PGOPTIONS planner GUCs on/off, 20 s): 110: 11,941 / 11,775 / 11,880 / 11,784; a: 20,133 / 20,205 / 20,212 / 20,206
+# tps_probe3.sh (each binary on each index; 20 s):
+#   docs_idx (built by a):          110 11,978 / 12,023   a 20,469 / 20,324
+#   docs_idx110 (built by 110 + fts_vacuum, same size): 110 12,189 / 12,191   a 17,132 / 16,422
+# tps_probe4.sh (arm a, PGOPTIONS variants, 20 s): 26,164 - 26,208 every variant (later in the session)
+# tps_probe5.sh (restart + CHECKPOINT + 20 s settle + prewarm, 30 s, alternating x3):
+#   110: 16,116 / 17,523 / 17,463     a: 26,085 / 26,220 / 26,260
+# Settled tps2 (the 1.10.0 harness, CHECKPOINT+sync+60 s): see tps_settled_*.txt
+# Reading: arm 110's c16 rare throughput moved between ~12k and ~17.5k on this host over the
+# session while arm a moved between ~20k and ~26k; the between-arm ratio held at 1.5-1.7x in
+# every probe.  The absolute level is host-state dependent (unexplained); only same-run ratios
+# and the settled runs are reported.

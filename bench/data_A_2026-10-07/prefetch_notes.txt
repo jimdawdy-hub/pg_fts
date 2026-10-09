@@ -1,0 +1,41 @@
+# A4 prefetch (aarch64 adev2, r7gd local NVMe, 2.19M docs) -- cold = PG stopped, drop_caches, start
+# cold2.sh FIRST showed 32,160 TOAST pages "read" by a rare-term query: that was autoprewarm
+#   (pg_prewarm.autoprewarm=on, autoprewarm.blocks) reloading its list, not the query.  Disabled
+#   for every cold measurement (no_apw.sh).  Without it a cold slovakia top-10 reads:
+#   cold3.sh: doclen sidecar 643 pages (the C1/shared slot build walks the whole chain),
+#   dictindex 66, posting 5, dict 1, meta 1; heap ~97.  year: + posting 202, dictindex 83.
+# Changes: bm25_chain_prefetch (next link + effective_io_concurrency window when the chain is
+#   contiguous; sidecar chains are) on the sidecar load, the dict/prefix/fuzzy/universe/pending
+#   walks, bm25_decode_term, merge dict sources, segment docids; WAND cursor prefetches the next
+#   posting page when it takes a page's last block; heap blocks of the ranked candidates
+#   prefetched a window ahead of the visibility loop.
+# pf_count.sh (one cold slovakia query, eic=16): PrefetchBuffer 1075, mdprefetch 237,
+#   WaitReadBuffers 918.
+# cold.sh, median of 5 cold runs (ms; buffer reads identical prev/cur: 842 / 1064 / 1195 / 858):
+#                      eic=1 prev  cur      eic=16 prev  cur
+#   slovakia           54.08  48.98         53.81  46.51
+#   year               75.89  72.34         75.84  68.77
+#   united & states   100.54  90.12        100.36  93.09
+#   slovakia|hungary   55.41  52.35         55.79  48.00
+#   (prev = the binary before prefetch; 8-14% at eic=16.  Local NVMe; network storage
+#    would show more -- unmeasured.)
+# Also: scores are now summed in query-term order on BMW and MaxScore (sum_term_order).  The
+#   lazy phrase gate on the new conjunctive walk and the collect path disagreed in the last bit
+#   on 46 of 199 "w0 w5 w2" scores (phrase_gate regression failed); BMW summed in cursor order,
+#   arbitrary among equal docids after its selection sort.  ph_dbg4.sh: all 4 lazy/bestfirst
+#   combinations now give identical score md5s; and_gate.sh 80/80 identical, 0 tie-order-only
+#   (was 75 + 5); mt_oracle 27 cases 0 differ 0 float-tie (was 1 float-tie).
+# --- after the rebench started (bfts host) ---
+# cold_t2.sh (uprobe phase timestamps, cold first query): bestfirst_collect 36 ms of a 70 ms
+#   cold 'year' top-10 vs the 1.10.0 dense path's 10 ms, and bm25_query_maxhits 11.5 ms vs 1.4 ms;
+#   strace (cold_bf3.sh): identical 1057 preads, plus 376 posix_fadvise calls.  Per-page advice on
+#   CONTIGUOUS chains defeats the kernel's sequential read-ahead.  Fix: advise only where the chain
+#   jumps (next != blk + 1).  cold_a2.sh, 5 cold runs each (ms):
+#     year      110 48.5-50.1   a(per-page advice) 53.1-65.4   a3(jump-only) 41.0-42.6
+#     slovakia  110 39.4-41.4   a 44.3-46.2                    a3 38.5-40.4
+#     u & s     110 65.2-66.0   a 78.1-79.8                    a3 45.6-47.3
+# tps_probe6.sh: a3 lost ~9% on count c16 (72.0-72.3k -> 65.2-66.0k) and rare c16 against the
+#   pre-prefetch arm-a binary: RelationGetNumberOfBlocks evaluated per page of every chain walk
+#   (as the prefetch bound).  a4 reads it only for a jump: count c16 73.7/74.3/74.0k,
+#   rare 19.7/20.7/20.3k (pre 72.7/72.0/72.2k, 20.5/19.8/20.0k; a3 66.1/65.6/65.5k).  Cold
+#   unchanged (a4: year 42.4-44.5, slovakia 40.4-41.1, u&s 45.4-47.7).

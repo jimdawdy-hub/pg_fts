@@ -1,0 +1,55 @@
+a  0
+aa 7790 7790
+aardvark 404 404
+abbey 16002 16002
+able 94055 94055
+also 1174939 1174939
+year 734896 734896
+film 210694 210694
+united 537876 537876
+states 663188 663188
+hungary 24097 24097
+slovakia 10875 10875
+zzzz 11 11
+zyzzyva 45 45
+zygote 308 308
+zulu 1452 1452
+zoo 6626 6626
+the  0
+of  0
+and  
+in  0
+to  0
+was  0
+for  0
+is  0
+on  0
+as  0
+by  0
+with  0
+he  0
+that  0
+at  0
+from  0
+it  0
+his  0
+an  0
+were  0
+are  0
+which  0
+this  0
+be  0
+or  
+has  0
+had  0
+first 793349 793349
+one 764045 764045
+new 651171 651171
+other  0
+their  0
+after  0
+its  0
+who  0
+but  0
+also 1174939 1174939
+been  0

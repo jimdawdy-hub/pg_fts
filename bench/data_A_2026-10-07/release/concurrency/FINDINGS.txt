@@ -1,0 +1,27 @@
+# Found during the 1.11.0 release gate (rgate host, r7gd.4xlarge aarch64, 2026-10-08). BOTH
+# reproduce on the released 1.10.0 (80c9ffdc) -- pre-existing, not introduced by 1.11.0.
+#
+# 1. Lost pending inserts during a concurrent flush (race.sh: 8 insert-only pgbench clients,
+#    fts_merge() every 0.2 s, no deletes, no VACUUM).  bm25_flush_pending reads the pending
+#    list under a SHARE metapage lock, releases it, folds the pages, then sets pendinghead =
+#    Invalid / npending = 0 -- discarding every document an inserter appended in between.
+#    Temporary probe (FLUSHPROBE, server log): "npending at read=14671 at clear=15587
+#    docs_read=14939" ... 10 of 11 flushes lost 648-883 rows each.  Index count < heap count
+#    (missing 137k-141k of ~3.0M after 40 s).  1.10.0: same shape ("missing=3362" in 40 s).
+#
+# 2. SIGSEGV in bm25_insert -> GenericXLogFinish (pg_fts_am.c bm25_insert append path) and
+#    "unexpected data beyond EOF" / "could not read blocks" / "previous segment is only N
+#    blocks" under insert + flush/merge, on 1.10.0 and 1.11.0.  Disappears when tail
+#    truncation is restricted to AccessExclusiveLock (probe_trunc): 3 runs, 0 crashes,
+#    0 EOF errors.  The flush/merge truncates the free tail (bm25_truncate_free_tail, the
+#    vacuum_compact backstop) while an inserter holds a pinned pending/tail page or is
+#    extending; the inserter then writes a page beyond the new EOF.
+#
+# STATUS (ada32aa): both FIXED in 1.11.0, plus two more found while verifying the fixes --
+# see FIXED.txt.  The text below is the pre-fix record.
+#
+# Fixes needed (as first written): (1) clear only the pending pages actually folded -- detach
+# the list under the EXCLUSIVE metapage lock BEFORE folding (swap head/tail to Invalid, keep
+# the detached chain), so concurrent inserts start a new list; (2) never truncate the index
+# under a lock that admits concurrent inserters (or take the relation-extension lock and
+# re-check), as nbtree/GIN do.

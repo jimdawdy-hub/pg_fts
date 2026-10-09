@@ -1,0 +1,20 @@
+[11:42:10] engine=fts host=<host> pg=postgres (PostgreSQL) 17.10
+[11:42:10] ext 1.9.1
+e062eedd22ce444a7f92b7be22ced6f1  /nvme/pg17/lib/postgresql/pg_fts.so
+[11:58:29] materialize_d_s=978.385923295
+[12:02:56] build_s=262.845085267
+[12:02:56] size_after_build=3590365184
+[12:05:43] fts_vacuum_s=166.984423726
+[12:05:43] size=1489600512 nseg=
+501144|181836
+[12:05:43] df slovakia=10875
+[12:05:43] df hungary=24097
+[12:05:43] df year=734896
+[12:05:58] regex slovakia=10898
+[12:06:12] regex hungary=24148
+[12:06:23] regex years?=733960
+[12:06:25] LAT_DONE
+[12:16:14] pos_build_s=317.502358186
+[12:20:10] pos_size=2754109440
+[12:20:24] phrase df=361465 regex=362305
+[12:20:25] PHRASE_DONE

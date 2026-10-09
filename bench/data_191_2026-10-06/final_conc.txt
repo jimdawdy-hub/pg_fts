@@ -1,0 +1,12 @@
+so=91ae1fc0 dense1_sym=1
+indexes=docs_fts
+NOTICE:  index "docs_fts_pos" does not exist, skipping
+pass=1 band=common_k10 rows=10, median_last5=7.149 raw=[35.691 7.323 7.217 7.224 7.192 7.149 7.125 7.127 ]
+pass=1 band=common_k100 rows=100, median_last5=7.364 raw=[37.807 7.623 7.499 7.403 7.380 7.364 7.277 7.315 ]
+pass=1 band=rare_k10 rows=10, median_last5=0.693 raw=[29.197 1.060 0.802 0.707 0.693 0.690 0.714 0.688 ]
+pass=2 band=common_k10 rows=10, median_last5=7.100 raw=[36.324 7.322 7.182 7.103 7.150 7.100 7.072 7.057 ]
+pass=2 band=common_k100 rows=100, median_last5=7.238 raw=[36.258 7.502 7.353 7.322 7.268 7.238 7.201 7.193 ]
+pass=2 band=rare_k10 rows=10, median_last5=0.688 raw=[28.666 0.944 0.730 0.691 0.683 0.693 0.688 0.671 ]
+pass=3 band=common_k10 rows=10, median_last5=7.057 raw=[34.512 7.275 7.144 7.070 7.057 6.958 6.997 7.097 ]
+pass=3 band=common_k100 rows=100, median_last5=7.206 raw=[36.897 7.520 7.331 7.266 7.206 7.245 7.195 7.160 ]
+pass=3 band=rare_k10 rows=10, median_last5=0.680 raw=[28.484 0.939 0.746 0.697 0.672 0.692 0.680 0.672 ]

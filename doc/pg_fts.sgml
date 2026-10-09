@@ -363,6 +363,21 @@ SELECT id FROM docs
    </varlistentry>
 
    <varlistentry>
+    <term><function>fts_shared_doclen_stats()</function></term>
+    <listitem>
+     <para>
+      One row per document-length array currently published in shared memory
+      (see <varname>pg_fts.shared_doclen</varname>): the database and index
+      relfilenode it belongs to, the segment's first sidecar block and document
+      count, <literal>state</literal> (<literal>ready</literal> or
+      <literal>building</literal>), <literal>refcnt</literal> (scans currently
+      reading it), <literal>retired</literal> (its segment has been merged away;
+      freed once no scan reads it) and its size in bytes.  For monitoring.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><function>fts_highlight(<replaceable>doc</replaceable> text, <replaceable>query</replaceable> ftsquery, ...)</function>, <function>fts_snippet(<replaceable>doc</replaceable> text, <replaceable>query</replaceable> ftsquery, ...)</function></term>
     <listitem>
      <para>
@@ -666,9 +681,13 @@ SELECT * FROM messages
    <emphasis>contiguous</emphasis> free tail, so pages freed underneath the final
    output survive until <function>fts_vacuum</function>'s compaction pass relocates
    live data toward the front of the file.  Live pages are ~98.8% full, so this is
-   not a packing inefficiency.  <emphasis role="bold">Run
-   <function>fts_vacuum</function> once after a large build, and do not judge the
-   index's size before you do.</emphasis>
+   not a packing inefficiency.  Since 1.11.0 a plain <command>CREATE INDEX</command>
+   or <command>REINDEX</command>, which holds the index exclusively, runs that
+   compaction itself at the end of the build, so the new index is already at its
+   packed size.  <emphasis role="bold">After <command>CREATE INDEX
+   CONCURRENTLY</command>, run <function>fts_vacuum</function> once, and do not judge
+   the index's size before you do</emphasis>: a concurrent build cannot reuse pages
+   it freed while other sessions may be reading.
   </para>
 
   <para>
@@ -810,15 +829,18 @@ SELECT * FROM messages
    <para>
     Call <function>fts_merge(<replaceable>index</replaceable>)</function> to
     <emphasis>optimize now</emphasis>: it folds the pending buffer and merges
-    live segments into one, e.g. right after a parallel build (which leaves the
-    workers' segments unmerged for speed) or after heavy churn.  It compacts the
+    live segments into one, e.g. after heavy churn, or after a build too large
+    for <varname>pg_fts.build_collapse_max_mb</varname> (which leaves the
+    workers' segments unmerged).  It compacts the
     segment directory but does <emphasis>not</emphasis> shrink the physical file.
     Call <function>fts_vacuum(<replaceable>index</replaceable>)</function> to
     <emphasis>reclaim disk</emphasis>: it additionally relocates live pages to
     the front of the index file and truncates the free tail back to the operating
     system, shrinking an index that has grown larger than its live contents
-    (after a bulk build or heavy update churn) without a
-    <command>REINDEX</command>.  A single <function>fts_vacuum()</function> call
+    (after <command>CREATE INDEX CONCURRENTLY</command>, a bulk load, or heavy
+    update churn) without a <command>REINDEX</command>.  A plain
+    <command>CREATE INDEX</command> or <command>REINDEX</command> already
+    compacts at the end of the build (1.11.0).  A single <function>fts_vacuum()</function> call
     reclaims most of the space; a second converges to the floor.
    </para>
   </formalpara>
@@ -884,7 +906,7 @@ SELECT * FROM messages
   <title>Ranked-query tuning parameters</title>
 
   <para>
-   Both settings change only how fast a ranked query runs, never which rows it
+   These settings change only how fast a ranked query runs, never which rows it
    returns or in what order.
   </para>
 
@@ -898,8 +920,45 @@ SELECT * FROM messages
       ranked query after the index's segments change.  With it a document's
       length is read with two array lookups instead of a page decode.  A
       segment that does not fit keeps the page-based lookup.  <literal>0</literal>
-      disables it.  Note that every backend holds its own copy; with many
-      concurrent backends this adds up.
+      disables it.  The arrays are shared by all backends (see
+      <varname>pg_fts.shared_doclen</varname>), so this budget is per index
+      segment, not per backend.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><varname>pg_fts.shared_doclen</varname> (<type>boolean</type>, default on)</term>
+    <listitem>
+     <para>
+      Keep one copy per server of each index segment's document-length array, in
+      dynamic shared memory, instead of one per backend.  The first ranked query
+      to need a segment's array builds and publishes it; every other backend
+      maps the same pages.  The copy depends only on the segment, which is never
+      modified once written, so backends with different snapshots share it
+      safely; a query reading a segment that a concurrent merge has since
+      dropped keeps that segment's copy until it finishes.  Before this setting
+      existed every backend held its own copy, and with many concurrent backends
+      those copies competed for CPU cache: rare-term ranked throughput fell
+      by about a third between 16 and 64 clients.  If shared memory is
+      unavailable (for example <filename>/dev/shm</filename> is full) a query
+      silently uses a private copy instead.  Only superusers can change it.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><varname>pg_fts.bestfirst</varname> (<type>boolean</type>, default on)</term>
+    <listitem>
+     <para>
+      A ranked query on a single term, an <literal>AND</literal> of terms, or a
+      phrase reads the score bound of each 128-document block first and visits
+      blocks best first, stopping as soon as no remaining block can beat the
+      k-th result.  A top-10 for a term in 735,000 documents visits about 30
+      blocks.  For <literal>AND</literal> and phrases the blocks of the rarest
+      term are visited and the other terms are looked up.  Results are
+      identical either way; <literal>off</literal> uses document-order
+      traversal (block-max WAND, or the exhaustive scoring below).
      </para>
     </listitem>
    </varlistentry>
@@ -908,10 +967,25 @@ SELECT * FROM messages
     <term><varname>pg_fts.dense_score_min_df</varname> (<type>integer</type>, default 32768)</term>
     <listitem>
      <para>
-      A ranked query on a single plain term whose postings live in one segment
-      and number at least this many is scored exhaustively instead of with
-      block-max WAND, which prunes almost nothing for very common terms.
-      <literal>0</literal> disables it.
+      With <varname>pg_fts.bestfirst</varname> off, a ranked query on a single
+      plain term whose postings live in one segment and number at least this
+      many is scored exhaustively instead of with block-max WAND, which prunes
+      almost nothing for very common terms.  <literal>0</literal> disables it.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><varname>pg_fts.lazy_phrase</varname> (<type>boolean</type>, default on)</term>
+    <listitem>
+     <para>
+      A ranked phrase or <literal>NEAR</literal> query on an index built
+      <literal>WITH (positions = on)</literal> checks each candidate's word
+      positions as it is ranked, instead of first collecting every document
+      that contains the phrase.  For a top-10 over a phrase with hundreds of
+      thousands of matches this is several times faster.  If a stored block has
+      no positions (a very long document), the query quietly reruns the
+      collect-first way.  <literal>off</literal> always collects first.
      </para>
     </listitem>
    </varlistentry>

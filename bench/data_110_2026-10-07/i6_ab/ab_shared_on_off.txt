@@ -1,0 +1,21 @@
+so=683d4152 nproc=16 cpu=Neoverse-V1
+shared=on
+pass=1 arm=on rare c16=17001 c32=16667 c64=16434
+pass=1 arm=on mid c16=16972 c32=17219 c64=17145
+pass=1 arm=on common c16=1896 c32=1876 c64=1868
+  copies=1 ready, held=0 backend_rss_mb=1338
+shared=off
+pass=1 arm=off rare c16=17011 c32=14639 c64=13232
+pass=1 arm=off mid c16=13398 c32=14219 c64=14061
+pass=1 arm=off common c16=1833 c32=1851 c64=1841
+  copies=0 ready, held=0 backend_rss_mb=1337
+shared=on
+pass=2 arm=on rare c16=16916 c32=16808 c64=16874
+pass=2 arm=on mid c16=17527 c32=17369 c64=17348
+pass=2 arm=on common c16=1913 c32=1887 c64=1878
+  copies=1 ready, held=0 backend_rss_mb=1337
+shared=off
+pass=2 arm=off rare c16=17056 c32=15111 c64=13334
+pass=2 arm=off mid c16=14125 c32=14323 c64=14198
+pass=2 arm=off common c16=1858 c32=1858 c64=1847
+  copies=0 ready, held=0 backend_rss_mb=1337

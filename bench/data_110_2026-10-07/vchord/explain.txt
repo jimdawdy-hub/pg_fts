@@ -1,0 +1,25 @@
+== rare_k10
+Aggregate  (cost=5.03..5.04 rows=1 width=8)
+  ->  Limit  (cost=0.00..4.90 rows=10 width=12)
+        ->  Index Scan using docs_idx on docs  (cost=0.00..1072173.17 rows=2188038 width=12)
+              Order By: (emb <&> to_bm25query('docs_idx'::regclass, (tokenize('slovakia'::text, 'en'::text))::bm25vector))
+== mid_k10
+Aggregate  (cost=5.03..5.04 rows=1 width=8)
+  ->  Limit  (cost=0.00..4.90 rows=10 width=12)
+        ->  Index Scan using docs_idx on docs  (cost=0.00..1072173.17 rows=2188038 width=12)
+              Order By: (emb <&> to_bm25query('docs_idx'::regclass, (tokenize('hungary'::text, 'en'::text))::bm25vector))
+== common_k10
+Aggregate  (cost=5.03..5.04 rows=1 width=8)
+  ->  Limit  (cost=0.00..4.90 rows=10 width=12)
+        ->  Index Scan using docs_idx on docs  (cost=0.00..1072173.17 rows=2188038 width=12)
+              Order By: (emb <&> to_bm25query('docs_idx'::regclass, (tokenize('year'::text, 'en'::text))::bm25vector))
+== common_k100
+Aggregate  (cost=50.25..50.26 rows=1 width=8)
+  ->  Limit  (cost=0.00..49.00 rows=100 width=12)
+        ->  Index Scan using docs_idx on docs  (cost=0.00..1072173.17 rows=2188038 width=12)
+              Order By: (emb <&> to_bm25query('docs_idx'::regclass, (tokenize('year'::text, 'en'::text))::bm25vector))
+== or_k10
+Aggregate  (cost=5.03..5.04 rows=1 width=8)
+  ->  Limit  (cost=0.00..4.90 rows=10 width=12)
+        ->  Index Scan using docs_idx on docs  (cost=0.00..1072173.17 rows=2188038 width=12)
+              Order By: (emb <&> to_bm25query('docs_idx'::regclass, (tokenize('slovakia hungary'::text, 'en'::text))::bm25vector))

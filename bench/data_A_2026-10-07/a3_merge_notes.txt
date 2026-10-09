@@ -1,0 +1,70 @@
+# A3 first step: where the build's time goes (2.19M docs, aarch64 adev2, 8 workers, mwm 8GB)
+# build_prof.sh (prev = approach-a before this change): 7 worker flushes (~35 s of heap scan +
+#   analysis), then "merging 7 of 7 segments ... in 237.4 s" (serial collapse), then fts_vacuum 195 s.
+# merge_prof.sh (perf, leader in the collapse): hash_search_with_hash_value 42%,
+#   bm25_merge_segments_streaming 17.6% (self), pg_qsort 14.8%, bm25_write_postings 8.7%.
+#   The merge is CPU-bound, not I/O-bound.
+# merge_count.sh (uprobes, fts_merge of the 7-segment index): add_posting 362,451,721 calls,
+#   doclen_collector_add 362,451,721, hash_search_with_hash_value 755,428,606 = 2 per posting:
+#   the term hash (re-hashing the SAME term for every posting) and the docid->doclen hash
+#   (one insert per posting for a per-document fact).  Also a full binary search of the source
+#   sidecar per posting (bm25_doclen_lookup).
+# Change: per-term BuildTerm resolved once (bt_append_posting); merged sidecar collected once per
+#   document from the v4 sources' sidecars (minus tombstones), per posting only for v3 sources;
+#   forward galloping lookup in the source sidecar.
+# Identity (merge_ident.sh, merge_diff2.py, merge_ident2.sh): 400k-doc serial build, 64MB mwm
+#   (several flushes then the collapse merge): every LIVE page byte-identical prev vs cur for
+#   positions=off, positions=on, doclen_sidecar=off (v3 path), and a 10%-deleted index merged by
+#   fts_vacuum (tombstone path).  Freed pages differ (free-time XID, leftover input bytes).
+#   400k build: 177.9 -> 108.0 s (positions off), 220.9 -> 151.8 s (on).
+# build_time.sh (full 2.19M, default settings):
+#   prev build 272.8 s + fts_vacuum 186.4 s; cur build 147.4 s + fts_vacuum 66.1 s
+#   same final size 1,489,600,512, nseg 1, count(year) 734,896 both.
+# second step (merge_prof2.sh after step 1): fts_merge of 7 segments 111.9 s; pg_qsort 34.8%
+#   (postings already in docid order), merge loop 26% (gallop in the source sidecar, pg_fts_am.c
+#   lookup lines), bm25_write_postings 19.5% (FOR pack).
+# Change: skip the qsort when the postings are already ordered; per-source C1 slot arrays
+#   (bm25_doclen_slots_from) for an O(1) doclen per posting.
+# Identity (merge_ident3.sh, merge_ident2.sh): live pages byte-identical vs the pre-change binary
+#   for positions off/on, doclen_sidecar=off and the tombstoned fts_vacuum merge.
+# 400k serial build (64MB mwm): positions off 124.7 -> 78.5 s, on 166.2 -> 118.7 s
+#   (the "prev" binary of this run is step 1).
+# full 2.19M (build_time.sh): build 121.6 s + fts_vacuum 39.7 s; size 1,489,600,512; count 734,896.
+#   vs approach-a before any merge change: 272.8 + 186.4 s.
+# third step (merge_prof3.sh): fts_merge of 7 segments 86.5 s, pg_qsort still 45%: the
+#   "already ordered" check never fired.  runprobe.sh (temporary elog, server log): in the merge
+#   every large term arrives as exactly 7 ascending runs (one per source segment: the parallel
+#   heap scan interleaves chunks, so the segments' docid ranges overlap); a worker flush's terms
+#   arrive as ~1800 runs (interleaved heap chunks within one worker).
+# Change: count descents; <= 64 runs -> linear k-way merge of the runs; else qsort as before.
+# Identity: live pages byte-identical (positions off/on, v3, tombstoned) vs the step-2 binary.
+# build_time.sh x2 (prev = step 2): build 138.3 / 138.0 -> 110.4 / 110.5 s; fts_vacuum 46.3-46.8
+#   both (the step-2 39.7 s single run did not reproduce; 46 s is the figure).
+# fourth step (merge_prof4.sh after step 3): fts_merge 64.5 s, WAL 1,498,452,640 bytes;
+#   bm25_write_postings 55.5% -- srcline: pg_fts_for.h:88/94, the per-BIT loop of bm25_for_pack.
+# Change: bm25_for_pack ORs each value in a byte at a time (same bit order).
+#   forpack_check.c: 195,000 random blocks, widths 0..64, new == old byte for byte, and
+#   bm25_for_unpack round-trips.  test/fuzz/run.sh: ALL CLEAN.
+# Identity: live pages byte-identical vs the step-3 binary (positions off/on, v3, tombstoned).
+# build_time.sh x2 (prev = step 3): build 95.2 / 94.9 -> 78.8 / 81.3 s; fts_vacuum 40.1 / 40.1 ->
+#   26.0 / 26.1 s.  NB same-arm drift: the step-3 binary measured 110.4/110.5 s in the previous
+#   session and 95 s in this one -- compare only within one run.
+# layout.sh (FSM after a build): bands 0-4 of the file 100% free, band 5 85% free, 6-9 live:
+#   the collapse merge writes extend-only above its inputs, so the build leaves a 2.1 GB free
+#   front that only fts_vacuum's pack (a full rewrite) reclaims.
+# fifth step: pack inside a plain CREATE INDEX / REINDEX (AccessExclusiveLock held), the same
+#   bm25_vacuum_compact fts_vacuum runs, after the collapse.  CIC unchanged.
+# compact_ident.sh (400k serial, 64MB mwm): in-build pack vs build + fts_vacuum -> 387,375,104
+#   bytes both, every live page identical.
+# cic_check.sh: CIC valid, 1,890,869,248 bytes (unpacked, as before), fts_vacuum -> 387,375,104;
+#   live pages identical to the plain in-build pack except the metapage (index OID, generation).
+# build_time2.sh x2 (2.19M, default settings, prev = step 4):
+#   prev: build 78.3 / 78.9 s (3.59 GB) + fts_vacuum 26.3 / 25.9 s -> 1,489,600,512
+#   cur:  build 105.1 / 105.2 s -> 1,489,600,512 directly; fts_vacuum afterwards 0.0 s
+#   (vs approach-a before the merge work: 272.8 s build + 186.4 s fts_vacuum)
+# fifth step, phase timing (adev2, log_min_messages=debug1, CREATE INDEX docs_fts_b on the stored
+#   column, default settings, in-build pack binary): server log lines --
+#   "collapsing 7 segments to one (2003 MB <= collapse cap 4096 MB)"
+#   "merging 7 of 7 segments (2188038 live docs) into one" ... "wrote merged segment ... in 42.2 s"
+#   "merging 1 of 1 segments (2188038 live docs) into one" ... "wrote merged segment ... in 23.7 s"
+#   (the second is bm25_vacuum_compact's pack; the build totalled 105-107 s in build_time2.sh)

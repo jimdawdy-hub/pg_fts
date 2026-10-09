@@ -1,0 +1,19 @@
+1.9.0 so: b593f8e2  1.9.1 so: ae86efaa
+built with ext 1.9.0
+1.9.0 built + deleted: nseg=1 live=200000
+1.9.1 binary started; ext SQL still 1.9.0
+  1.9.1 .so, 1.9.0 SQL [common]: count 160000/160000 OK | top20 == heap ref OK | orderby rows=20
+  1.9.1 .so, 1.9.0 SQL [rare]: count 40000/40000 OK | top20 == heap ref OK | orderby rows=20
+  1.9.1 .so, 1.9.0 SQL [common | rare]: count 200000/200000 OK | top20 == heap ref OK | orderby rows=20
+  1.9.1 .so, 1.9.0 SQL [w5]: count 2062/2062 OK | top20 == heap ref OK | orderby rows=20
+after ALTER: ext 1.9.1
+  after ALTER EXTENSION [common]: count 160000/160000 OK | top20 == heap ref OK | orderby rows=20
+  after ALTER EXTENSION [rare]: count 40000/40000 OK | top20 == heap ref OK | orderby rows=20
+  after ALTER EXTENSION [common | rare]: count 200000/200000 OK | top20 == heap ref OK | orderby rows=20
+  after ALTER EXTENSION [w5]: count 2062/2062 OK | top20 == heap ref OK | orderby rows=20
+after insert+delete+vacuum+merge on 1.9.1: nseg=1
+  after 1.9.1 writes [common]: count 147142/147142 OK | top20 == heap ref OK | orderby rows=20
+  after 1.9.1 writes [rare]: count 34286/34286 OK | top20 == heap ref OK | orderby rows=20
+  after 1.9.1 writes [common | rare]: count 181428/181428 OK | top20 == heap ref OK | orderby rows=20
+  after 1.9.1 writes [w5]: count 1767/1767 OK | top20 == heap ref OK | orderby rows=20
+UPG_DONE
