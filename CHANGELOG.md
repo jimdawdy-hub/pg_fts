@@ -2,7 +2,11 @@
 
 All notable changes to pg_fts are documented here.
 
-## Unreleased
+## 1.11.0-freecase - 2026-10-09
+
+The legal-search fork on upstream 1.11.0.  Installs as extension version `1.11.0`: the
+SQL install script is upstream's, byte for byte; the differences below are in the C code
+and its tests.
 
 ### Merged upstream 1.9.1 - 1.11.0
 
