@@ -156,7 +156,7 @@ jobs:
             LD_PRELOAD="$ASAN_LIB" \
             LD_LIBRARY_PATH="$ASAN_DIR:${LD_LIBRARY_PATH:-}" \
             ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1:verify_asan_link_order=0" \
-            make installcheck REGRESS="pg_fts unicode_fold legal_proximity limit_hint doclen_slots score_reuse wand_last_block dense_score phrase_gate shared_doclen ranked_exact pending_delete bmw_block_end" PROVE_TESTS=ci/noop.pl PG_CONFIG=$PGBIN/pg_config
+            make installcheck REGRESS="pg_fts unicode_fold legal_proximity limit_hint doclen_slots score_reuse wand_last_block dense_score phrase_gate shared_doclen ranked_exact pending_delete bmw_block_end ranked_route" PROVE_TESTS=ci/noop.pl PG_CONFIG=$PGBIN/pg_config
       - name: Show diffs on failure
         if: failure()
         run: |

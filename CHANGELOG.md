@@ -25,6 +25,20 @@ All notable changes to pg_fts are documented here.
   (`<N>`) and `(A OR B) w/N C` -- keep the collect path that evaluates them.
 - `phrase_gate` sorts its labels with `COLLATE "C"`, so its expected output no longer
   depends on the server locale.
+- Fixed since the 1.9.0 merge: `WHERE d @@@ q ORDER BY d <=> q LIMIT k` went to the
+  filtered ordering scan instead of the top-k engine.  Upstream's planner LIMIT hint
+  rides in the header of the ORDER BY copy of `q` only, and the fork compared the WHERE
+  and ORDER BY queries byte for byte.  The comparison now skips that planner-only field.
+  The filtered scan materializes the whole match set and pending list; under the
+  `t/012_concurrent_flush` insert storm it ran a backend out of memory.  New test
+  `ranked_route`; the filtered scan now reports itself at DEBUG1.
+- Pending-list matches are gathered in one growing array and sorted once.  Each match
+  used to be OR-ed into a fresh copy of the whole set, so time and memory grew with the
+  square of the pending matches (about 1.2 GB for 20,000).  The fork's exact ranking of
+  pending documents reaches this path on every ranked query while the pending list is
+  non-empty, so `t/012_concurrent_flush` still ran out of memory after the routing fix;
+  it now passes.  The walk is upstream code with the same defect on its bitmap and plain
+  paths.
 - Known residual: pruning bounds (WAND pivot, block sums, MaxScore prefixes) are summed in
   cursor order while final scores are summed in query-term order.  A bound can therefore
   round up to one unit in the last place below a candidate's exact score; a document whose

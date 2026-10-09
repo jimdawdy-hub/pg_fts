@@ -1632,12 +1632,19 @@ bm25_beginscan(Relation r, int nkeys, int norderbys)
 	return scan;
 }
 
-/* Byte-identical ftsquery values?  Both are detoasted (4-byte header). */
+/*
+ * The same ftsquery?  Both are detoasted (4-byte header).  Byte-identical
+ * except the header's flags: that is the planner-only LIMIT hint
+ * (pg_fts_customscan.c), which the ORDER BY copy carries and the WHERE copy
+ * does not, and is no part of the query (test ranked_route).
+ */
 static inline bool
 fts_query_equal(FtsQuery a, FtsQuery b)
 {
 	return a == b ||
-		(VARSIZE(a) == VARSIZE(b) && memcmp(a, b, VARSIZE(a)) == 0);
+		(VARSIZE(a) == VARSIZE(b) && a->version == b->version &&
+		 memcmp(&a->nitems, &b->nitems,
+				VARSIZE(a) - offsetof(FtsQueryData, nitems)) == 0);
 }
 
 void
@@ -1914,6 +1921,8 @@ bm25_gettuple_filtered(IndexScanDesc scan, BM25ScanOpaque so)
 		TidSet		rows;
 
 		pgstat_count_index_scan(scan->indexRelation);
+		elog(DEBUG1, "pg_fts: ordering scan of index \"%s\" filters by its WHERE query",
+			 RelationGetRelationName(scan->indexRelation));
 		bm25_collect_filter(scan->indexRelation, so, &rows, &so->filtRecheck);
 		so->nfiltHits = bm25_rank_filter(scan->indexRelation,
 										 so->rankNull ? NULL : so->query,
@@ -2955,12 +2964,22 @@ bm25_collect_segment(Relation index, BM25SegMeta *sg, uint32 s, BM25CollectCtx *
  *
  * Split out of bm25_collect_matches, which had grown to 412 lines with this and
  * the per-segment evaluation inlined.  Behaviour is unchanged.
+ *
+ * Matches are appended to one growing array and sorted once at the end.
+ * OR-ing each match into *out copied the whole set per match: quadratic time
+ * and, with no pfree, quadratic memory -- ~1.2 GB for 20k pending matches, which
+ * an insert storm reaches in seconds (t/012_concurrent_flush ran out of memory).
  */
 static void
 bm25_collect_pending(Relation index, const BM25MetaPageData *meta,
 					 FtsQuery query, TidSet *out)
 {
 	BlockNumber blk = meta->pendinghead;
+	TidSet		found;
+	int			cap = 0;
+
+	found.tids = NULL;
+	found.n = 0;
 
 	while (blk != InvalidBlockNumber)
 	{
@@ -3018,16 +3037,26 @@ bm25_collect_pending(Relation index, const BM25MetaPageData *meta,
 						 errhint("REINDEX the index to rebuild it from the heap.")));
 			else if (fts_doc_matches(pdoc, query))
 			{
-				TidSet		one;
-
-				one.tids = &pi->tid;
-				one.n = 1;
-				*out = tidset_or(*out, one);	/* exact per-doc match */
+				/* exact per-doc match */
+				if (found.n == cap)
+				{
+					cap = cap ? cap * 2 : 64;
+					found.tids = found.tids
+						? (ItemPointerData *) repalloc(found.tids, cap * sizeof(ItemPointerData))
+						: (ItemPointerData *) palloc(cap * sizeof(ItemPointerData));
+				}
+				found.tids[found.n++] = pi->tid;
 			}
 			ptr += MAXALIGN(sizeof(BM25PendingItem) + pi->doclen);
 		}
 		UnlockReleaseBuffer(buffer);
 		blk = next;
+	}
+	if (found.n > 0)
+	{
+		tidset_sort_uniq(&found);
+		*out = tidset_or(*out, found);
+		pfree(found.tids);
 	}
 }
 

@@ -1,0 +1,90 @@
+-- ranked_route: an ordering scan whose WHERE query is its ORDER BY query is
+-- served by the top-k engine, not by the filtered scan.
+--
+-- The planner's LIMIT hint (pg_fts_customscan.c, 1.9.0) rides in the header of
+-- the ORDER BY copy of the query, never in the WHERE copy.  Comparing the two
+-- byte for byte saw different queries, so every
+--   WHERE d @@@ q ORDER BY d <=> q LIMIT k
+-- went to the filtered scan, which materializes the whole match set and the
+-- whole pending list (t/012_concurrent_flush ran it out of memory).  The
+-- filtered scan reports itself at DEBUG1.
+SET client_min_messages = warning;
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE rr (id int PRIMARY KEY, d ftsdoc);
+INSERT INTO rr SELECT g, to_ftsdoc('simple',
+  CASE WHEN g % 3 = 0 THEN 'apple pie ' || repeat('filler ', g / 3)
+       ELSE 'apple tart ' || g END)
+FROM generate_series(1, 300) g;
+CREATE INDEX rr_fts ON rr USING fts (d);
+VACUUM ANALYZE rr;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- the LIMIT hint's shape: Limit over an ordering index scan
+EXPLAIN (COSTS OFF)
+SELECT id FROM rr WHERE d @@@ 'apple'::ftsquery
+ORDER BY d <=> 'apple'::ftsquery LIMIT 5;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Index Scan using rr_fts on rr
+         Index Cond: (d @@@ '''apple'''::ftsquery)
+         Order By: (d <=> '''apple'''::ftsquery)
+(4 rows)
+
+SET client_min_messages = debug1;
+-- the same query in WHERE and ORDER BY, with a LIMIT: top-k engine, no notice
+SELECT count(*) FROM (SELECT id FROM rr WHERE d @@@ 'apple'::ftsquery
+  ORDER BY d <=> 'apple'::ftsquery LIMIT 5) s;
+ count 
+-------
+     5
+(1 row)
+
+-- and without a LIMIT
+SELECT count(*) FROM (SELECT id FROM rr WHERE d @@@ 'apple'::ftsquery
+  ORDER BY d <=> 'apple'::ftsquery) s;
+ count 
+-------
+   300
+(1 row)
+
+-- a different WHERE query: the filtered scan, which reports itself
+SELECT count(*) FROM (SELECT id FROM rr WHERE d @@@ 'pie'::ftsquery
+  ORDER BY d <=> 'apple'::ftsquery LIMIT 5) s;
+DEBUG:  pg_fts: ordering scan of index "rr_fts" filters by its WHERE query
+ count 
+-------
+     5
+(1 row)
+
+-- the same terms with a different operator are a different query
+SELECT count(*) FROM (SELECT id FROM rr WHERE d @@@ 'apple & pie'::ftsquery
+  ORDER BY d <=> 'apple | pie'::ftsquery LIMIT 5) s;
+DEBUG:  pg_fts: ordering scan of index "rr_fts" filters by its WHERE query
+ count 
+-------
+     5
+(1 row)
+
+SET client_min_messages = warning;
+-- both routes rank alike: the top rows of the routed scan match a forced
+-- filtered scan over the same match set
+SELECT array_agg(id ORDER BY n) AS same_query_top5 FROM (
+  SELECT id, row_number() OVER () n FROM (
+    SELECT id FROM rr WHERE d @@@ 'apple & pie'::ftsquery
+    ORDER BY d <=> 'apple & pie'::ftsquery LIMIT 5) s) t;
+ same_query_top5 
+-----------------
+ {3,6,9,12,15}
+(1 row)
+
+SELECT array_agg(id ORDER BY n) AS filtered_top5 FROM (
+  SELECT id, row_number() OVER () n FROM (
+    SELECT id FROM rr WHERE d @@@ 'apple & pie'::ftsquery AND d @@@ 'pie'::ftsquery
+    ORDER BY d <=> 'apple & pie'::ftsquery LIMIT 5) s) t;
+ filtered_top5 
+---------------
+ {3,6,9,12,15}
+(1 row)
+
+DROP TABLE rr;
