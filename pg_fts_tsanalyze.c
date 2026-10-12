@@ -7,7 +7,7 @@
  * tokenizer, this file makes the analyzer *pluggable* by binding an ftsdoc to
  * any installed text search configuration (pg_ts_config): the configured
  * parser and dictionary chain (snowball stemmers, ispell, synonyms, thesaurus,
- * stopwords) are run via parsetext(), and the resulting normalized lexemes are
+ * stopwords) are run via fts_parsetext(), and the resulting normalized lexemes are
  * folded into an ftsdoc.  No tokenizer or dictionary code is reimplemented --
  * this is the reuse the design calls for.
  *
@@ -28,16 +28,18 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
-/* qsort_arg comparator: elements are indices into a ParsedWord array (arg).
+#include "vendor/ts_parse_wide.c"
+
+/* qsort_arg comparator: elements are indices into a FtsParsedWord array (arg).
  * Ties on (text, len) break by token position so a distinct-term run comes out
  * with its positions ascending -- phrase_step requires each term's position
  * list to be ascending (this mirrors cmp_rawterm in pg_fts_analyze.c). */
 static int
 cmp_word_idx(const void *a, const void *b, void *arg)
 {
-	ParsedWord *words = (ParsedWord *) arg;
-	ParsedWord *wa = &words[*(const int *) a];
-	ParsedWord *wb = &words[*(const int *) b];
+	FtsParsedWord *words = (FtsParsedWord *) arg;
+	FtsParsedWord *wa = &words[*(const int *) a];
+	FtsParsedWord *wb = &words[*(const int *) b];
 	int			min = Min(wa->len, wb->len);
 	int			c = memcmp(wa->word, wb->word, min);
 
@@ -46,8 +48,8 @@ cmp_word_idx(const void *a, const void *b, void *arg)
 	if (wa->len != wb->len)
 		return wa->len - wb->len;
 	/* same term: order by position so positions come out ascending.
-	 * parsetext() fills pos.pos with a plain 1-based token ordinal via
-	 * LIMITPOS() (no weight bits, capped at MAXENTRYPOS-1); alen==0 so the
+	 * fts_parsetext() fills pos.pos with a plain 1-based token ordinal with
+	 * checked 30-bit precision (no weight bits); alen==0 so the
 	 * apos array form is never used on this path. */
 	if (wa->pos.pos < wb->pos.pos)
 		return -1;
@@ -60,16 +62,16 @@ cmp_word_idx(const void *a, const void *b, void *arg)
  * Build an ftsdoc from the words produced by parsetext().  The words are not
  * sorted and may contain duplicates and multiple variants per position, so we
  * sort, deduplicate and count term frequency, exactly like the simple
- * analyzer.  doclen is the number of token positions, which parsetext tracks
+ * analyzer.  doclen is the number of token positions, which fts_parsetext tracks
  * in prs->pos.  Per-token positions are stored (FTS_DOCF_POSITIONS) so phrase
- * and NEAR queries enforce adjacency on this path too; parsetext() fills each
- * ParsedWord.pos.pos with a 1-based token ordinal.
+ * and NEAR queries enforce adjacency on this path too; fts_parsetext() fills each
+ * FtsParsedWord.pos.pos with a 1-based token ordinal.
  */
 static FtsDoc
-ftsdoc_from_parsed(ParsedText *prs, uint8 label)
+ftsdoc_from_parsed(FtsParsedText *prs, uint8 label)
 {
 	int			nw = prs->curwords;
-	ParsedWord *words = prs->words;
+	FtsParsedWord *words = prs->words;
 	int		   *order;
 	int			i;
 	int			ndistinct = 0;
@@ -106,11 +108,11 @@ ftsdoc_from_parsed(ParsedText *prs, uint8 label)
 	for (i = 0; i < nw;)
 	{
 		int			run = 1;
-		ParsedWord *w = &words[order[i]];
+		FtsParsedWord *w = &words[order[i]];
 
 		while (i + run < nw)
 		{
-			ParsedWord *n = &words[order[i + run]];
+			FtsParsedWord *n = &words[order[i + run]];
 			int			min = Min(w->len, n->len);
 			int			c = memcmp(w->word, n->word, min);
 
@@ -155,11 +157,11 @@ ftsdoc_from_parsed(ParsedText *prs, uint8 label)
 	{
 		int			run = 1;
 		int			k;
-		ParsedWord *w = &words[order[i]];
+		FtsParsedWord *w = &words[order[i]];
 
 		while (i + run < nw)
 		{
-			ParsedWord *n = &words[order[i + run]];
+			FtsParsedWord *n = &words[order[i + run]];
 			int			min = Min(w->len, n->len);
 			int			c = memcmp(w->word, n->word, min);
 
@@ -193,21 +195,21 @@ ftsdoc_from_parsed(ParsedText *prs, uint8 label)
 FtsDoc
 fts_analyze_with_config(Oid cfgId, const char *str, int len, uint8 label)
 {
-	ParsedText	prs;
+	FtsParsedText	prs;
 	FtsDoc		doc;
 	char	   *buf;
 
 	prs.lenwords = Max(len / 6, 16);
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
+	prs.words = (FtsParsedWord *) palloc(sizeof(FtsParsedWord) * prs.lenwords);
 
-	/* parsetext wants a writable buffer */
+	/* The parser wants a writable buffer */
 	buf = (char *) palloc(len + 1);
 	memcpy(buf, str, len);
 	buf[len] = '\0';
 
-	parsetext(cfgId, &prs, buf, len);
+	fts_parsetext(cfgId, &prs, buf, len);
 
 	doc = ftsdoc_from_parsed(&prs, label);
 

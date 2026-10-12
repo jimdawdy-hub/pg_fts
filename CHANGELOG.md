@@ -2,6 +2,20 @@
 
 All notable changes to pg_fts are documented here.
 
+## Unreleased - clone-tested fix
+
+- Configured analysis now preserves 30-bit token positions, including weighted
+  analysis, by adapting PostgreSQL's existing parsing/dictionary pipeline with
+  private wide position storage. PostgreSQL's `ParsedWord` stores only uint16
+  positions and `parsetext` additionally clamps them to 16,383.
+- Added `configured_positions`: late adjacent/nonadjacent phrases, punctuation,
+  English stemming/stopword gaps, weighted analysis, and indexed/direct result
+  agreement beyond 16,383 and 65,535 positions. The actual Freecase application
+  query also finds a 1.14-million-character clone fixture it previously missed.
+- No on-disk format change. Previously capped document/index values must be
+  regenerated from original text. Existing `tsvector` conversion remains bounded
+  by the positions present in its input. This is not a released production build.
+
 ## 1.11.0-freecase - 2026-10-09
 
 The legal-search fork on upstream 1.11.0.  Installs as extension version `1.11.0`: the

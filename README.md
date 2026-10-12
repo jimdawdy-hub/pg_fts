@@ -235,10 +235,11 @@ Use `WITH (positions=on)` for compound proximity without heap rechecks, also
 when combined with AND and NOT. Weighted/expanded terms still use exact
 rechecks, and so does a document whose positions were not stored or are
 oversized (that document alone).
-The configured analyzer inherits PostgreSQL's position cap of 16,383; matches
-beyond it can be lost. The unconfigured `to_ftsdoc(text)` analyzer stores wider
-positions. This inherited limitation needs resolution before a legal-corpus
-cutover; existing document vectors cannot recover spacing already lost on input.
+The configured analyzer preserves 30-bit positions using PostgreSQL's parser
+and dictionary pipeline. This fixes the prior 16,383-position cap for newly
+analyzed source text. Existing capped `ftsdoc` values and indexes need regeneration
+from their original text; converting an existing `tsvector` cannot recover spacing
+already lost on input. The on-disk representation is unchanged.
 
 Example
 -------
