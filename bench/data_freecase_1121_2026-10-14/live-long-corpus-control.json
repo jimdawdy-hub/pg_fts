@@ -1,0 +1,82 @@
+{
+  "target_opinion": 6353492,
+  "case_name": "Dobbs v. Jackson Women's Health Organization",
+  "phrase": "greenlighting even total abortion bans",
+  "near_miss": "greenlighting carefully even total abortion bans",
+  "library_sha256": "b277a1fc2c588eef4c9833038ff1db2364c915f6465090e871f72054d38ca712",
+  "controls": [
+    {
+      "name": "positive",
+      "used_existing_index": true,
+      "target_present": true,
+      "ids": [
+        6353492
+      ],
+      "elapsed_s": 1.0302834390022326,
+      "plan": [
+        {
+          "Plan": {
+            "Node Type": "Bitmap Heap Scan",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Relation Name": "search_opinion",
+            "Alias": "search_opinion",
+            "Disabled": false,
+            "Recheck Cond": "(to_ftsdoc('english'::regconfig, COALESCE(display_text, plain_text)) @@@ '((((''greenlight'' <-> ''even'') <-> ''total'') <-> ''abort'') <-> ''ban'')'::ftsquery)",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Index Name": "idx_so_pgfts_body",
+                "Disabled": false,
+                "Index Cond": "(to_ftsdoc('english'::regconfig, COALESCE(display_text, plain_text)) @@@ '((((''greenlight'' <-> ''even'') <-> ''total'') <-> ''abort'') <-> ''ban'')'::ftsquery)"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "near_miss",
+      "used_existing_index": true,
+      "target_present": false,
+      "ids": [],
+      "elapsed_s": 1.2115338429866824,
+      "plan": [
+        {
+          "Plan": {
+            "Node Type": "Bitmap Heap Scan",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Relation Name": "search_opinion",
+            "Alias": "search_opinion",
+            "Disabled": false,
+            "Recheck Cond": "(to_ftsdoc('english'::regconfig, COALESCE(display_text, plain_text)) @@@ '(((((''greenlight'' <-> ''care'') <-> ''even'') <-> ''total'') <-> ''abort'') <-> ''ban'')'::ftsquery)",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Index Name": "idx_so_pgfts_body",
+                "Disabled": false,
+                "Index Cond": "(to_ftsdoc('english'::regconfig, COALESCE(display_text, plain_text)) @@@ '(((((''greenlight'' <-> ''care'') <-> ''even'') <-> ''total'') <-> ''abort'') <-> ''ban'')'::ftsquery)"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "text_sha256": "e1e6206a540f1690bd663870a5278a6d96ac270676845607212678bc42d81988",
+  "text_chars": 443917,
+  "tsquery": "'greenlight' <-> 'even' <-> 'total' <-> 'abort' <-> 'ban'",
+  "matching_phrase_start_positions": [
+    72794
+  ],
+  "actual_phrase_only_beyond_65535": true,
+  "direct_positive": true,
+  "direct_near_miss": false
+}

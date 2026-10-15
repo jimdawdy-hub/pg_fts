@@ -1,0 +1,27 @@
+echo "# +++ tap install-check in  +++" && rm -rf '/work-final'/tmp_check && /bin/mkdir -p '/work-final'/tmp_check && cd ./ && TESTLOGDIR='/work-final/tmp_check/log' TESTDATADIR='/work-final/tmp_check' PATH="/usr/lib/postgresql/18/bin:/work-final:$PATH" PGPORT='65432' PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/regress/pg_regress' /usr/bin/prove -I /usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/perl/ -I ./  t/*.pl
+# +++ tap install-check in  +++
+t/001_crash_recovery.pl ....... ok
+t/002_replication.pl .......... ok
+# corrupted 5 posting page(s), 74 pending page(s)
+t/003_corruption.pl ........... ok
+t/004_encodings.pl ............ ok
+# reader summary: NOTICE:  READER_DONE reads=68001 wrong=0
+# NOTICE:  READER_DONE reads=66334 wrong=0
+t/005_concurrency.pl .......... ok
+t/006_concurrent_extend.pl .... ok
+# final segments = 8 (hard cap 128), rows = 240
+t/007_segment_cap.pl .......... ok
+# index pages after build: 2199
+# index pages after fts_vacuum #1: 2199
+# index pages after fts_vacuum #2: 2199
+t/008_vacuum_reclaim.pl ....... ok
+t/009_doclen_sidecar.pl ....... ok
+# index MB after three VACUUMs: 20, 20, 20
+# after delete=20MB, after 4 cleanups=24MB
+# after delete=20MB, +4 cleanups=24MB, +6 txns +4 more=4MB
+t/010_vacuum_delete_heavy.pl .. ok
+t/011_shared_doclen.pl ........ ok
+t/012_concurrent_flush.pl ..... ok
+All tests successful.
+Files=12, Tests=137, 223 wallclock secs ( 0.45 usr  0.02 sys +  6.78 cusr  5.04 csys = 12.29 CPU)
+Result: PASS

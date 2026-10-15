@@ -1,0 +1,1153 @@
+{
+  "same_on_complete_pairs": 88,
+  "ordered_equal": 88,
+  "sets_equal": 88,
+  "nonempty_pairs": 79,
+  "pairs": [
+    {
+      "key": [
+        "residency",
+        "common_premises_liability",
+        "nationwide",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "new_mexico",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_market_share_liability",
+        "illinois",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 6,
+      "new_count": 6
+    },
+    {
+      "key": [
+        "residency",
+        "common_ineffective_assistance",
+        "nationwide",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_equitable_subrogation",
+        "new_mexico",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 5,
+      "new_count": 5
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_cy_pres",
+        "new_mexico",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "nationwide",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "new_mexico",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 7,
+      "new_count": 7
+    },
+    {
+      "key": [
+        "memory",
+        "ineffective_assistance",
+        "nationwide",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "scotus",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "memory",
+        "premises_liability",
+        "nationwide",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_spoliation_esi",
+        "new_mexico",
+        1,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "residency",
+        "common_ineffective_assistance",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_judicial_estoppel",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_diminished_capacity",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 19,
+      "new_count": 19
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "illinois",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 16,
+      "new_count": 16
+    },
+    {
+      "key": [
+        "memory",
+        "premises_liability",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_market_share_liability",
+        "illinois",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 6,
+      "new_count": 6
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_interpreting_settlement_release",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "common_medical_malpractice",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_scriveners_error",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "common_premises_liability",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "common_contract_damages",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_necessity_trespass",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "common_probable_cause",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 7,
+      "new_count": 7
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "residency",
+        "common_personal_jurisdiction",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_equitable_subrogation",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_equitable_subrogation",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 5,
+      "new_count": 5
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_advocate_hospital",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 17,
+      "new_count": 17
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_state_created_danger",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 2,
+      "new_count": 2
+    },
+    {
+      "key": [
+        "memory",
+        "premises_liability",
+        "federal",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "common_negligence_elements",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_spoliation_esi",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "memory",
+        "ineffective_assistance",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_cy_pres",
+        "new_mexico",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_forum_non_conveniens",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 19,
+      "new_count": 19
+    },
+    {
+      "key": [
+        "residency",
+        "common_limitations_discovery",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "federal",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "scotus",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_market_share_liability",
+        "nationwide",
+        2,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_cy_pres",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_equitable_subrogation",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_loss_of_chance",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 21,
+      "new_count": 21
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_diminished_capacity",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 19,
+      "new_count": 19
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_forum_non_conveniens",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 19,
+      "new_count": 19
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_market_share_liability",
+        "illinois",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 6,
+      "new_count": 6
+    },
+    {
+      "key": [
+        "residency",
+        "common_negligence_elements",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_advocate_hospital",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 17,
+      "new_count": 17
+    },
+    {
+      "key": [
+        "memory",
+        "premises_liability",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "common_hearsay_business_records",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_market_share_liability",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "common_probable_cause",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "common_personal_jurisdiction",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "scotus",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 7,
+      "new_count": 7
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 1,
+      "new_count": 1
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_state_created_danger",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 2,
+      "new_count": 2
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_scriveners_error",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 8,
+      "new_count": 8
+    },
+    {
+      "key": [
+        "residency",
+        "common_ineffective_assistance",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "common_medical_malpractice",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "memory",
+        "ineffective_assistance",
+        "federal",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 25,
+      "new_count": 25
+    },
+    {
+      "key": [
+        "residency",
+        "common_limitations_discovery",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_cy_pres",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "common_summary_judgment",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 25,
+      "new_count": 25
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_reverse_piercing",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "common_qualified_immunity",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "common_workers_compensation",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 19,
+      "new_count": 19
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_judicial_estoppel",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "illinois",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 16,
+      "new_count": 16
+    },
+    {
+      "key": [
+        "residency",
+        "common_child_custody",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "memory",
+        "premises_liability",
+        "federal",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "memory",
+        "res_ipsa_medical",
+        "federal",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_necessity_trespass",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_interpreting_settlement_release",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "common_employment_discrimination",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_amended_settlement_release",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_state_created_danger",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 23,
+      "new_count": 23
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_spoliation_esi",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 0,
+      "new_count": 0
+    },
+    {
+      "key": [
+        "memory",
+        "ineffective_assistance",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 24,
+      "new_count": 24
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_equitable_subrogation",
+        "new_mexico",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 5,
+      "new_count": 5
+    },
+    {
+      "key": [
+        "residency",
+        "common_motion_suppress",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 20,
+      "new_count": 20
+    },
+    {
+      "key": [
+        "residency",
+        "uncommon_scriveners_error",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    },
+    {
+      "key": [
+        "residency",
+        "common_premises_liability",
+        "nationwide",
+        3,
+        "on"
+      ],
+      "ids_equal": true,
+      "sets_equal": true,
+      "old_count": 22,
+      "new_count": 22
+    }
+  ],
+  "caveat": "Different sessions/cache/host conditions and query-plan selection; this is not a controlled old-vs-new extension benchmark."
+}

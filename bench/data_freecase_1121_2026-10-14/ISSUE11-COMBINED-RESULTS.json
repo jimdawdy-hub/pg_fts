@@ -1,0 +1,10 @@
+{
+  "repeats": 3,
+  "query_shapes": [
+    "LIMIT 100000",
+    "no LIMIT"
+  ],
+  "all_six_counts_correct": true,
+  "all_six_orders_correct": true,
+  "expected_matches": 2000
+}

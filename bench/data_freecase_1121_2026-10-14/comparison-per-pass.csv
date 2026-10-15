@@ -1,0 +1,226 @@
+suite,query_id,query,scope,pass,leading_engine,off_coverage,off_search_s,off_hits,on_coverage,on_search_s,on_hits,on_legacy_fallback,overlap_count,union_count,overlap_fraction_smaller_set,ordered_ids_equal,top1_equal
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,nationwide,1,off,timed_out,25.072244420996867,0,timed_out,25.04182808700716,0,True,,,,,
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,nationwide,2,on,best_effort,6.304097265994642,9,complete,0.7811448049906176,20,False,0,29,0.0,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,nationwide,3,off,best_effort,5.991815374989528,9,complete,3.7473664870194625,20,False,0,29,0.0,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,illinois,1,on,complete,1.6027662309934385,19,timed_out,25.054946196993114,0,True,,,,,
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,illinois,2,off,complete,1.13683389898506,19,complete,2.0658285730169155,16,False,6,29,0.375,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,illinois,3,on,complete,1.5047905709943734,19,complete,4.360819863999495,16,False,6,29,0.375,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,new_mexico,1,off,complete,2.694003899989184,7,complete,1.0721776540158316,7,False,7,7,1.0,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,new_mexico,2,on,complete,0.9363982870127074,7,complete,1.0342528820037842,7,False,7,7,1.0,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,new_mexico,3,off,complete,0.9398700539895799,7,complete,1.0305760219926015,7,False,7,7,1.0,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,federal,1,on,timed_out,25.041182749992004,0,timed_out,25.04526412099949,0,True,,,,,
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,federal,2,off,complete,4.143220109981485,25,complete,1.4010783089906909,24,False,6,43,0.25,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,federal,3,on,complete,4.552845033002086,25,complete,4.534517249994678,24,False,6,43,0.25,False,False
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,scotus,1,off,complete,0.942766174004646,0,complete,1.0348145520256367,0,False,0,0,,True,
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,scotus,2,on,complete,0.9461152500007302,0,complete,1.0171583839983214,0,False,0,0,,True,
+memory,res_ipsa_medical,res ipsa AND medical malpractice AND hospital,scotus,3,off,complete,0.9415338219841942,0,complete,0.9729396990151145,0,False,0,0,,True,
+memory,premises_liability,premises liability slip fall summary judgment,nationwide,1,on,timed_out,25.01985333499033,0,complete,3.9016181059996597,24,False,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,nationwide,2,off,timed_out,25.029152150003938,0,complete,0.9493123950087465,24,False,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,nationwide,3,on,best_effort,6.364400288002798,20,complete,1.1033742539875675,24,False,0,44,0.0,False,False
+memory,premises_liability,premises liability slip fall summary judgment,illinois,1,off,timed_out,25.029521240998292,0,timed_out,25.058745493006427,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,illinois,2,on,timed_out,25.015697466005804,0,timed_out,25.026549550995696,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,illinois,3,off,timed_out,25.014010499988217,0,timed_out,25.018994771991856,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,new_mexico,1,on,timed_out,25.420857184013585,0,timed_out,25.046705168002518,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,new_mexico,2,off,complete,2.2924681050062645,21,complete,2.5554515969997738,21,False,17,25,0.8095238095238095,False,False
+memory,premises_liability,premises liability slip fall summary judgment,new_mexico,3,on,complete,1.5248087610234506,21,complete,3.1738913020235486,21,False,17,25,0.8095238095238095,False,False
+memory,premises_liability,premises liability slip fall summary judgment,federal,1,off,timed_out,25.02074905799236,0,complete,3.3954023539845366,24,False,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,federal,2,on,timed_out,25.044953684991924,0,complete,2.2031368220050354,24,False,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,federal,3,off,timed_out,25.03869543498149,0,complete,4.189720707014203,24,False,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,scotus,1,on,timed_out,25.012728742003674,0,timed_out,25.032273428019835,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,scotus,2,off,timed_out,25.004744801990455,0,timed_out,25.036062599014258,0,True,,,,,
+memory,premises_liability,premises liability slip fall summary judgment,scotus,3,on,complete,2.248311350005679,20,timed_out,25.037288791005267,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,nationwide,1,off,best_effort,5.678981727018254,17,complete,1.570508040022105,24,False,1,40,0.058823529411764705,False,False
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,nationwide,2,on,best_effort,5.661124517995631,17,complete,1.0817891290062107,24,False,1,40,0.058823529411764705,False,False
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,nationwide,3,off,best_effort,5.696725040994352,17,complete,1.2691204150032718,24,False,1,40,0.058823529411764705,False,False
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,illinois,1,on,timed_out,25.010755420982605,0,timed_out,25.020526877982775,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,illinois,2,off,best_effort,12.866064213012578,9,best_effort,14.961951749981381,9,True,9,9,1.0,True,True
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,illinois,3,on,best_effort,12.31675179200829,9,best_effort,12.263033102004556,9,True,9,9,1.0,True,True
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,new_mexico,1,off,timed_out,25.07531489498797,0,timed_out,25.019751370011363,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,new_mexico,2,on,best_effort,10.268367404001765,19,timed_out,25.00726162601495,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,new_mexico,3,off,best_effort,15.856205169984605,19,best_effort,6.762496589013608,19,True,19,19,1.0,True,True
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,federal,1,on,timed_out,25.020353580010124,0,timed_out,25.03878851601621,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,federal,2,off,best_effort,6.23620782000944,18,best_effort,5.883034411002882,18,True,18,18,1.0,True,True
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,federal,3,on,best_effort,5.913289360003546,18,complete,1.3710997070011217,25,False,0,43,0.0,False,False
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,scotus,1,off,timed_out,25.01711506198626,0,timed_out,25.06148001301335,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,scotus,2,on,timed_out,25.011619468976278,0,timed_out,25.02695922800922,0,True,,,,,
+memory,ineffective_assistance,ineffective assistance and counsel and prejudice,scotus,3,off,timed_out,25.01259017799748,0,timed_out,25.04439032598748,0,True,,,,,
+residency,common_negligence_elements,negligence duty breach causation damages,nationwide,1,on,timed_out,25.042345372989075,0,timed_out,25.03184888200485,0,True,,,,,
+residency,common_negligence_elements,negligence duty breach causation damages,nationwide,2,off,best_effort,6.7052854530047625,21,complete,2.703719628014369,24,False,0,45,0.0,False,False
+residency,common_negligence_elements,negligence duty breach causation damages,nationwide,3,on,best_effort,6.104585155000677,21,complete,4.271980475023156,24,False,0,45,0.0,False,False
+residency,common_negligence_elements,negligence duty breach causation damages,illinois,1,off,timed_out,25.017620509985136,0,timed_out,25.02004626300186,0,True,,,,,
+residency,common_negligence_elements,negligence duty breach causation damages,illinois,2,on,timed_out,25.039920981012983,0,timed_out,25.163918128004298,0,True,,,,,
+residency,common_negligence_elements,negligence duty breach causation damages,illinois,3,off,timed_out,25.003979578992585,0,timed_out,25.011051432986278,0,True,,,,,
+residency,common_contract_damages,breach of contract expectation damages,nationwide,1,on,best_effort,5.734172626020154,19,best_effort,6.207240528980037,19,True,19,19,1.0,True,True
+residency,common_contract_damages,breach of contract expectation damages,nationwide,2,off,best_effort,5.758296788990265,19,complete,2.7079718629829586,22,False,0,41,0.0,False,False
+residency,common_contract_damages,breach of contract expectation damages,nationwide,3,on,best_effort,5.709964934998425,19,best_effort,6.274060021998594,19,True,19,19,1.0,True,True
+residency,common_contract_damages,breach of contract expectation damages,new_mexico,1,off,timed_out,25.020265404979,0,timed_out,25.010341273009544,0,True,,,,,
+residency,common_contract_damages,breach of contract expectation damages,new_mexico,2,on,best_effort,6.7234724599984474,22,best_effort,7.787389428005554,22,True,22,22,1.0,True,True
+residency,common_contract_damages,breach of contract expectation damages,new_mexico,3,off,best_effort,6.768665699986741,22,best_effort,6.774975343985716,22,True,22,22,1.0,True,True
+residency,common_summary_judgment,summary judgment genuine issue material fact,nationwide,1,on,timed_out,25.025132166978437,0,timed_out,25.073623372998554,0,True,,,,,
+residency,common_summary_judgment,summary judgment genuine issue material fact,nationwide,2,off,best_effort,5.934959054982755,17,best_effort,5.5195947689935565,17,True,17,17,1.0,True,True
+residency,common_summary_judgment,summary judgment genuine issue material fact,nationwide,3,on,best_effort,5.491742129001068,17,complete,2.4825146999792196,25,False,0,42,0.0,False,False
+residency,common_summary_judgment,summary judgment genuine issue material fact,illinois,1,off,best_effort,13.300191168993479,14,best_effort,12.802234023984056,14,True,14,14,1.0,True,True
+residency,common_summary_judgment,summary judgment genuine issue material fact,illinois,2,on,best_effort,12.583625562983798,14,best_effort,12.888360927987378,14,True,14,14,1.0,True,True
+residency,common_summary_judgment,summary judgment genuine issue material fact,illinois,3,off,best_effort,12.413074754003901,14,best_effort,12.351809659972787,14,True,14,14,1.0,True,True
+residency,common_qualified_immunity,qualified immunity clearly established law,nationwide,1,on,timed_out,25.027930609008763,0,timed_out,25.07233474199893,0,True,,,,,
+residency,common_qualified_immunity,qualified immunity clearly established law,nationwide,2,off,best_effort,5.8169451449939515,18,best_effort,5.416869303997373,18,True,18,18,1.0,True,True
+residency,common_qualified_immunity,qualified immunity clearly established law,nationwide,3,on,best_effort,5.531850900995778,18,complete,2.285800001001917,20,False,0,38,0.0,False,False
+residency,common_qualified_immunity,qualified immunity clearly established law,new_mexico,1,off,timed_out,25.006441303004976,0,timed_out,25.0426295720099,0,True,,,,,
+residency,common_qualified_immunity,qualified immunity clearly established law,new_mexico,2,on,best_effort,6.717593028006377,20,best_effort,7.352915968018351,20,True,20,20,1.0,True,True
+residency,common_qualified_immunity,qualified immunity clearly established law,new_mexico,3,off,best_effort,6.811245215008967,20,best_effort,6.785502707003616,20,True,20,20,1.0,True,True
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,nationwide,1,on,best_effort,5.803658432996599,17,complete,1.5478576259920374,24,False,1,40,0.058823529411764705,False,False
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,nationwide,2,off,best_effort,5.718676930991933,17,complete,0.926878079015296,24,False,1,40,0.058823529411764705,False,False
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,nationwide,3,on,best_effort,5.634252361021936,17,complete,1.3019265299953986,24,False,1,40,0.058823529411764705,False,False
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,illinois,1,off,timed_out,25.007223316002637,0,timed_out,25.02528176299529,0,True,,,,,
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,illinois,2,on,best_effort,12.391540118027478,9,best_effort,12.623004605004098,9,True,9,9,1.0,True,True
+residency,common_ineffective_assistance,ineffective assistance counsel prejudice,illinois,3,off,best_effort,13.111859127006028,9,best_effort,12.6526454819832,9,True,9,9,1.0,True,True
+residency,common_premises_liability,premises liability slip fall notice,nationwide,1,on,timed_out,25.02945567999268,0,complete,4.763277566002216,22,False,,,,,
+residency,common_premises_liability,premises liability slip fall notice,nationwide,2,off,best_effort,23.48236653400818,22,complete,0.7663249149918556,22,False,0,44,0.0,False,False
+residency,common_premises_liability,premises liability slip fall notice,nationwide,3,on,timed_out,25.02795198300737,0,complete,3.1829629200219642,22,False,,,,,
+residency,common_premises_liability,premises liability slip fall notice,new_mexico,1,off,timed_out,25.01481446600519,0,timed_out,25.017892322997795,0,True,,,,,
+residency,common_premises_liability,premises liability slip fall notice,new_mexico,2,on,complete,2.0856801330228336,19,best_effort,6.967466923990287,19,True,19,19,1.0,True,True
+residency,common_premises_liability,premises liability slip fall notice,new_mexico,3,off,complete,3.871366987004876,19,complete,2.0424403810175136,20,False,14,25,0.7368421052631579,False,False
+residency,common_medical_malpractice,medical malpractice standard of care causation,nationwide,1,on,timed_out,25.057732604997,0,timed_out,25.04115436199936,0,True,,,,,
+residency,common_medical_malpractice,medical malpractice standard of care causation,nationwide,2,off,timed_out,25.048236863018246,0,complete,2.3833013249968644,22,False,,,,,
+residency,common_medical_malpractice,medical malpractice standard of care causation,nationwide,3,on,best_effort,6.424481310008559,19,complete,4.640119557996513,22,False,0,41,0.0,False,False
+residency,common_medical_malpractice,medical malpractice standard of care causation,illinois,1,off,timed_out,25.014361824985826,0,timed_out,25.038739793002605,0,True,,,,,
+residency,common_medical_malpractice,medical malpractice standard of care causation,illinois,2,on,timed_out,25.022522640996613,0,timed_out,25.02102867301437,0,True,,,,,
+residency,common_medical_malpractice,medical malpractice standard of care causation,illinois,3,off,timed_out,25.10415053498582,0,timed_out,25.055828743003076,0,True,,,,,
+residency,common_employment_discrimination,employment discrimination pretext adverse action,nationwide,1,on,timed_out,25.0273619669897,0,timed_out,25.03193108801497,0,True,,,,,
+residency,common_employment_discrimination,employment discrimination pretext adverse action,nationwide,2,off,best_effort,6.528208178002387,20,best_effort,6.064066780993016,20,True,20,20,1.0,True,True
+residency,common_employment_discrimination,employment discrimination pretext adverse action,nationwide,3,on,timed_out,25.01212125402526,0,complete,2.5091667440137826,24,False,,,,,
+residency,common_employment_discrimination,employment discrimination pretext adverse action,new_mexico,1,off,timed_out,25.01930211900617,0,timed_out,25.04270606499631,0,True,,,,,
+residency,common_employment_discrimination,employment discrimination pretext adverse action,new_mexico,2,on,timed_out,25.00856232800288,0,timed_out,25.018066844000714,0,True,,,,,
+residency,common_employment_discrimination,employment discrimination pretext adverse action,new_mexico,3,off,best_effort,6.922772586985957,14,best_effort,6.7578929839946795,14,True,14,14,1.0,True,True
+residency,common_probable_cause,probable cause search warrant affidavit,nationwide,1,on,timed_out,25.01610474899644,0,timed_out,25.03472653499921,0,True,,,,,
+residency,common_probable_cause,probable cause search warrant affidavit,nationwide,2,off,best_effort,6.3903747820004355,17,complete,2.9245921970286872,22,False,0,39,0.0,False,False
+residency,common_probable_cause,probable cause search warrant affidavit,nationwide,3,on,best_effort,5.766300641989801,17,complete,3.790987504995428,22,False,0,39,0.0,False,False
+residency,common_probable_cause,probable cause search warrant affidavit,illinois,1,off,timed_out,25.00571849499829,0,timed_out,25.012705892004305,0,True,,,,,
+residency,common_probable_cause,probable cause search warrant affidavit,illinois,2,on,timed_out,25.060021627985407,0,timed_out,25.03717119299108,0,True,,,,,
+residency,common_probable_cause,probable cause search warrant affidavit,illinois,3,off,timed_out,25.030036721000215,0,timed_out,25.013389272004133,0,True,,,,,
+residency,common_hearsay_business_records,hearsay exception business records foundation,nationwide,1,on,timed_out,25.03463655000087,0,timed_out,25.039522311999463,0,True,,,,,
+residency,common_hearsay_business_records,hearsay exception business records foundation,nationwide,2,off,best_effort,6.614234923006734,22,best_effort,6.088861714000814,22,True,22,22,1.0,True,True
+residency,common_hearsay_business_records,hearsay exception business records foundation,nationwide,3,on,best_effort,6.1235918480088,22,complete,1.0348239909799304,22,False,0,44,0.0,False,False
+residency,common_hearsay_business_records,hearsay exception business records foundation,new_mexico,1,off,timed_out,25.075971889978973,0,timed_out,25.02204512100434,0,True,,,,,
+residency,common_hearsay_business_records,hearsay exception business records foundation,new_mexico,2,on,best_effort,6.685847206012113,21,best_effort,7.138712940010009,21,True,21,21,1.0,True,True
+residency,common_hearsay_business_records,hearsay exception business records foundation,new_mexico,3,off,complete,4.475799494015519,21,complete,2.62433199599036,20,False,12,29,0.6,False,False
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,nationwide,1,on,best_effort,5.950767201982671,20,best_effort,6.746824970992748,20,True,20,20,1.0,True,True
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,nationwide,2,off,best_effort,5.925908316014102,20,complete,2.983920586993918,23,False,0,43,0.0,False,False
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,nationwide,3,on,best_effort,5.937516144971596,20,complete,1.4312579069810454,23,False,0,43,0.0,False,False
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,illinois,1,off,timed_out,25.045349802996498,0,timed_out,25.18457787798252,0,True,,,,,
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,illinois,2,on,timed_out,25.014162702020258,0,timed_out,25.019502143986756,0,True,,,,,
+residency,common_personal_jurisdiction,personal jurisdiction minimum contacts purposeful availment,illinois,3,off,timed_out,25.018353325984208,0,timed_out,25.01329060801072,0,True,,,,,
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,nationwide,1,on,timed_out,25.08887493101065,0,timed_out,25.026080070994794,0,True,,,,,
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,nationwide,2,off,best_effort,6.833350144996075,22,best_effort,6.307232747989474,22,True,22,22,1.0,True,True
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,nationwide,3,on,timed_out,25.04894353300915,0,complete,3.36520708000171,20,False,,,,,
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,new_mexico,1,off,timed_out,25.00622289601597,0,timed_out,25.033936809981242,0,True,,,,,
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,new_mexico,2,on,complete,3.3960739900066983,20,timed_out,25.018672424019314,0,True,,,,,
+residency,common_motion_suppress,motion to suppress unlawful search exclusionary rule,new_mexico,3,off,best_effort,6.698797548015136,20,complete,3.263138626993168,23,False,13,30,0.65,False,False
+residency,common_child_custody,child custody best interests of the child,nationwide,1,on,timed_out,25.00865917498595,0,timed_out,25.053163218020927,0,True,,,,,
+residency,common_child_custody,child custody best interests of the child,nationwide,2,off,best_effort,6.2113720219931565,23,best_effort,5.7322934700059704,23,True,23,23,1.0,True,True
+residency,common_child_custody,child custody best interests of the child,nationwide,3,on,best_effort,10.308269330998883,23,complete,1.9435724900104105,20,False,0,43,0.0,False,False
+residency,common_child_custody,child custody best interests of the child,illinois,1,off,timed_out,25.02428331700503,0,timed_out,25.12650696700439,0,True,,,,,
+residency,common_child_custody,child custody best interests of the child,illinois,2,on,timed_out,25.009643637982663,0,timed_out,25.008723539009225,0,True,,,,,
+residency,common_child_custody,child custody best interests of the child,illinois,3,off,timed_out,25.021525853982894,0,timed_out,25.013834059005603,0,True,,,,,
+residency,common_workers_compensation,workers compensation course and scope of employment,nationwide,1,on,timed_out,25.033271010994213,0,timed_out,25.176713259977987,0,True,,,,,
+residency,common_workers_compensation,workers compensation course and scope of employment,nationwide,2,off,best_effort,6.233818217006046,21,best_effort,5.7008632509969175,21,True,21,21,1.0,True,True
+residency,common_workers_compensation,workers compensation course and scope of employment,nationwide,3,on,best_effort,5.76505742201698,21,complete,1.1680306310008746,19,False,0,40,0.0,False,False
+residency,common_workers_compensation,workers compensation course and scope of employment,new_mexico,1,off,timed_out,25.061808812024537,0,timed_out,25.087198007007828,0,True,,,,,
+residency,common_workers_compensation,workers compensation course and scope of employment,new_mexico,2,on,best_effort,6.705634811019991,21,best_effort,7.381668598012766,21,True,21,21,1.0,True,True
+residency,common_workers_compensation,workers compensation course and scope of employment,new_mexico,3,off,best_effort,6.704438143002335,21,best_effort,6.675905009004055,21,True,21,21,1.0,True,True
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,nationwide,1,on,timed_out,25.05546289499034,0,timed_out,25.0572804720141,0,True,,,,,
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,nationwide,2,off,best_effort,6.552306450990727,18,complete,2.1479336329794023,24,False,3,39,0.16666666666666666,False,False
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,nationwide,3,on,best_effort,6.177769971021917,18,complete,1.1816401279938873,24,False,3,39,0.16666666666666666,False,False
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,illinois,1,off,timed_out,25.011352156987414,0,timed_out,25.043359153991332,0,True,,,,,
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,illinois,2,on,timed_out,25.02700879398617,0,timed_out,25.37159215999418,0,True,,,,,
+residency,common_limitations_discovery,statute of limitations discovery rule accrual,illinois,3,off,timed_out,25.007648538972717,0,timed_out,25.013365120976232,0,True,,,,,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",nationwide,1,on,timed_out,25.025763473007828,0,complete,1.285284206009237,1,False,,,,,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",nationwide,2,off,best_effort,6.049916215997655,0,complete,0.896914573997492,1,False,0,1,,False,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",nationwide,3,on,best_effort,5.852082853001775,0,complete,0.7761064909864217,1,False,0,1,,False,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",new_mexico,1,off,timed_out,25.0294951700198,0,complete,2.6192518289899454,0,False,,,,,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",new_mexico,2,on,best_effort,6.604716767993523,0,complete,1.463219855009811,0,False,0,0,,True,
+residency,uncommon_amended_settlement_release,"""amended settlement release""",new_mexico,3,off,timed_out,25.04480964699178,0,complete,1.4365970939979888,0,False,,,,,
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,nationwide,1,on,timed_out,25.01616485399427,0,timed_out,25.124956662999466,0,True,,,,,
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,nationwide,2,off,best_effort,6.704377101006685,21,complete,2.2240174409816973,23,False,0,44,0.0,False,False
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,nationwide,3,on,timed_out,25.03090075502405,0,complete,4.682465197984129,23,False,,,,,
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,illinois,1,off,timed_out,25.029375318001257,0,timed_out,25.009741196001414,0,True,,,,,
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,illinois,2,on,timed_out,25.01767831199686,0,timed_out,25.0296765230014,0,True,,,,,
+residency,uncommon_interpreting_settlement_release,interpreting settlement release,illinois,3,off,timed_out,25.027364795998437,0,timed_out,25.004156213981332,0,True,,,,,
+residency,uncommon_advocate_hospital,advocate hospital,nationwide,1,on,timed_out,25.04244788401411,0,timed_out,25.039238500990905,0,True,,,,,
+residency,uncommon_advocate_hospital,advocate hospital,nationwide,2,off,best_effort,6.553256410028553,21,complete,1.5030851240153424,17,False,0,38,0.0,False,False
+residency,uncommon_advocate_hospital,advocate hospital,nationwide,3,on,best_effort,5.9300343389913905,21,complete,4.277190222986974,17,False,0,38,0.0,False,False
+residency,uncommon_advocate_hospital,advocate hospital,illinois,1,off,timed_out,25.01537717800238,0,timed_out,25.033051190985134,0,True,,,,,
+residency,uncommon_advocate_hospital,advocate hospital,illinois,2,on,timed_out,25.099334456026554,0,timed_out,25.122593384003267,0,True,,,,,
+residency,uncommon_advocate_hospital,advocate hospital,illinois,3,off,timed_out,25.031983357999707,0,timed_out,25.04155422199983,0,True,,,,,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",nationwide,1,on,timed_out,25.14859416501713,0,timed_out,25.15118514900678,0,True,,,,,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",nationwide,2,off,best_effort,5.9413198590045795,0,best_effort,6.215961909998441,0,True,0,0,,True,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",nationwide,3,on,best_effort,5.842783895001048,0,best_effort,5.879919529019389,0,True,0,0,,True,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",new_mexico,1,off,timed_out,25.52413222400355,0,complete,2.0560619960015174,0,False,,,,,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",new_mexico,2,on,best_effort,6.6564598830009345,0,complete,1.6143360199930612,0,False,0,0,,True,
+residency,uncommon_spoliation_esi,"""spoliation instruction"" AND electronically stored information",new_mexico,3,off,timed_out,25.092648174002534,0,complete,1.8513172559905797,0,False,,,,,
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,nationwide,1,on,timed_out,25.03584528301144,0,timed_out,25.03511699999217,0,True,,,,,
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,nationwide,2,off,best_effort,6.426690481021069,2,best_effort,5.926488363009412,2,True,2,2,1.0,True,True
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,nationwide,3,on,best_effort,5.919803112978116,2,complete,1.2014077529893257,22,False,1,23,0.5,False,False
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,new_mexico,1,off,complete,1.3839766249875538,1,complete,1.0078972520132083,1,False,1,1,1.0,True,True
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,new_mexico,2,on,complete,0.910298323025927,1,complete,1.1696921050024685,1,False,1,1,1.0,True,True
+residency,uncommon_cy_pres,cy pres AND unclaimed class funds,new_mexico,3,off,complete,0.9598434139916208,1,complete,0.9717042870179284,1,False,1,1,1.0,True,True
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,nationwide,1,on,timed_out,25.038330983021297,0,timed_out,25.08510060000117,0,True,,,,,
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,nationwide,2,off,best_effort,6.516009542014217,17,complete,1.4662350500002503,19,False,0,36,0.0,False,False
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,nationwide,3,on,best_effort,6.183380878006574,17,complete,2.9397705359733663,19,False,0,36,0.0,False,False
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,illinois,1,off,timed_out,25.14860953297466,0,timed_out,25.13872392597841,0,True,,,,,
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,illinois,2,on,timed_out,25.031870959996013,0,timed_out,25.01979152401327,0,True,,,,,
+residency,uncommon_forum_non_conveniens,forum non conveniens AND private interest factors,illinois,3,off,complete,4.843380579986842,17,timed_out,25.015484108007513,0,True,,,,,
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,nationwide,1,on,timed_out,25.022730260010576,0,timed_out,25.043154537008377,0,True,,,,,
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,nationwide,2,off,best_effort,6.040406872984022,3,complete,4.665571737976279,23,False,0,26,0.0,False,False
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,nationwide,3,on,best_effort,5.865764985996066,3,complete,0.6095372149720788,23,False,0,26,0.0,False,False
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,new_mexico,1,off,complete,2.8029717179888394,5,complete,0.9668383249954786,5,False,5,5,1.0,False,True
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,new_mexico,2,on,complete,0.9256943259970285,5,complete,2.302704314002767,5,False,5,5,1.0,False,True
+residency,uncommon_equitable_subrogation,equitable subrogation AND volunteer doctrine,new_mexico,3,off,complete,1.8172283850144595,5,complete,0.9416411260026507,5,False,5,5,1.0,False,True
+residency,uncommon_market_share_liability,market share liability AND fungible product,nationwide,1,on,timed_out,25.03950193701894,0,timed_out,25.06052446400281,0,True,,,,,
+residency,uncommon_market_share_liability,market share liability AND fungible product,nationwide,2,off,best_effort,6.510804283985635,16,complete,2.801165682991268,20,False,0,36,0.0,False,False
+residency,uncommon_market_share_liability,market share liability AND fungible product,nationwide,3,on,best_effort,6.3047349370026495,16,complete,1.2788391970098019,20,False,0,36,0.0,False,False
+residency,uncommon_market_share_liability,market share liability AND fungible product,illinois,1,off,complete,2.983965717983665,6,complete,1.375033592019463,6,False,6,6,1.0,False,True
+residency,uncommon_market_share_liability,market share liability AND fungible product,illinois,2,on,complete,1.0153937730065081,6,complete,1.427423256012844,6,False,6,6,1.0,False,True
+residency,uncommon_market_share_liability,market share liability AND fungible product,illinois,3,off,complete,1.4068206679949071,6,complete,1.2010964849905577,6,False,6,6,1.0,False,True
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,nationwide,1,on,best_effort,5.749468016001629,21,best_effort,6.592777738987934,21,True,21,21,1.0,True,True
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,nationwide,2,off,best_effort,6.010019442997873,21,complete,2.1275846869975794,19,False,0,40,0.0,False,False
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,nationwide,3,on,best_effort,7.024568028980866,21,complete,4.5230430500232615,19,False,0,40,0.0,False,False
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,new_mexico,1,off,timed_out,25.030816249985946,0,timed_out,25.021916204015724,0,True,,,,,
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,new_mexico,2,on,best_effort,6.697187623009086,20,best_effort,7.0814470990153495,20,True,20,20,1.0,True,True
+residency,uncommon_diminished_capacity,diminished capacity AND specific intent,new_mexico,3,off,best_effort,6.832401799008949,20,best_effort,6.654961496009491,20,True,20,20,1.0,True,True
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,nationwide,1,on,timed_out,25.05757223800174,0,timed_out,25.101587224024115,0,True,,,,,
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,nationwide,2,off,best_effort,6.637884976022178,19,best_effort,6.042765060992679,19,True,19,19,1.0,True,True
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,nationwide,3,on,best_effort,6.105871854000725,19,complete,0.8712736089946702,20,False,0,39,0.0,False,False
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,illinois,1,off,timed_out,25.05266996199498,0,timed_out,25.027624000998912,0,True,,,,,
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,illinois,2,on,timed_out,25.046552660991438,0,timed_out,25.13494324099156,0,True,,,,,
+residency,uncommon_reverse_piercing,reverse piercing corporate veil,illinois,3,off,timed_out,25.049947135004913,0,complete,4.715105840004981,17,False,,,,,
+residency,uncommon_scriveners_error,scrivener's error AND reformation,nationwide,1,on,timed_out,25.034172131010564,0,timed_out,25.007987979013706,0,True,,,,,
+residency,uncommon_scriveners_error,scrivener's error AND reformation,nationwide,2,off,timed_out,25.05712491797749,0,complete,0.8545934820140246,22,False,,,,,
+residency,uncommon_scriveners_error,scrivener's error AND reformation,nationwide,3,on,timed_out,25.027477755007567,0,complete,4.7653397459944244,22,False,,,,,
+residency,uncommon_scriveners_error,scrivener's error AND reformation,new_mexico,1,off,timed_out,25.01931571800378,0,complete,4.166828766989056,8,False,,,,,
+residency,uncommon_scriveners_error,scrivener's error AND reformation,new_mexico,2,on,complete,0.9374897580128163,8,complete,3.0640873910160735,8,False,8,8,1.0,False,False
+residency,uncommon_scriveners_error,scrivener's error AND reformation,new_mexico,3,off,complete,2.2961665889888536,8,complete,1.1401231919880956,8,False,8,8,1.0,False,False
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,nationwide,1,on,timed_out,25.187717513996176,0,timed_out,25.089181804010877,0,True,,,,,
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,nationwide,2,off,best_effort,7.038290003984002,24,best_effort,6.385547110985499,24,True,24,24,1.0,True,True
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,nationwide,3,on,best_effort,6.073773190000793,24,complete,1.3838136380072683,21,False,1,44,0.047619047619047616,False,False
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,illinois,1,off,timed_out,25.031059211993124,0,timed_out,25.03095733601367,0,True,,,,,
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,illinois,2,on,timed_out,25.07161374099087,0,timed_out,25.009858982026344,0,True,,,,,
+residency,uncommon_loss_of_chance,loss of chance AND medical negligence,illinois,3,off,timed_out,25.040434405993437,0,timed_out,25.008346586982952,0,True,,,,,
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,nationwide,1,on,timed_out,25.021860451000975,0,timed_out,25.230229817010695,0,True,,,,,
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,nationwide,2,off,best_effort,6.60754714399809,17,best_effort,6.05307589500444,17,True,17,17,1.0,True,True
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,nationwide,3,on,timed_out,25.127255536004668,0,complete,2.2415759610012174,23,False,,,,,
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,new_mexico,1,off,timed_out,25.04722284799209,0,timed_out,25.063728805980645,0,True,,,,,
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,new_mexico,2,on,complete,1.283931740996195,2,complete,3.263368354004342,2,False,2,2,1.0,False,False
+residency,uncommon_state_created_danger,state-created danger AND deliberate indifference,new_mexico,3,off,complete,1.001456172001781,2,complete,1.4034982750017662,2,False,2,2,1.0,False,False
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,nationwide,1,on,timed_out,25.035678121988894,0,timed_out,25.033349029021338,0,True,,,,,
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,nationwide,2,off,timed_out,25.059402694983874,0,complete,2.786471622006502,24,False,,,,,
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,nationwide,3,on,best_effort,6.738027535000583,22,complete,4.580026165000163,24,False,1,45,0.045454545454545456,False,False
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,illinois,1,off,timed_out,25.020178456994472,0,timed_out,25.00511011297931,0,True,,,,,
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,illinois,2,on,timed_out,25.029255041008582,0,timed_out,25.220356836012797,0,True,,,,,
+residency,uncommon_judicial_estoppel,judicial estoppel AND inconsistent position,illinois,3,off,timed_out,25.01688916000421,0,timed_out,25.020406281022588,0,True,,,,,
+residency,uncommon_necessity_trespass,necessity defense AND trespass,nationwide,1,on,timed_out,25.043148895027116,0,timed_out,25.028860926016932,0,True,,,,,
+residency,uncommon_necessity_trespass,necessity defense AND trespass,nationwide,2,off,best_effort,6.430216969019966,23,complete,0.9386599260033108,24,False,0,47,0.0,False,False
+residency,uncommon_necessity_trespass,necessity defense AND trespass,nationwide,3,on,timed_out,25.014400778978597,0,complete,3.7175022570008878,24,False,,,,,
+residency,uncommon_necessity_trespass,necessity defense AND trespass,new_mexico,1,off,timed_out,25.02707819401985,0,timed_out,25.029908619006164,0,True,,,,,
+residency,uncommon_necessity_trespass,necessity defense AND trespass,new_mexico,2,on,timed_out,25.012762210011715,0,timed_out,25.003230379981687,0,True,,,,,
+residency,uncommon_necessity_trespass,necessity defense AND trespass,new_mexico,3,off,complete,3.8004661849990953,24,complete,2.250679064018186,25,False,15,34,0.625,False,False

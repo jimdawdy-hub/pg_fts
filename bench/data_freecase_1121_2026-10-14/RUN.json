@@ -1,0 +1,232 @@
+{
+  "schema": "pgfts-historical-query-comparison/v2",
+  "started_at": "2026-10-14T19:52:23.455036+00:00",
+  "lane": "direct search.search_opinions; not HTTP/API replication",
+  "database": "freecase_vm801",
+  "system_identifier": "7695560671403937875",
+  "extension_artifact_sha256": "b277a1fc2c588eef4c9833038ff1db2364c915f6465090e871f72054d38ca712",
+  "extension_source_base": "37801f3c6682ed0f00f36698b75daab6da0425fb",
+  "extension_upstream_tag": "4434607ff0f3fd57f39cced87b4b33e19a61497d",
+  "source_revision": "863c531252a2c28775c86134cc61df27a62d47cb",
+  "passes": 3,
+  "planned_searches": 450,
+  "historical_memory_repetitions": 30,
+  "comparison_memory_repetitions": 3,
+  "cache_policy": "untimed minimal per-backend initialization; first measured pass separate from repeats; shared cache, no dropping/preload; stable cell/pass alternating lead",
+  "arm_labels": {
+    "off": "pgfts-branch flag off, legacy retrieval",
+    "on": "1.12.1-freecase engine; unchanged app flag on, legacy bounded fallback"
+  },
+  "connection_policy": "two persistent worker processes, one fixed engine and guarded read-only backend each; serialized searches and rollback between leases",
+  "parameters": {
+    "precedential": true,
+    "limit": 25,
+    "AI_rerank": false,
+    "API_fast_lane": false
+  },
+  "metadata_before": {
+    "settings": [
+      [
+        "cpu_index_tuple_cost",
+        "0.005",
+        null,
+        "default"
+      ],
+      [
+        "cpu_operator_cost",
+        "0.0025",
+        null,
+        "default"
+      ],
+      [
+        "cpu_tuple_cost",
+        "0.01",
+        null,
+        "default"
+      ],
+      [
+        "default_statistics_target",
+        "100",
+        null,
+        "default"
+      ],
+      [
+        "effective_cache_size",
+        "524288",
+        "8kB",
+        "default"
+      ],
+      [
+        "effective_io_concurrency",
+        "16",
+        null,
+        "default"
+      ],
+      [
+        "from_collapse_limit",
+        "8",
+        null,
+        "default"
+      ],
+      [
+        "jit",
+        "on",
+        null,
+        "default"
+      ],
+      [
+        "join_collapse_limit",
+        "8",
+        null,
+        "default"
+      ],
+      [
+        "max_parallel_workers_per_gather",
+        "4",
+        null,
+        "client"
+      ],
+      [
+        "random_page_cost",
+        "4",
+        null,
+        "default"
+      ],
+      [
+        "seq_page_cost",
+        "1",
+        null,
+        "default"
+      ],
+      [
+        "shared_buffers",
+        "1048576",
+        "8kB",
+        "configuration file"
+      ],
+      [
+        "work_mem",
+        "65536",
+        "kB",
+        "client"
+      ]
+    ],
+    "index": [
+      "idx_so_pgfts_body",
+      true,
+      true,
+      33735385088,
+      [
+        "positions=on"
+      ]
+    ],
+    "extension_version": "1.12.1",
+    "other_activity": []
+  },
+  "workload_hashes": {
+    "memory-workload.json": "9ce347a8258671ea0f47072eef4668ae85a59795b9fc44de68ea6ba00687e9a5",
+    "residency-workload.json": "ac4765b307556fd0cd21875108fc3b5b88a8569b53ae217792af3e7e427879be"
+  },
+  "status": "complete",
+  "finished_at": "2026-10-14T21:43:11.756538+00:00",
+  "completed_searches": 450,
+  "metadata_after": {
+    "settings": [
+      [
+        "cpu_index_tuple_cost",
+        "0.005",
+        null,
+        "default"
+      ],
+      [
+        "cpu_operator_cost",
+        "0.0025",
+        null,
+        "default"
+      ],
+      [
+        "cpu_tuple_cost",
+        "0.01",
+        null,
+        "default"
+      ],
+      [
+        "default_statistics_target",
+        "100",
+        null,
+        "default"
+      ],
+      [
+        "effective_cache_size",
+        "524288",
+        "8kB",
+        "default"
+      ],
+      [
+        "effective_io_concurrency",
+        "16",
+        null,
+        "default"
+      ],
+      [
+        "from_collapse_limit",
+        "8",
+        null,
+        "default"
+      ],
+      [
+        "jit",
+        "on",
+        null,
+        "default"
+      ],
+      [
+        "join_collapse_limit",
+        "8",
+        null,
+        "default"
+      ],
+      [
+        "max_parallel_workers_per_gather",
+        "4",
+        null,
+        "client"
+      ],
+      [
+        "random_page_cost",
+        "4",
+        null,
+        "default"
+      ],
+      [
+        "seq_page_cost",
+        "1",
+        null,
+        "default"
+      ],
+      [
+        "shared_buffers",
+        "1048576",
+        "8kB",
+        "configuration file"
+      ],
+      [
+        "work_mem",
+        "65536",
+        "kB",
+        "client"
+      ]
+    ],
+    "index": [
+      "idx_so_pgfts_body",
+      true,
+      true,
+      33735385088,
+      [
+        "positions=on"
+      ]
+    ],
+    "extension_version": "1.12.1",
+    "other_activity": []
+  }
+}

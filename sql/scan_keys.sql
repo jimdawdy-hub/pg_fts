@@ -1,0 +1,127 @@
+-- scan_keys (1.12.1): every scan path must return exactly what a sequential scan
+-- returns, for the query shapes that were wrong through the index until 1.12.1:
+--   GitHub #8   NOT over a phrase/NEAR (and, found with it, over fuzzy terms and
+--               fuzzy terms ORed with a plain term) under-counted;
+--   GitHub #9   WHERE q1 ORDER BY d <=> q2 filtered by q2 instead of q1;
+--   GitHub #10  a second @@@ key on the same index was never applied;
+--   a NULL ORDER BY argument crashed the backend.
+SET client_min_messages = warning;
+
+-- every combination of: alpha?, "bravo cherry" adjacent / apart / absent,
+-- delta?, brave? -- 64 documents
+CREATE TABLE sk (id int PRIMARY KEY, d ftsdoc);
+INSERT INTO sk SELECT g, to_ftsdoc('simple',
+   CASE WHEN g & 1 > 0 THEN 'alpha ' ELSE '' END ||
+   CASE (g >> 1) % 3 WHEN 0 THEN 'bravo cherry ' WHEN 1 THEN 'bravo x cherry ' ELSE '' END ||
+   CASE WHEN g & 8 > 0 THEN 'delta ' ELSE '' END ||
+   CASE WHEN g & 16 > 0 THEN 'brave ' ELSE '' END || 'filler')
+FROM generate_series(0, 63) g;
+CREATE INDEX sk_fts ON sk USING fts (d) WITH (trigrams = on);
+CREATE INDEX sk_pos ON sk USING fts (d) WITH (positions = on);
+VACUUM ANALYZE sk;
+
+CREATE TABLE skq (q text PRIMARY KEY);
+INSERT INTO skq VALUES
+ ('alpha & !"bravo cherry"'), ('!"bravo cherry"'), ('alpha & !!"bravo cherry"'), ('!!"bravo cherry"'),
+ ('alpha & !("bravo cherry" | delta)'), ('!"bravo cherry" | delta'), ('!(alpha & !"bravo cherry")'),
+ ('alpha & !(delta | !"bravo cherry")'), ('!(!"bravo cherry" & !delta)'), ('("bravo cherry" | delta) & !alpha'),
+ ('!("bravo cherry" & delta)'), ('alpha | !"bravo cherry"'), ('!(alpha | "bravo cherry")'),
+ ('alpha & !bravo~1'), ('!bravo~1'), ('delta | bravo~1'), ('filler | bravo~1'), ('!delta & bravo~1'),
+ ('alpha & !(delta | bravo~1)'), ('alpha & !/brav.*/'), ('delta | /brav.*/'), ('alpha & !brav*'),
+ ('delta | "bravo cherry"'), ('alpha & !NEAR(bravo cherry, 2)'), ('!NEAR(bravo cherry, 1)'),
+ ('alpha & !(bravo & "x cherry")'), ('"bravo cherry" & !"x cherry"'), ('!("bravo cherry" | "x cherry")');
+
+-- ids matching q through the current plan
+CREATE FUNCTION sk_ids(q text) RETURNS text LANGUAGE sql AS $$
+  SELECT coalesce(string_agg(id::text, ',' ORDER BY id), '-') FROM sk WHERE d @@@ q::ftsquery $$;
+
+CREATE TABLE skr (q text, how text, ids text);
+-- truth: sequential scan (the heap matcher)
+SET enable_indexscan = off; SET enable_bitmapscan = off;
+INSERT INTO skr SELECT q, 'seq', sk_ids(q) FROM skq;
+RESET enable_indexscan; RESET enable_bitmapscan;
+SET enable_seqscan = off;
+-- each index alone, bitmap and plain index scan
+UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'sk_pos'::regclass;
+SET enable_indexscan = off;
+INSERT INTO skr SELECT q, 'bitmap', sk_ids(q) FROM skq;
+RESET enable_indexscan; SET enable_bitmapscan = off;
+INSERT INTO skr SELECT q, 'index', sk_ids(q) FROM skq;
+RESET enable_bitmapscan;
+UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'sk_pos'::regclass;
+UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'sk_fts'::regclass;
+SET enable_indexscan = off;
+INSERT INTO skr SELECT q, 'bitmap_pos', sk_ids(q) FROM skq;
+RESET enable_indexscan; SET enable_bitmapscan = off;
+INSERT INTO skr SELECT q, 'index_pos', sk_ids(q) FROM skq;
+RESET enable_bitmapscan;
+UPDATE pg_index SET indisvalid = true WHERE indexrelid = 'sk_fts'::regclass;
+RESET enable_seqscan;
+
+-- every index path agrees with the sequential scan, and the truth is non-trivial
+SELECT count(*) AS results, count(*) FILTER (WHERE r.ids <> t.ids) AS wrong
+FROM skr r JOIN skr t ON t.q = r.q AND t.how = 'seq' WHERE r.how <> 'seq';
+SELECT r.q, r.how, r.ids AS got, t.ids AS want
+FROM skr r JOIN skr t ON t.q = r.q AND t.how = 'seq' WHERE r.how <> 'seq' AND r.ids <> t.ids ORDER BY 1, 2;
+SELECT count(*) FILTER (WHERE ids <> '-') AS nonempty_truths, count(*) AS queries FROM skr WHERE how = 'seq';
+
+-- #9 and #10 (the reporter's table), plain index scans
+CREATE TABLE sk9 (id int, d ftsdoc);
+INSERT INTO sk9 VALUES (1, to_ftsdoc('simple', 'apple cherry')), (2, to_ftsdoc('simple', 'apple')),
+                       (3, to_ftsdoc('simple', 'cherry cherry'));
+CREATE INDEX sk9_fts ON sk9 USING fts (d);
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+-- #9: rows are the WHERE set, ranked by the ORDER BY query
+SELECT string_agg(id::text, ',') AS where_apple_order_cherry
+FROM (SELECT id FROM sk9 WHERE d @@@ 'apple'::ftsquery ORDER BY d <=> 'cherry'::ftsquery LIMIT 10) s;
+-- #10: both keys apply
+SELECT string_agg(id::text, ',' ORDER BY id) AS apple_and_cherry_keys
+FROM sk9 WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+SET enable_indexscan = off; RESET enable_bitmapscan;
+SELECT string_agg(id::text, ',' ORDER BY id) AS apple_and_cherry_keys_bitmap
+FROM sk9 WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery;
+RESET enable_indexscan; SET enable_bitmapscan = off;
+-- two keys with an ORDER BY equal to the first key
+SELECT string_agg(id::text, ',') AS two_keys_ranked
+FROM (SELECT id FROM sk9 WHERE d @@@ 'apple'::ftsquery AND d @@@ 'cherry'::ftsquery
+      ORDER BY d <=> 'apple'::ftsquery LIMIT 10) s;
+
+-- the split scan's order equals the index's own BM25 order (WHERE != ORDER BY),
+-- over two segments with deletes: no adjacent pair out of order
+INSERT INTO sk SELECT 100 + g, to_ftsdoc('simple', 'alpha ' || repeat('cherry ', 1 + g % 4) || 'n' || g)
+FROM generate_series(1, 300) g;
+DELETE FROM sk WHERE id % 13 = 0;
+VACUUM sk;
+CREATE TEMP TABLE sko AS
+SELECT row_number() OVER () AS rn, id,
+       fts_bm25(d, 'cherry'::ftsquery, (SELECT ndocs FROM fts_index_stats('sk_fts')),
+                (SELECT avgdl FROM fts_index_stats('sk_fts')),
+                ARRAY[(SELECT unnest(fts_index_df('sk_fts', 'cherry'::ftsquery)))::float8]) AS sc
+FROM (SELECT id, d FROM sk WHERE d @@@ 'alpha'::ftsquery ORDER BY d <=> 'cherry'::ftsquery) s;
+SELECT count(*) AS split_rows,
+       count(*) = (SELECT count(*) FROM sk WHERE fts_match(d, 'alpha'::ftsquery)) AS all_where_rows,
+       count(DISTINCT id) = count(*) AS no_duplicates,
+       (SELECT count(*) FROM sko a JOIN sko b ON b.rn = a.rn + 1 WHERE b.sc > a.sc + 1e-9) AS order_violations
+FROM sko;
+
+-- NULL arguments: no crash; a NULL WHERE key matches nothing, a NULL ORDER BY
+-- returns the WHERE rows with NULL distances
+-- a custom plan folds `d @@@ NULL` to false before the index is reached; a
+-- generic plan passes the NULL to the scan at run time
+SET plan_cache_mode = force_generic_plan;
+PREPARE skw(ftsquery) AS SELECT count(*) FROM sk9 WHERE d @@@ $1;
+EXPLAIN (COSTS OFF) EXECUTE skw(NULL);
+EXECUTE skw(NULL);
+PREPARE skw2(ftsquery) AS SELECT count(*) FROM (SELECT 1 FROM sk9 WHERE d @@@ $1 ORDER BY d <=> 'apple'::ftsquery LIMIT 5) s;
+EXECUTE skw2(NULL);
+PREPARE sko2(ftsquery) AS
+  SELECT count(*) AS rows, count(dd) AS nonnull_distances
+  FROM (SELECT d <=> $1 AS dd FROM sk9 WHERE d @@@ 'apple'::ftsquery ORDER BY d <=> $1) s;
+EXECUTE sko2(NULL);
+PREPARE sko3(ftsquery) AS SELECT count(*) FROM (SELECT 1 FROM sk9 ORDER BY d <=> $1 LIMIT 5) s;
+EXECUTE sko3(NULL);
+SELECT 'alive' AS server;
+
+RESET ALL;
+DROP TABLE sk, skq, skr, sk9;
+DROP FUNCTION sk_ids(text);

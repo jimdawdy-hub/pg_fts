@@ -924,6 +924,15 @@ SELECT * FROM messages
       <varname>pg_fts.shared_doclen</varname>), so this budget is per index
       segment, not per backend.
      </para>
+     <para>
+      Since 1.12.0 the same budget also holds a per-backend copy of each
+      segment's dictionary index (one entry per dictionary page, about 1 MB
+      on a 2.2-million-document index), so a ranked query finds a term's
+      dictionary page without reading the index's page chain.  A segment that
+      does not fit keeps the page-chain lookup; results are identical either
+      way.  Changing the setting in a session takes effect on that session's
+      next ranked query.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -943,6 +952,15 @@ SELECT * FROM messages
       by about a third between 16 and 64 clients.  If shared memory is
       unavailable (for example <filename>/dev/shm</filename> is full) a query
       silently uses a private copy instead.  Only superusers can change it.
+     </para>
+     <para>
+      It is a trade, not a strict improvement.  With as many clients as cores,
+      private copies can be faster: by 8-21% on cloud hosts where memory
+      access with 4&nbsp;KiB pages is slow, by about 1% where it is fast.  With
+      more clients than cores the shared copy is faster everywhere (2-17% at
+      four times as many clients as cores).  The default favours the
+      oversubscribed case; measure both on your hardware if you run at about one
+      client per core.
      </para>
     </listitem>
    </varlistentry>

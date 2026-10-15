@@ -1,0 +1,7 @@
+{
+  "index_identity_and_size_equal": true,
+  "match_count_equal": true,
+  "top150_ordered_ids_equal": true,
+  "installed_new_hash": true,
+  "installed_new_version": true
+}

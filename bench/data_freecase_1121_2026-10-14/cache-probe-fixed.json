@@ -1,0 +1,10 @@
+{
+  "variant": "fixed",
+  "cycles": 30,
+  "before_bytes": 735104,
+  "after_bytes": 723248,
+  "growth_bytes": -11856,
+  "unfinished_build_contexts": 0,
+  "so_sha256": "4e4d6f656d8832aca7024cc06e6cea14287d2b8a4dbd2f2e0a3cd53279c59817",
+  "method": "Private build injects SQLSTATE57014 after dictionary/slot cache allocations and before publish; tests actual ERROR cleanup in one persistent backend."
+}

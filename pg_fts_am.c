@@ -2515,12 +2515,38 @@ typedef struct BM25DoclenDir
 	Size		slot_byte_off;	/* uint8 bytes[base[slot_nblk]] */
 } BM25DoclenDir;
 
+/*
+ * I7 (1.12.0): one segment's dictionary-index directory, cached so a
+ * dictionary seek binary-searches memory instead of re-reading the index chain
+ * under buffer pins and share locks.  `n` entries at `entry_off` (bytes from the
+ * chunk start): uint32 offsets into a packed (blk uint32, termlen uint32,
+ * term[]) region, sorted exactly as on disk.  Keyed by the segment's
+ * (dictstart, dictindexstart); a segment's dict pages are immutable while it is
+ * listed, and any listing change bumps the metapage generation, which rebuilds
+ * the chunk.  n == 0: not cached (no index, malformed chain, or over budget) ->
+ * the chain walk.
+ */
+typedef struct BM25DictDir
+{
+	BlockNumber dictstart;
+	BlockNumber dictindexstart;
+	uint32		nterms;			/* identity, with ndocs/sumdoclen: see bm25_dictdir_find */
+	double		ndocs;
+	double		sumdoclen;
+	uint32		n;
+	Size		entry_off;		/* uint32 off[n], each to a packed entry */
+} BM25DictDir;
+
 typedef struct BM25DoclenDirCache
 {
 	uint32		generation;		/* metapage generation this cache was built at */
 	bool		private_slots;	/* built with per-backend slot arrays (shared off) */
 	int			nsegs;
 	int			ndocid;			/* total entries across all segs (docid[] len) */
+	Size		used;			/* bytes of this chunk in use (appenders copy this much) */
+	int			budget_mb;		/* pg_fts.doclen_cache_mb it was built under */
+	int			ndictdirs;		/* I7: dictionary-index directories cached */
+	BM25DictDir dictdirs[BM25_MAX_SEGMENTS];
 	BM25DoclenDir segs[BM25_MAX_SEGMENTS];
 	/* packed regions follow in the SAME allocation: uint64 docid[ndocid] then
 	 * BlockNumber blk[ndocid].  Accessed via the *_off indices above. */
@@ -2624,6 +2650,8 @@ bm25_doclendir_count_seg(Relation index, BlockNumber start)
  * has a sidecar (nothing to cache).
  */
 static BM25DoclenDirCache *bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc);
+static BM25DoclenDirCache *bm25_dictdir_add(Relation index, const BM25MetaPageData *meta,
+											BM25DoclenDirCache *dc);
 
 static BM25DoclenDirCache *
 bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
@@ -2633,10 +2661,20 @@ bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 	uint32		s;
 	int			pos = 0;
 	Size		sz;
-	MemoryContext old;
+	MemoryContext parent = CurrentMemoryContext;
+	MemoryContext buildctx;
+	BM25DoclenDirCache *result = NULL;
 
+	/*
+	 * Valid only for the generation AND the settings it was built under: the
+	 * slot arrays and (1.12.0) the dictionary directories are both sized by
+	 * pg_fts.doclen_cache_mb, so a chunk built at 64 MB must not keep serving a
+	 * session that has since SET it to 0 (until 1.12.0 it did, so "0 disables"
+	 * only took effect at the next directory change).
+	 */
 	if (dc != NULL && dc->generation == meta->generation &&
-		dc->private_slots == !(pg_fts_shared_doclen && IsUnderPostmaster))
+		dc->private_slots == !(pg_fts_shared_doclen && IsUnderPostmaster) &&
+		dc->budget_mb == pg_fts_doclen_cache_mb)
 		return dc;
 
 	/* stale or absent: drop the old single chunk, rebuild */
@@ -2663,37 +2701,59 @@ bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 	sz = offsetof(BM25DoclenDirCache, data) +
 		(Size) total *sizeof(uint64) +		/* docid[] */
 		(Size) total *sizeof(uint64);		/* blk[] (one BlockNumber per uint64 slot) */
-	old = MemoryContextSwitchTo(CacheMemoryContext);
-	dc = (BM25DoclenDirCache *) palloc0(sz);
-	MemoryContextSwitchTo(old);
-	dc->generation = meta->generation;
-	dc->private_slots = !(pg_fts_shared_doclen && IsUnderPostmaster);
-	dc->ndocid = total;
-	dc->nsegs = 0;
-
+	/* A canceled first-use rebuild must not leave an unreachable chunk in
+	 * CacheMemoryContext. Build in an attempt-owned context, then publish one
+	 * complete offset-based chunk only after every interruptible step succeeds. */
+	buildctx = AllocSetContextCreate(parent, "pg_fts cache build",
+									ALLOCSET_DEFAULT_SIZES);
+	PG_TRY();
 	{
-		uint64	   *docid = dc->data;
-		BlockNumber *blk = (BlockNumber *) (dc->data + total);	/* NB: BlockNumber slots */
+		MemoryContextSwitchTo(buildctx);
+		dc = (BM25DoclenDirCache *) palloc0(sz);
+		dc->generation = meta->generation;
+		dc->private_slots = !(pg_fts_shared_doclen && IsUnderPostmaster);
+		dc->ndocid = total;
+		dc->nsegs = 0;
+		dc->used = sz;
+		dc->budget_mb = pg_fts_doclen_cache_mb;
 
-		for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
 		{
-			int			startpos = pos;
-			int			n;
+			uint64	   *docid = dc->data;
+			BlockNumber *blk = (BlockNumber *) (dc->data + total);	/* NB: BlockNumber slots */
 
-			if (meta->segs[s].doclenstart == InvalidBlockNumber)
-				continue;
-			n = bm25_doclendir_scan_seg(index, meta->segs[s].doclenstart,
-										docid, blk, total, &pos);
-			dc->segs[dc->nsegs].start = meta->segs[s].doclenstart;
-			dc->segs[dc->nsegs].n = n;
-			dc->segs[dc->nsegs].docid_off = startpos;
-			dc->segs[dc->nsegs].blk_off = startpos;
-			dc->nsegs++;
+			for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
+			{
+				int			startpos = pos;
+				int			n;
+
+				if (meta->segs[s].doclenstart == InvalidBlockNumber)
+					continue;
+				n = bm25_doclendir_scan_seg(index, meta->segs[s].doclenstart,
+											docid, blk, total, &pos);
+				dc->segs[dc->nsegs].start = meta->segs[s].doclenstart;
+				dc->segs[dc->nsegs].n = n;
+				dc->segs[dc->nsegs].docid_off = startpos;
+				dc->segs[dc->nsegs].blk_off = startpos;
+				dc->nsegs++;
+			}
 		}
+		dc = bm25_doclendir_add_slots(index, dc);
+		dc = bm25_dictdir_add(index, meta, dc);
+
+		result = (BM25DoclenDirCache *) MemoryContextAlloc(CacheMemoryContext, dc->used);
+		memcpy(result, dc, dc->used);
+		MemoryContextSwitchTo(parent);
+		MemoryContextDelete(buildctx);
 	}
-	dc = bm25_doclendir_add_slots(index, dc);
-	index->rd_amcache = (void *) dc;
-	return dc;
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(parent);
+		MemoryContextDelete(buildctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	index->rd_amcache = (void *) result;
+	return result;
 }
 
 /* GUC (1.9.0, C1): budget in MB for the resident slot-indexed doclen arrays a
@@ -2883,10 +2943,11 @@ bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc)
 		return dc;
 	}
 	/* one chunk: the existing header + directory, then each segment's arrays */
-	old = MemoryContextSwitchTo(CacheMemoryContext);
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(dc));
 	out = (BM25DoclenDirCache *) palloc(MAXALIGN(basesz) + extra);
 	MemoryContextSwitchTo(old);
 	memcpy(out, dc, basesz);
+	out->used = MAXALIGN(basesz) + extra;
 	{
 		Size		pos = MAXALIGN(basesz);
 
@@ -2907,6 +2968,244 @@ bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc)
 	MemoryContextDelete(tmp);
 	pfree(dc);
 	return out;
+}
+
+/*
+ * I7 (1.12.0): append each segment's dictionary-index directory to the chunk.
+ *
+ * Why: a ranked query looks up each term in each segment up to three times
+ * (maxhits bound, global df, cursor), and every lookup walked the segment's
+ * dictionary-index chain from its head -- up to 85 pages on 2.19M Wikipedia,
+ * each a buffer pin plus a share lock on a page EVERY concurrent query reads.
+ * A rare top-10 read 278 shared buffers, ~200 of them on that chain; on a host
+ * where cache-line transfer is slow those pins and locks were the largest
+ * per-query cost to grow with concurrency (bench/RESULTS_TPS_VARIANCE).  The
+ * chain is immutable while the segment is listed, so read it once per backend
+ * and generation, like the doclen directory above, and search memory.
+ *
+ * Budget: shares pg_fts.doclen_cache_mb with the slot arrays; a segment whose
+ * directory would exceed what is left is simply not cached (chain walk).  A
+ * malformed chain (an entry running off its page, a term longer than a page)
+ * is not cached either: the chain walk stops at the same place, so the answer
+ * is unchanged.  Everything stays ONE chunk (rd_amcache's contract).
+ */
+static BM25DoclenDirCache *
+bm25_dictdir_add(Relation index, const BM25MetaPageData *meta, BM25DoclenDirCache *dc)
+{
+	Size		budget = (Size) pg_fts_doclen_cache_mb * 1024 * 1024;
+	Size		have = dc->used;
+	MemoryContext tmp,
+				old;
+	char	   *buf[BM25_MAX_SEGMENTS];
+	Size		len[BM25_MAX_SEGMENTS];
+	uint32		cnt[BM25_MAX_SEGMENTS];
+	Size		extra = 0;
+	uint32		s;
+	BM25DoclenDirCache *out;
+
+	dc->ndictdirs = 0;
+	if (budget == 0)
+		return dc;
+	tmp = AllocSetContextCreate(CurrentMemoryContext, "pg_fts dict directory",
+								ALLOCSET_DEFAULT_SIZES);
+	old = MemoryContextSwitchTo(tmp);
+	for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
+	{
+		const BM25SegMeta *sg = &meta->segs[s];
+		BlockNumber iblk = sg->dictindexstart;
+		StringInfoData packed;		/* (blk, termlen, term) entries, MAXALIGNed */
+		uint32		n = 0;
+		uint32		visited = 0;
+		BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+		bool		ok = true;
+
+		buf[s] = NULL;
+		len[s] = 0;
+		cnt[s] = 0;
+		if (sg->dictstart == InvalidBlockNumber || iblk == InvalidBlockNumber)
+			continue;
+		initStringInfo(&packed);
+		while (iblk != InvalidBlockNumber && ok)
+		{
+			Buffer		b;
+			Page		page;
+			char	   *ptr,
+					   *end;
+
+			CHECK_FOR_INTERRUPTS();
+			if (iblk >= nblocks || ++visited > nblocks)
+			{
+				ok = false;		/* past EOF or a cycle: leave it to the chain walk */
+				break;
+			}
+			b = bm25_readbuf(index, iblk);
+			LockBuffer(b, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(b);
+			if (PageIsNew(page) || !(BM25PageGetOpaque(page)->flags & BM25_DICTINDEX))
+			{
+				UnlockReleaseBuffer(b);
+				ok = false;
+				break;
+			}
+			ptr = (char *) PageGetContents(page);
+			end = bm25_page_data_end(page);
+			if (!(ptr + offsetof(BM25DictIndexEntry, term) <= end))
+			{
+				/* an empty index page ends bm25_dict_seek's walk: end the
+				 * directory there too, so both search the same entries */
+				UnlockReleaseBuffer(b);
+				break;
+			}
+			/* the same entry walk and bounds as bm25_dict_seek */
+			while (ptr + offsetof(BM25DictIndexEntry, term) <= end)
+			{
+				BM25DictIndexEntry *ie = (BM25DictIndexEntry *) ptr;
+				Size		esz = MAXALIGN(offsetof(BM25DictIndexEntry, term) + ie->termlen);
+
+				if (ie->termlen > BLCKSZ || ptr + esz > end + MAXIMUM_ALIGNOF)
+				{
+					ok = false;
+					break;
+				}
+				if ((Size) packed.len + esz > budget)
+				{
+					ok = false;	/* cannot fit the budget: stop reading */
+					break;
+				}
+				appendBinaryStringInfo(&packed, (char *) ie,
+									   offsetof(BM25DictIndexEntry, term) + ie->termlen);
+				while (packed.len % MAXIMUM_ALIGNOF)
+					appendStringInfoChar(&packed, '\0');
+				n++;
+				ptr += esz;
+			}
+			iblk = BM25PageGetOpaque(page)->nextblk;
+			UnlockReleaseBuffer(b);
+		}
+		if (!ok || n == 0)
+			continue;
+		if (have + extra + MAXALIGN((Size) n * sizeof(uint32)) + MAXALIGN(packed.len) > budget ||
+			have + extra + MAXALIGN((Size) n * sizeof(uint32)) + MAXALIGN(packed.len) > MaxAllocSize / 2)
+			continue;			/* over budget: chain walk for this segment */
+		buf[s] = packed.data;
+		len[s] = packed.len;
+		cnt[s] = n;
+		extra += MAXALIGN((Size) n * sizeof(uint32)) + MAXALIGN(packed.len);
+	}
+	MemoryContextSwitchTo(old);
+	if (extra == 0)
+	{
+		MemoryContextDelete(tmp);
+		return dc;
+	}
+	{
+		Size		used = MAXALIGN(dc->used);
+		Size		pos;
+
+		old = MemoryContextSwitchTo(GetMemoryChunkContext(dc));
+		out = (BM25DoclenDirCache *) palloc(used + extra);
+		MemoryContextSwitchTo(old);
+		memcpy(out, dc, dc->used);
+		pos = used;
+		out->ndictdirs = 0;
+		out->used = used + extra;
+		for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
+		{
+			BM25DictDir *dd;
+			uint32	   *offs;
+			Size		e;
+			uint32		k;
+
+			if (cnt[s] == 0)
+				continue;
+			dd = &out->dictdirs[out->ndictdirs++];
+			dd->dictstart = meta->segs[s].dictstart;
+			dd->dictindexstart = meta->segs[s].dictindexstart;
+			dd->nterms = meta->segs[s].nterms;
+			dd->ndocs = meta->segs[s].ndocs;
+			dd->sumdoclen = meta->segs[s].sumdoclen;
+			dd->n = cnt[s];
+			dd->entry_off = pos;
+			offs = (uint32 *) ((char *) out + pos);
+			pos += MAXALIGN((Size) cnt[s] * sizeof(uint32));
+			memcpy((char *) out + pos, buf[s], len[s]);
+			for (e = 0, k = 0; k < cnt[s]; k++)
+			{
+				const BM25DictIndexEntry *ie = (const BM25DictIndexEntry *) (buf[s] + e);
+
+				offs[k] = (uint32) (pos + e);
+				e += MAXALIGN(offsetof(BM25DictIndexEntry, term) + ie->termlen);
+			}
+			pos += MAXALIGN(len[s]);
+		}
+	}
+	MemoryContextDelete(tmp);
+	pfree(dc);
+	return out;
+}
+
+/*
+ * The cached dictionary-index directory of `seg` in `dc`, or NULL (not cached:
+ * use the chain walk).
+ *
+ * The guard is the chunk's metapage generation (bm25_doclendir_cache rebuilds
+ * when it moves).  The key is defence in depth, as for the shared doclen copies
+ * (pg_fts_shdoclen.c): both chain heads plus the segment's nterms, ndocs and
+ * sumdoclen, none of which a segment changes while it is listed (VACUUM rewrites
+ * only tombstones).  A new segment can only match a stale entry if it starts
+ * on the same recycled blocks AND has identical counts; the recycle gate keeps
+ * a freed page from being reused while a snapshot that could see it is alive.
+ * For the same reason a test cannot make a stale entry match on purpose:
+ * dict_dir checks the lookup itself and the not-found fallback.
+ */
+static const BM25DictDir *
+bm25_dictdir_find(const BM25DoclenDirCache *dc, const BM25SegMeta *seg)
+{
+	int			i;
+
+	if (dc == NULL)
+		return NULL;
+	for (i = 0; i < dc->ndictdirs; i++)
+		if (dc->dictdirs[i].dictindexstart == seg->dictindexstart &&
+			dc->dictdirs[i].dictstart == seg->dictstart &&
+			dc->dictdirs[i].nterms == seg->nterms &&
+			dc->dictdirs[i].ndocs == seg->ndocs &&
+			dc->dictdirs[i].sumdoclen == seg->sumdoclen)
+			return &dc->dictdirs[i];
+	return NULL;
+}
+
+/* bm25_dict_seek over a cached directory: the dict page whose first term is
+ * the largest <= term (the same comparison, in memory), or dictstart. */
+static BlockNumber
+bm25_dictdir_seek(const BM25DoclenDirCache *dc, const BM25DictDir *dd,
+				  BlockNumber dictstart, const char *term, int termlen)
+{
+	const uint32 *offs = (const uint32 *) ((const char *) dc + dd->entry_off);
+	int			lo = 0,
+				hi = (int) dd->n - 1,
+				cand = -1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) >> 1;
+		const BM25DictIndexEntry *ie = (const BM25DictIndexEntry *) ((const char *) dc + offs[mid]);
+		int			cmplen = Min((int) ie->termlen, termlen);
+		int			c = memcmp(ie->term, term, cmplen);
+
+		if (c == 0)
+			c = (int) ie->termlen - termlen;
+		if (c <= 0)
+		{
+			cand = mid;
+			lo = mid + 1;
+		}
+		else
+			hi = mid - 1;
+	}
+	return cand >= 0
+		? ((const BM25DictIndexEntry *) ((const char *) dc + offs[cand]))->blk
+		: dictstart;
 }
 
 /* the shared-memory copies of the slot arrays (1.10.0) */

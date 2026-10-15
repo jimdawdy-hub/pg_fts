@@ -1,0 +1,111 @@
+{
+  "searches": 450,
+  "per_mode": {
+    "off": 225,
+    "on": 225
+  },
+  "backend_pids": {
+    "off": 88850,
+    "on": 88853
+  },
+  "coverage": {
+    "off": {
+      "timed_out": 108,
+      "complete": 33,
+      "best_effort": 84
+    },
+    "on": {
+      "timed_out": 90,
+      "complete": 98,
+      "best_effort": 37
+    }
+  },
+  "by_pass": [
+    {
+      "pass": 1,
+      "engine": "off",
+      "coverage": {
+        "timed_out": 63,
+        "complete": 6,
+        "best_effort": 6
+      },
+      "median_seconds": 25.025132166978437
+    },
+    {
+      "pass": 1,
+      "engine": "on",
+      "coverage": {
+        "timed_out": 57,
+        "complete": 14,
+        "best_effort": 4
+      },
+      "median_seconds": 25.032273428019835
+    },
+    {
+      "pass": 2,
+      "engine": "off",
+      "coverage": {
+        "timed_out": 22,
+        "best_effort": 41,
+        "complete": 12
+      },
+      "median_seconds": 6.637884976022178
+    },
+    {
+      "pass": 2,
+      "engine": "on",
+      "coverage": {
+        "timed_out": 19,
+        "complete": 34,
+        "best_effort": 22
+      },
+      "median_seconds": 5.7322934700059704
+    },
+    {
+      "pass": 3,
+      "engine": "off",
+      "coverage": {
+        "complete": 15,
+        "best_effort": 37,
+        "timed_out": 23
+      },
+      "median_seconds": 6.364400288002798
+    },
+    {
+      "pass": 3,
+      "engine": "on",
+      "coverage": {
+        "complete": 50,
+        "best_effort": 11,
+        "timed_out": 14
+      },
+      "median_seconds": 3.7473664870194625
+    }
+  ],
+  "scopes": {
+    "nationwide": {
+      "off": {
+        "samples": 66,
+        "complete": 0,
+        "median_seconds": 6.304416101498646
+      },
+      "on": {
+        "samples": 66,
+        "complete": 52,
+        "median_seconds": 2.7058457454986637
+      }
+    },
+    "filtered": {
+      "off": {
+        "samples": 84,
+        "complete": 27,
+        "median_seconds": 8.595569995493861
+      },
+      "on": {
+        "samples": 84,
+        "complete": 32,
+        "median_seconds": 7.24581445401418
+      }
+    }
+  }
+}

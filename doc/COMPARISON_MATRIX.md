@@ -92,29 +92,34 @@ regex, and the current comparison below uses that configuration.
 
 **Caution: the pg_fts column above used `fts_search()`; the competitors used `ORDER BY`
 forms** (see the retraction in CHANGELOG 1.8.6). pg_fts and pg_textsearch have both moved
-since. Current head-to-head, 2026-10-07/08: all four engines at their latest release, one
+since. Current head-to-head, 2026-10-09: all four engines at their latest release, one
 AWS r7gd.4xlarge (Graviton3) per engine, Debian 13 arm64, PostgreSQL 17.10, each engine's
-documented English index and query form.  pg_fts is **1.11.0**, with 1.10.0 re-measured on the same host and index
-(`bench/RESULTS_A_2026-10-07.md`; 1.10.0's own run: `bench/RESULTS_110_2026-10-07.md`):
+documented English index and query form, the same night.  pg_fts is the **1.11.0 release**
+built from its PGXN zip (`bench/RESULTS_111_2026-10-09.md`; the 1.10.0 comparison:
+`bench/RESULTS_A_2026-10-07.md`):
 
-| Measure | pg_fts 1.11.0 | pg_fts 1.10.0 | pg_textsearch 1.5.1 | pg_search 0.26.0 | VectorChord-bm25 0.3.0 |
-|---|---|---|---|---|---|
-| rare / mid top-10 | **0.64 / 0.43 ms** | 1.07 / 0.83 | 0.99 / 1.21 | 2.66 / 2.27 | 20.4 / 36.8 |
-| common top-10 / top-100 | **0.81 / 1.30** | 8.48 / 8.77 | 10.71 / 13.06 | 2.63 / 5.51 | 84.5 / 86.8 |
-| AND / OR top-10 (rare terms) | **1.38 / 1.84** | 2.15 / 2.11 | >300 s (seq scan) | 3.45 / 3.75 | n/a / 12.6 |
-| AND top-10, `united & states` / `world & war` | **2.71** / 5.98 | 23.89 / 19.12 | >300 s | 11.97 / **5.73** | n/a |
-| 4-term OR top-10 | 13.99 | wrong result | 14.98 | **13.92** | 50.9 |
-| phrase top-10 `"united states"` / `"world war"` | **3.55 / 6.84** | 24.95 / 19.79 | >300 s | 12.08 / 11.95 | n/a |
-| exact `count(*)` | **0.19 ms** | 0.21 | n/a | 10.56 | n/a |
-| tps, rare top-10, 16 / 64 clients | **26,750 / 26,338** | 17,496 / 17,274 | 13,355 / 12,157 | 5,147 / 5,998 | 334 / 667 |
-| tps, common top-10, 16 / 64 clients | **22,369 / 21,590** | 1,911 / 1,875 | 1,176 / 1,236 | 5,241 / 5,951 | 59 / 119 |
-| index size | **1,421 MiB** (1,369 as expression index) | same | 1,887 MiB | 3,397 MiB | 42,434 MiB |
-| build (expression index, analysis included) | 257 s | 412 s + 198 s `fts_vacuum` | 268 s | **71 s** | 267 s (+ 3,959 s tokenize/model) |
+| Measure | pg_fts 1.11.0 | pg_textsearch 1.5.1 | pg_search 0.26.1 | VectorChord-bm25 0.3.0 |
+|---|---|---|---|---|
+| rare / mid top-10 | **0.57 / 0.42 ms** | 0.99 / 1.21 | 2.59 / 2.27 | 13.6 / 26.6 |
+| common top-10 / top-100 | **0.72 / 1.15** | 10.69 / 13.01 | 2.63 / 5.46 | 72.4 / 78.0 |
+| AND / OR top-10 (rare terms) | **1.16 / 1.68** | >300 s (seq scan) | 3.31 / 3.58 | n/a / 7.90 |
+| AND top-10, `united & states` / `world & war` | **2.49** / 5.87 | >300 s | 11.61 / **5.75** | n/a |
+| 4-term OR top-10 | 13.97 | 14.63 | **13.40** | 42.4 |
+| phrase top-10 `"united states"` / `"world war"` | **2.84 / 6.45** | >300 s | 11.41 / 11.54 | n/a |
+| exact `count(*)` | **0.18 ms** | n/a | 8.64 | n/a |
+| tps, rare top-10, 16 / 64 clients | **24,696 / 25,431** | 14,259 / 12,595 | 5,364 / 6,291 | 366 / 875 |
+| tps, common top-10, 16 / 64 clients | **19,359 / 19,507** | 1,321 / 1,267 | 5,327 / 5,959 | 73 / 138 |
+| index size | **1,421 MiB** (1,369 as expression index) | 1,887 MiB | 3,395 MiB | 42,434 MiB |
+| build (expression index, analysis included) | 238 s, no `fts_vacuum` | 267 s | **72 s** | 209 s (+ 3,246 s tokenize/model) |
 
-**Read:** 1.11.0 leads ranked latency and throughput at every term
-frequency, conjunctive queries and phrases, exact counts and index size.  pg_search builds
-3.6x faster and is within 5% on `world & war` and on a 4-term OR.  pg_textsearch is close
-on a single rare term, but its boolean and phrase forms scan the table.  VectorChord's
+**1.12.0** (2026-10-09, `bench/RESULTS_112_2026-10-09.md`) halves single-term ranked latency
+and raises ranked throughput 42-97% over the 1.11.0 column above, with identical results;
+the competitors were not re-measured against it, so the table stays the 1.11.0 run.
+
+**Read:** 1.11.0 leads ranked latency and throughput at every term frequency, conjunctive
+queries and phrases, exact counts and index size.  pg_search builds 3.3x faster and is
+2% faster on `world & war` (spreads overlapping) and 4% on a 4-term OR.  pg_textsearch is
+close on a single rare term, but its boolean and phrase forms scan the table.  VectorChord's
 results reflect the tokenizer setup it documents for English, which built a 41 GB index
 here.
 

@@ -2,7 +2,29 @@
 
 All notable changes to pg_fts are documented here.
 
-## Unreleased - clone-tested fix
+## Unreleased - 1.12.1-freecase integration
+
+- Integrates upstream 1.12.1, including ranked dictionary-directory caching and
+  new scan_keys/dict_dir regressions, while preserving Freecase wide positions,
+  proximity grammar, exact positional boolean evaluation, pending ranking and
+  independent filter/rank queries. The fork's existing multi-key/NULL algorithms
+  supersede the overlapping upstream scan implementation; compound fuzzy/regex
+  queries already evaluate their complete Boolean set rather than a narrowing
+  union funnel. Qualified on PG18: 18 regression files, two isolation files,
+  12 recovery/stress files (137 assertions), and 450 VM801 historical searches.
+  The existing index retains its count and ranked-ID controls; a real late
+  phrase at position 72,794 is found. Application timeouts remain; see the dated
+  Freecase qualification report.
+- Cache construction now uses an attempt-owned memory context. Cancellation or
+  ERROR releases its unfinished chunk and scratch children; only a completed
+  single chunk is copied into the persistent per-index cache. This addresses
+  the upstream construction-window leak without changing index storage.
+- Retains the fork's explicit error for an unfiltered NULL distance ordering.
+  Filtered NULL ordering returns the filter rows with NULL distances. The app
+  does not issue the unfiltered form; no crashing or silent fallback is allowed.
+- No on-disk format change (BM25_VERSION remains 4); existing indexes are reused.
+
+## Earlier clone-tested wide-position fix
 
 - Configured analysis now preserves 30-bit token positions, including weighted
   analysis, by adapting PostgreSQL's existing parsing/dictionary pipeline with
@@ -252,6 +274,138 @@ and its tests.
   its pending row is ranked by the exact pending fallback), a deep pull across segments with deletes, VACUUM
   and heap-slot reuse (every filter row exactly once, in exact order), and NULL `WHERE` and
   `ORDER BY` values.
+## 1.12.1 - 2026-10-14
+
+Index scans returned wrong rows for four query shapes, and a NULL query argument could
+crash the backend.  All were present in every release.  Reported in GitHub #8, #9 and
+#10 by jimdawdy-hub (with reproductions, against 1.8.3); the NOT/fuzzy cases beyond #8
+and the NULL ORDER BY crash were found while fixing them.  **No on-disk format change**;
+**no REINDEX**; no new SQL objects (`pg_fts--1.12.0--1.12.1.sql` is a no-op).
+
+### Fixed (wrong results)
+
+- **NOT over a phrase or NEAR under-counted through the index** (GitHub #8).  The boolean
+  evaluator reads a phrase as the AND of its words, a superset of its matches that the
+  heap recheck narrows.  Under a NOT that superset becomes a subset of the true answer,
+  and a recheck only removes rows, so the missing rows were lost:
+  `alpha & !"bravo cherry"` returned 0 of 1 matching rows, through the bitmap scan, the
+  plain index scan and `fts_count`, on `positions = off` and `on`.  The evaluator now
+  tracks whether each intermediate set is a superset or a subset of its truth and widens
+  a subset to the universe (narrowed by the recheck), so the result is always a superset.
+  `!!"phrase"` stays as tight as the phrase.
+- **Fuzzy and regex terms under a NOT, or ORed with a plain term, under-counted** (found
+  with #8).  The trigram/Levenshtein funnel collects documents that contain a fuzzy/regex
+  term, which covers the matches only if every match must contain one: `alpha & !bravo~1`
+  returned nothing and `delta | bravo~1` lost every `delta`-only document.  The funnel is
+  now used only when that holds; otherwise the scan takes the existing full-segment
+  fallback, which the recheck narrows.
+- **A second `@@@` condition on the same index was never applied** (GitHub #10).  The
+  scan evaluated the first key only and reported no recheck.  It now asks the executor to
+  recheck whenever there is more than one key, so every condition applies.
+- **`WHERE d @@@ q1 ORDER BY d <=> q2` filtered by `q2` instead of `q1`** (GitHub #9).  The
+  ordering scan replaced the WHERE query with the ORDER BY query.  It now returns exactly
+  the rows that pass WHERE, ordered by `q2`'s BM25 score with the index's own statistics,
+  so the order and distances equal what an equal WHERE/ORDER BY scan reports.  This form
+  is evaluated exhaustively over the WHERE matches; the usual form, where both queries
+  are the same, is unchanged.
+- In 1.12.0's 28-shape x 4-path test matrix, 52 of 112 index results were wrong; with the
+  fix, 0.
+
+### Fixed (crash)
+
+- **A NULL ORDER BY argument crashed the backend**, e.g. a prepared
+  `ORDER BY d <=> $1` executed with `$1 = NULL`.  A NULL `WHERE` argument in a generic
+  plan was also dereferenced.  A NULL WHERE key now matches nothing (as GiST does), and a
+  NULL ORDER BY returns the WHERE rows with NULL distances.
+
+### Tests
+
+- `scan_keys` regression test: 28 boolean/phrase/NEAR/fuzzy/regex/prefix shapes over 64
+  documents covering every combination, each through the bitmap and the plain index scan
+  on `positions = off` and `on`, must equal a sequential scan; #9 and #10 as reported;
+  the split ORDER BY in BM25 order over two segments with deletes; NULL WHERE and ORDER BY
+  arguments in generic plans.  It fails on 1.12.0 (52 wrong) and on each of the five
+  fixes reverted alone.
+- `pg_fts.sql`'s count-pushdown block expected 50 rows for
+  `d @@@ 'term1' AND d @@@ 'body'`; a sequential scan returns 0 (the documents hold the
+  stemmed `bodi`), so the expected value was the #10 bug and is now 0.
+
+## 1.12.0 - 2026-10-09
+
+Ranked queries find a term's dictionary page in memory instead of re-reading the
+dictionary-index chain: a rare-term top-10 reads 80 shared buffers instead of 278, and
+ranked throughput rises 42-97% at 16-64 clients.  **No on-disk format change**; **no
+REINDEX**; no new SQL objects (`pg_fts--1.11.0--1.12.0.sql` is a no-op).  Measured in
+`bench/RESULTS_112_2026-10-09.md` (plan written before the code).
+
+### Changed (performance)
+
+- **Dictionary lookups on the ranked path read memory, not the index chain** (ROADMAP I7).
+  Each ranked query looked a term up in each segment three times (the max-hits bound, the
+  global document frequency and the cursor), and every lookup walked the segment's
+  dictionary-index chain from its head under a buffer pin and a share lock per page -- up
+  to 85 pages on 2.19M Wikipedia articles, pages every concurrent query reads.  Each
+  backend now copies a segment's dictionary index into its existing per-index relcache
+  chunk once per segment-directory change and binary-searches it, so a lookup reads only
+  the one dictionary page.  The copy is about 1 MB on 2.19M articles and counts against
+  `pg_fts.doclen_cache_mb`; a segment that does not fit, or a chain that looks
+  malformed, keeps the page walk.  Ranked results are identical (every band of the
+  benchmark protocol, on four hosts).  On four r7gd.4xlarge, against 1.11.0:
+  single-client rare top-10 0.54 -> 0.27 ms, common 0.67 -> 0.36 ms; throughput at 16 and
+  64 clients rare +67-97%, mid +49-60%, common +74-92%, `united & states` +42-53%;
+  `count(*)` unchanged (it does no ranked lookup).  The gain is larger on hosts where
+  shared cache-line traffic is slow (`bench/RESULTS_TPS_VARIANCE_2026-10-09.md`).
+
+### Fixed
+
+- **Setting `pg_fts.doclen_cache_mb` in a session took effect only at the index's next
+  segment-directory change** (since 1.9.0).  The per-backend chunk was rebuilt only when
+  the directory generation moved, so `SET pg_fts.doclen_cache_mb = 0` kept serving the
+  arrays built at the previous budget.  The chunk now also records the budget it was
+  built under.  Results were never affected (the setting chooses between two exact
+  lookups); found by the new `dict_dir` test, whose cache-on vs cache-off comparison was
+  comparing the cache with itself.
+
+### Known issues
+
+- **A query cancelled while a backend rebuilds its per-index relcache chunk leaks that
+  chunk until the backend exits** (since 1.5.8, when the rebuild gained a cancel check; not new in 1.12.0, which makes the chunk
+  larger).  The chunk is rebuilt by the first ranked query after a segment-directory
+  change; the old one is freed first, and the new one is attached only once complete, so
+  an ERROR during the rebuild (a cancel, an out-of-memory) leaves it unreferenced in
+  `CacheMemoryContext`, per occurrence.  Its size is not measured on its own; the whole of
+  `CacheMemoryContext` is 1.4 MB in a backend that has run one ranked query on a
+  2.19M-document index (0.54 MB with 1.11.0), which bounds it.  Results are never affected (the next query rebuilds).
+  Reproduction: cancel a ranked query issued right after `fts_merge` on a large index;
+  `pg_backend_memory_contexts` shows `CacheMemoryContext` grow by the chunk size.  ROADMAP
+  I8.
+
+### Tests
+
+- `dict_dir` regression test: cached lookup == page-chain lookup for 22 probes (first and
+  last terms, dictionary-page first terms, prefixes, terms one character short or long,
+  absent terms before, between and after) and for every term of 6,000 documents, after a
+  merge in the same backend and with several segments; and the cached lookup must read
+  fewer buffers.  Fails on a broken in-memory search (93 of 6,002 terms lost) and on a
+  directory that is never used.
+
+### Benchmarks
+
+- **The 1.11.0 release binary is now measured** (`bench/RESULTS_111_2026-10-09.md`,
+  protocol written before the run).  The 1.11.0 numbers published with the release were
+  taken at commit 39b6a42, before the VACUUM and concurrency fixes, and the release itself
+  had not been timed.  Built from the PGXN zip and run against 39b6a42 on one host and
+  the same indexes: identical results, overlapping spreads on 10 of 12 latency bands, mid
+  k10 3.4% slower and `"united states"` 5.0% faster (neither on a changed code path).  The
+  release matches the exhaustive references (21 cases, 0 differ).  Competitors
+  re-measured the same night (pg_search now 0.26.1); README, BENCHMARK_SUMMARY and the
+  comparison matrix now quote this run.  pg_fts leads 10 of 12 latency bands as before;
+  pg_search is ahead by 2% on `world & war` and 4% on the 4-term OR.  Absolute pg_fts
+  throughput is 0.5-13.5% below the 39b6a42 run, on a different host of the same type,
+  with the release and 39b6a42 agreeing on this one.  Cause (`bench/RESULTS_TPS_VARIANCE_
+  2026-10-09.md`): the same binary runs ~27k or ~17-20k rare top-10 tps at 16 clients
+  depending on which r7gd.4xlarge host, and on that host's state; the code is not the
+  cause.  pg_fts's exposure to it (buffer pin and lock traffic per query) is ROADMAP I7.
 
 ## 1.11.0 - 2026-10-08
 

@@ -1,0 +1,36 @@
+echo "# +++ regress install-check in  +++" && /usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/regress/pg_regress --inputdir=./ --bindir='/usr/lib/postgresql/18/bin'    --dbname=contrib_regression pg_fts unicode_fold idx_scan_stats legal_proximity limit_hint doclen_slots score_reuse wand_last_block dense_score phrase_gate shared_doclen ranked_exact pending_delete bmw_block_end ranked_route configured_positions dict_dir scan_keys
+# +++ regress install-check in  +++
+# using postmaster on /var/run/postgresql, default port
+ok 1         - pg_fts                                  20750 ms
+ok 2         - unicode_fold                               48 ms
+ok 3         - idx_scan_stats                             35 ms
+ok 4         - legal_proximity                         24777 ms
+ok 5         - limit_hint                                722 ms
+ok 6         - doclen_slots                              366 ms
+ok 7         - score_reuse                               110 ms
+ok 8         - wand_last_block                           106 ms
+ok 9         - dense_score                               506 ms
+ok 10        - phrase_gate                              1187 ms
+ok 11        - shared_doclen                             624 ms
+ok 12        - ranked_exact                             2409 ms
+ok 13        - pending_delete                             66 ms
+ok 14        - bmw_block_end                              51 ms
+ok 15        - ranked_route                               25 ms
+ok 16        - configured_positions                     1228 ms
+ok 17        - dict_dir                                10241 ms
+ok 18        - scan_keys                                  69 ms
+1..18
+# All 18 tests passed.
+echo "# +++ isolation install-check in  +++" && /usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/isolation/pg_isolation_regress --inputdir=./ --outputdir=output_iso --bindir='/usr/lib/postgresql/18/bin'    --dbname=isolation_regression bm25_concurrency bm25_cic
+# +++ isolation install-check in  +++
+# using postmaster on /var/run/postgresql, default port
+ok 1         - bm25_concurrency                           63 ms
+ok 2         - bm25_cic                                   33 ms
+1..2
+# All 2 tests passed.
+echo "# +++ tap install-check in  +++" && rm -rf '/work-final'/tmp_check && /bin/mkdir -p '/work-final'/tmp_check && cd ./ && TESTLOGDIR='/work-final/tmp_check/log' TESTDATADIR='/work-final/tmp_check' PATH="/usr/lib/postgresql/18/bin:/work-final:$PATH" PGPORT='65432' PG_REGRESS='/usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/regress/pg_regress' /usr/bin/prove -I /usr/lib/postgresql/18/lib/pgxs/src/makefiles/../../src/test/perl/ -I ./  ci/noop.pl
+# +++ tap install-check in  +++
+ci/noop.pl .. ok
+All tests successful.
+Files=1, Tests=1,  0 wallclock secs ( 0.01 usr  0.01 sys +  0.03 cusr  0.01 csys =  0.06 CPU)
+Result: PASS
