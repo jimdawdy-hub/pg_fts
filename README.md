@@ -1,3 +1,27 @@
+## Freecase custom 1.13.0 — qualification and cloud replay completed
+
+This branch is the qualified **Freecase build**, not the unmodified upstream
+release. It retains configured 30-bit positions and cancel-safe cache construction;
+1.13.0 also retains the block-end-safe ranked skip. PostgreSQL reports the upstream
+version string, so identify the actual runtime by its library SHA-256:
+`9919c16554a44fed87a71d15fd62e0d4b1d37e224afc46f0afad280f268a71f2` (tested source `a0b53551a847aa48def4bd834c02d5da72079ce1`).
+
+Both custom 1.12.1 and 1.13.0 completed the same full-memory cloud workload:
+450 searches per version, with coverage and full ordered case/opinion IDs
+identical in all 450 comparisons. On-mode nationwide completion was 99/99;
+filtered completion was 85/126, with 41 legacy fallbacks overall. These are
+application measurements, not a claim of exact final BM25 ranking or production
+acceptance. The later application court-filter change was measured separately.
+See [versioned raw results, earlier VM801 records and reviews](https://github.com/FreecaseAI/freecase-ai/tree/fix/pgfts-court-filter-20261015/docs/pgfts-benchmarks).
+
+Qualification included PG18 regression/isolation/recovery checks (18 regression
+files, two isolation files and 137 TAP assertions). The 1.13.0 feature checks
+covered hand-built/frozen-query fixtures, not the Illinois corpus half.
+Both cloud runs reused the built wide-position format-4 index; no rebuild was
+needed for these upgrades. An old index originally built with truncated positions
+would still need regeneration from original text; this does not repair such data.
+No production deployment or upstream release tag was made by this experiment.
+
 # pg_fts — BM25 full-text search for PostgreSQL
 
 [![CI](https://github.com/gburd/pg_fts/actions/workflows/ci.yml/badge.svg)](https://github.com/gburd/pg_fts/actions/workflows/ci.yml)

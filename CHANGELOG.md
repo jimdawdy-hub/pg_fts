@@ -1,8 +1,21 @@
-# 1.13.0-freecase qualification candidate (unreleased)
-
-Retains upstream 1.13.0 scan/query fixes; carries the Freecase configured analyzer with checked 30-bit token positions and cancel-safe cache construction. Also retains the block-end-safe ranked skip: the upstream clamp skipped the exact top-1 in bmw_block_end (returned ID 1 instead of 5000). Index format unchanged. Qualification in progress; not deployed.
-
 # Changelog
+
+## 2026-10-15 — Freecase 1.13.0 cloud qualification complete
+
+Retains upstream 1.13.0 scan/query fixes plus Freecase configured wide positions,
+cancel-safe cache construction and the block-end-safe ranked skip. The upstream
+clamp failed the exact top-1 control before removal; the final build passed all
+18 regression files, two isolation files, 137 TAP assertions and 11 hand-built
+feature checks. This is not an upstream release tag or production deployment.
+
+Custom 1.12.1 and 1.13.0 produced identical ordered IDs and coverage for all
+450 searches. Nationwide pg_fts answered 99/99 completely; filtered completion
+was 85/126. Existing-index late-position controls passed. The remaining court
+filter and final-score issues belong to the application integration; the later
+approved court-filter candidate is documented separately. Runtime/source hashes,
+method limitations, VM801 history and raw evidence are in the
+[Freecase benchmark record](https://github.com/FreecaseAI/freecase-ai/tree/fix/pgfts-court-filter-20261015/docs/pgfts-benchmarks).
+
 
 All notable changes to pg_fts are documented here.
 
