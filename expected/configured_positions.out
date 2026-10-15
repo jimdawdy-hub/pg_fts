@@ -1,0 +1,63 @@
+-- Configured parsing must preserve positions beyond both the 14-bit clamp
+-- and the uint16 storage of PostgreSQL ParsedWord. Keep dictionary semantics.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_fts;
+DO $$
+DECLARE n integer; cfg regconfig; prefix text; q ftsquery; d ftsdoc;
+BEGIN
+ FOR cfg IN SELECT unnest(ARRAY['simple'::regconfig,'english'::regconfig]) LOOP
+  q := phraseto_tsquery(cfg, 'qualified immunity')::ftsquery;
+  FOREACH n IN ARRAY ARRAY[16380,16383,17000,65536,160000] LOOP
+   prefix := repeat('filler ', n);
+   d := to_ftsdoc(cfg, prefix || 'qualified immunity');
+   IF NOT (d @@@ q) THEN RAISE EXCEPTION 'late phrase lost: %/%', cfg,n; END IF;
+   IF to_ftsdoc(cfg,prefix || 'qualified arbitrary immunity') @@@ q THEN
+    RAISE EXCEPTION 'false adjacency: %/%',cfg,n;
+   END IF;
+   IF NOT (to_ftsdoc(cfg,prefix || 'qualified, immunity', 'A'::"char") @@@ q) THEN
+    RAISE EXCEPTION 'weighted/punctuation phrase lost: %/%',cfg,n;
+   END IF;
+  END LOOP;
+ END LOOP;
+ -- Stopword gaps and stemming must still agree with PostgreSQL on short
+ -- input and remain identical when the same passage follows a long prefix.
+ FOR prefix IN SELECT unnest(ARRAY['',repeat('filler ',17000)]) LOOP
+  IF NOT (to_ftsdoc('english',prefix || 'officers of the courts')
+    @@@ phraseto_tsquery('english','officer of the court')::ftsquery) THEN
+   RAISE EXCEPTION 'stemming or stopword gap changed';
+  END IF;
+  IF to_ftsdoc('english',prefix || 'officers near courts')
+    @@@ phraseto_tsquery('english','officer of the court')::ftsquery THEN
+   RAISE EXCEPTION 'stopword gap ignored';
+  END IF;
+ END LOOP;
+END $$;
+CREATE TABLE cp_docs(id integer, body text);
+INSERT INTO cp_docs VALUES
+ (1,repeat('filler ',17000)||'qualified immunity'),
+ (2,repeat('filler ',17000)||'qualified arbitrary immunity'),
+ (3,repeat('filler ',65536)||'qualified immunity');
+CREATE INDEX cp_idx ON cp_docs USING fts(to_ftsdoc('english',body)) WITH (positions=on);
+SET enable_seqscan=off;
+SELECT array_agg(id ORDER BY id) AS indexed_matches FROM cp_docs
+ WHERE to_ftsdoc('english',body) @@@ phraseto_tsquery('english','qualified immunity')::ftsquery;
+ indexed_matches 
+-----------------
+ {1,3}
+(1 row)
+
+SET enable_seqscan=on;
+SET enable_indexscan=off;
+SET enable_bitmapscan=off;
+SELECT array_agg(id ORDER BY id) AS heap_matches FROM cp_docs
+ WHERE to_ftsdoc('english',body) @@@ phraseto_tsquery('english','qualified immunity')::ftsquery;
+ heap_matches 
+--------------
+ {1,3}
+(1 row)
+
+DROP TABLE cp_docs;
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+RESET client_min_messages;

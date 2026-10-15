@@ -2661,7 +2661,9 @@ bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 	uint32		s;
 	int			pos = 0;
 	Size		sz;
-	MemoryContext old;
+	MemoryContext parent = CurrentMemoryContext;
+	MemoryContext buildctx;
+	BM25DoclenDirCache *result = NULL;
 
 	/*
 	 * Valid only for the generation AND the settings it was built under: the
@@ -2699,40 +2701,59 @@ bm25_doclendir_cache(Relation index, const BM25MetaPageData *meta)
 	sz = offsetof(BM25DoclenDirCache, data) +
 		(Size) total *sizeof(uint64) +		/* docid[] */
 		(Size) total *sizeof(uint64);		/* blk[] (one BlockNumber per uint64 slot) */
-	old = MemoryContextSwitchTo(CacheMemoryContext);
-	dc = (BM25DoclenDirCache *) palloc0(sz);
-	MemoryContextSwitchTo(old);
-	dc->generation = meta->generation;
-	dc->private_slots = !(pg_fts_shared_doclen && IsUnderPostmaster);
-	dc->ndocid = total;
-	dc->nsegs = 0;
-	dc->used = sz;
-	dc->budget_mb = pg_fts_doclen_cache_mb;
-
+	/* A canceled first-use rebuild must not leave an unreachable chunk in
+	 * CacheMemoryContext. Build in an attempt-owned context, then publish one
+	 * complete offset-based chunk only after every interruptible step succeeds. */
+	buildctx = AllocSetContextCreate(parent, "pg_fts cache build",
+									ALLOCSET_DEFAULT_SIZES);
+	PG_TRY();
 	{
-		uint64	   *docid = dc->data;
-		BlockNumber *blk = (BlockNumber *) (dc->data + total);	/* NB: BlockNumber slots */
+		MemoryContextSwitchTo(buildctx);
+		dc = (BM25DoclenDirCache *) palloc0(sz);
+		dc->generation = meta->generation;
+		dc->private_slots = !(pg_fts_shared_doclen && IsUnderPostmaster);
+		dc->ndocid = total;
+		dc->nsegs = 0;
+		dc->used = sz;
+		dc->budget_mb = pg_fts_doclen_cache_mb;
 
-		for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
 		{
-			int			startpos = pos;
-			int			n;
+			uint64	   *docid = dc->data;
+			BlockNumber *blk = (BlockNumber *) (dc->data + total);	/* NB: BlockNumber slots */
 
-			if (meta->segs[s].doclenstart == InvalidBlockNumber)
-				continue;
-			n = bm25_doclendir_scan_seg(index, meta->segs[s].doclenstart,
-										docid, blk, total, &pos);
-			dc->segs[dc->nsegs].start = meta->segs[s].doclenstart;
-			dc->segs[dc->nsegs].n = n;
-			dc->segs[dc->nsegs].docid_off = startpos;
-			dc->segs[dc->nsegs].blk_off = startpos;
-			dc->nsegs++;
+			for (s = 0; s < meta->nsegments && s < BM25_MAX_SEGMENTS; s++)
+			{
+				int			startpos = pos;
+				int			n;
+
+				if (meta->segs[s].doclenstart == InvalidBlockNumber)
+					continue;
+				n = bm25_doclendir_scan_seg(index, meta->segs[s].doclenstart,
+											docid, blk, total, &pos);
+				dc->segs[dc->nsegs].start = meta->segs[s].doclenstart;
+				dc->segs[dc->nsegs].n = n;
+				dc->segs[dc->nsegs].docid_off = startpos;
+				dc->segs[dc->nsegs].blk_off = startpos;
+				dc->nsegs++;
+			}
 		}
+		dc = bm25_doclendir_add_slots(index, dc);
+		dc = bm25_dictdir_add(index, meta, dc);
+
+		result = (BM25DoclenDirCache *) MemoryContextAlloc(CacheMemoryContext, dc->used);
+		memcpy(result, dc, dc->used);
+		MemoryContextSwitchTo(parent);
+		MemoryContextDelete(buildctx);
 	}
-	dc = bm25_doclendir_add_slots(index, dc);
-	dc = bm25_dictdir_add(index, meta, dc);
-	index->rd_amcache = (void *) dc;
-	return dc;
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(parent);
+		MemoryContextDelete(buildctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	index->rd_amcache = (void *) result;
+	return result;
 }
 
 /* GUC (1.9.0, C1): budget in MB for the resident slot-indexed doclen arrays a
@@ -2922,7 +2943,7 @@ bm25_doclendir_add_slots(Relation index, BM25DoclenDirCache *dc)
 		return dc;
 	}
 	/* one chunk: the existing header + directory, then each segment's arrays */
-	old = MemoryContextSwitchTo(CacheMemoryContext);
+	old = MemoryContextSwitchTo(GetMemoryChunkContext(dc));
 	out = (BM25DoclenDirCache *) palloc(MAXALIGN(basesz) + extra);
 	MemoryContextSwitchTo(old);
 	memcpy(out, dc, basesz);
@@ -3081,7 +3102,7 @@ bm25_dictdir_add(Relation index, const BM25MetaPageData *meta, BM25DoclenDirCach
 		Size		used = MAXALIGN(dc->used);
 		Size		pos;
 
-		old = MemoryContextSwitchTo(CacheMemoryContext);
+		old = MemoryContextSwitchTo(GetMemoryChunkContext(dc));
 		out = (BM25DoclenDirCache *) palloc(used + extra);
 		MemoryContextSwitchTo(old);
 		memcpy(out, dc, dc->used);

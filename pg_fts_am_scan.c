@@ -5016,8 +5016,6 @@ fts_search_bmw(WandCursor *cursors, int nterms, int k, const DocidFilter *filter
 						else if (cursors[i].docid < skipto)
 							skipto = cursors[i].docid;
 					}
-					if (skipto <= pivot_docid)
-						skipto = pivot_docid + 1;	/* always make progress */
 					for (i = 0; i < nterms; i++)
 						if (cursors[i].docid != UINT64_MAX &&
 							cursors[i].docid <= pivot_docid)

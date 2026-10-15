@@ -1,3 +1,7 @@
+# 1.13.0-freecase qualification candidate (unreleased)
+
+Retains upstream 1.13.0 scan/query fixes; carries the Freecase configured analyzer with checked 30-bit token positions and cancel-safe cache construction. Also retains the block-end-safe ranked skip: the upstream clamp skipped the exact top-1 in bmw_block_end (returned ID 1 instead of 5000). Index format unchanged. Qualification in progress; not deployed.
+
 # Changelog
 
 All notable changes to pg_fts are documented here.

@@ -92,3 +92,11 @@ These do not touch the index and are the cheapest, highest-leverage work in the 
 - **1.5.9 / 1.5.10** non-UTF-8 case folding; common-term 1.56x via ascending-resume + word-load `bm25_for_get`.
 - **1.5.0** doclen sidecar (format v3 -> v4) with dual-read, **no REINDEX** -- the precedent for all future format changes.
 - **COUNT pushdown** (CustomScan), **`fts_search` under-fetch**, **reserved keywords as literals**, **sparsemap error-path leaks**, **recovery guard on `fts_merge`/`fts_vacuum`**, **privilege lockdown**, **recently-dead exclusion from corpus stats**, **parallel-build memory ceiling** -- all shipped; see history file.
+
+## Freecase 1.13.0 qualification (2026-10-15, in progress)
+
+Jim authorized a successor cloud run only after the unchanged 1.12.1 baseline and if the existing eight-hour VM window allows it. Carry only the configured wide-position analyzer and cancel-safe cache construction; retain upstream 1.13.0 query/scan implementations. Gate on regression/isolation, long-position positive/negative, historical issue-11 fixture, cancel/reuse checks, independent source review, and restored-corpus controls before a separately labeled historical replay. No index rebuild or production change. Preserve and export baseline results first.
+
+- B1 reproduced on the initial 1.13.0 candidate: bmw_block_end top-1 returned ID 1 instead of exact ID 5000; removed the inherited forced pivot+1 skip, matching the accepted Freecase fix. Post-fix qualification pending.
+
+- Local post-fix gates passed: 18 regression, 2 isolation, 12 TAP files/137 assertions; configured wide positions; recovered issue11 fixture 3 repeats with 2000 distinct ordered matches; 30 cache construction cancels with -11856 bytes growth and no contexts plus proven settled-cache reuse; original C1-C11 hand-built/frozen app-query checks all 11 pass. Illinois corpus checks not claimed. Cloud successor remains conditional on completion/export of the unchanged baseline and time remaining.
