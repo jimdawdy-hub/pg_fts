@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-15 — Freecase 1.12.1 cloud qualification complete
+
+The earlier 450-search VM801 qualification remains a dated low-memory result.
+A later full-memory cloud run completed all 450 searches with 184 complete and
+41 partial pg_fts answers, zero final timeouts; ordinary mode was 196 complete
+and 29 partial. No index rebuild or production deployment occurred.
+
+Custom 1.12.1 and 1.13.0 produced identical ordered IDs and coverage for all
+450 searches. Nationwide pg_fts answered 99/99 completely; filtered completion
+was 85/126. Existing-index late-position controls passed. The remaining court
+filter and final-score issues belong to the application integration; the later
+approved court-filter candidate is documented separately. Runtime/source hashes,
+method limitations, VM801 history and raw evidence are in the
+[Freecase benchmark record](https://github.com/FreecaseAI/freecase-ai/tree/fix/pgfts-court-filter-20261015/docs/pgfts-benchmarks).
+
+
 All notable changes to pg_fts are documented here.
 
 ## Unreleased - 1.12.1-freecase integration
