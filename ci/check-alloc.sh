@@ -27,7 +27,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Files with corpus/vocabulary-scale allocations (the AM + doc/analyze paths).
-FILES="pg_fts_am.c pg_fts_am_scan.c pg_fts_trgm_index.c pg_fts_doc.c pg_fts_analyze.c pg_fts_tsanalyze.c"
+FILES="pg_fts_am.c pg_fts_am_scan.c pg_fts_subset.c pg_fts_trgm_index.c pg_fts_doc.c pg_fts_analyze.c pg_fts_tsanalyze.c"
 
 # Size-drivers that scale with the corpus / vocabulary / one document (unbounded
 # in principle) -- as opposed to query size or fixed structs.  Matched as whole

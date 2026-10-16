@@ -11,6 +11,18 @@ plan file.
 
 ---
 
+## Isolated Freecase subset prototype -- open, not installed
+
+`fts_search_subset` drives native scoring from caller-supplied visible heap
+TIDs, with HOT-root normalization. Fixture-only SQL registration lives in
+`sql/subset_prototype.sql`; ordinary entry points and installed SQL are unchanged.
+Positive plain AND/OR only, at most 64 terms, no pending entries, valid non-partial
+index over an ordinary heap, no RLS/serializable mode, k=1..10000. Unsupported
+states refuse explicitly; the caller owns eligibility and fallback. The optional
+aligned bigint[] tie keys preserve opinion-id cutoff ordering. Source/fixture
+qualification is separate from the unproven allowed-ID and latency gates; evidence
+is retained outside this checkout in `/data/pgfts-court-intersection-20261016/`.
+
 ## Open -- repository and presentation (from `REVIEW_2026-09-17.md`)
 
 These do not touch the index and are the cheapest, highest-leverage work in the project.

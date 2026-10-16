@@ -7004,6 +7004,7 @@ bm25_insert(Relation index, Datum *values, bool *isnull,
  */
 #include "pg_fts_lev.c"
 #include "pg_fts_am_scan.c"
+#include "pg_fts_subset.c"
 #include "pg_fts_trgm_index.c"
 
 /* ----- vacuum / flush / merge / cost / options ----- */

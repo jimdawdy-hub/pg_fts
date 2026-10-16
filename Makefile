@@ -37,7 +37,7 @@ include $(PGXS)
 
 # pg_fts_am.c #includes these .c files; without this a change to one of them
 # leaves a stale pg_fts_am.o and an incremental build silently runs old code.
-pg_fts_am.o pg_fts_am.bc: pg_fts_am_scan.c pg_fts_lev.c pg_fts_trgm_index.c pg_fts_shdoclen.c pg_fts_am.h pg_fts.h pg_fts_for.h pg_fts_sm.h
+pg_fts_am.o pg_fts_am.bc: pg_fts_am_scan.c pg_fts_subset.c pg_fts_lev.c pg_fts_trgm_index.c pg_fts_shdoclen.c pg_fts_am.h pg_fts.h pg_fts_for.h pg_fts_sm.h
 
 # Vendored sparsemap uses C99 mixed declarations and its own /* FALLTHROUGH */
 # comment convention (not recognized by -Wimplicit-fallthrough=5); suppress those
